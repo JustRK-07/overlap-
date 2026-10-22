@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ISGEC Overlay</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main>
+    <h1>ISGEC Overlay</h1>
+    <p class="tag">Superimpose two CAD drawings in your browser.</p>
+
+    <!-- Section 1: Upload -->
+    <section id="upload-section" class="card">
+      <h2>1. Upload drawings</h2>
+
+      <div class="drop-grid">
+        <label class="drop" data-target="file-a">
+          <span class="drop-label">Drawing A (Mechanical)</span>
+          <span class="drop-hint">Drop .dwg or .dxf here, or click to browse</span>
+          <input type="file" id="file-a" accept=".dwg,.dxf" hidden>
+        </label>
+
+        <label class="drop" data-target="file-b">
+          <span class="drop-label">Drawing B (Structural)</span>
+          <span class="drop-hint">Drop .dwg or .dxf here, or click to browse</span>
+          <input type="file" id="file-b" accept=".dwg,.dxf" hidden>
+        </label>
+      </div>
+
+      <div class="strategy-row">
+        <span class="strategy-label">Overlay strategy:</span>
+        <label class="radio">
+          <input type="radio" name="strategy" value="A" checked>
+          <span><b>A</b> per-entity <span class="muted">(preserve original colors)</span></span>
+        </label>
+        <label class="radio">
+          <input type="radio" name="strategy" value="B">
+          <span><b>B</b> 2-block <span class="muted">(force red/blue)</span></span>
+        </label>
+        <label class="radio">
+          <input type="radio" name="strategy" value="C">
+          <span><b>C</b> 1-block <span class="muted">(force red/blue)</span></span>
+        </label>
+      </div>
+
+      <div class="strategy-row">
+        <span class="strategy-label">Cleaner version:</span>
+        <label class="radio">
+          <input type="radio" name="clean_version" value="v1" checked>
+          <span><b>v1</b> aggressive <span class="muted">(strips all annotations — recommended)</span></span>
+        </label>
+        <label class="radio">
+          <input type="radio" name="clean_version" value="v2">
+          <span><b>v2</b> less aggressive <span class="muted">(keeps more content — for comparison)</span></span>
+        </label>
+      </div>
+
+      <!-- Slice 2 — Multi-file upload (collapsible; legacy 2-file form stays default) -->
+      <details class="checks-panel" id="multi-file-details" style="margin-top: 0.6em;">
+        <summary>Multi-file upload <span class="muted">(upload N files, label each as MECH/STR/other, run all MECH×STR pairs)</span></summary>
+
+        <div class="checks-group">
+          <div class="checks-group-title">Files</div>
+          <div id="files-container" class="file-rows"></div>
+          <button id="add-file-btn" type="button" class="secondary" style="margin-top: 0.6em;">+ Add file</button>
+        </div>
+
+        <div class="checks-group">
+          <div class="checks-group-title">Grid convention (shared by every pair)</div>
+          <div class="form-row" style="margin: 6px 0 0;">
+            <label>Prefix:
+              <input type="text" id="mf-prefix" placeholder="e.g. TP104-">
+            </label>
+            <label>Axes (space-separated):
+              <input type="text" id="mf-axes" value="A B C D 1 2 3">
+            </label>
+          </div>
+        </div>
+
+        <div style="margin-top: 0.8em;">
+          <button id="multi-start-btn" type="button" class="primary" disabled>Start Multi-file Overlay</button>
+          <span id="multi-upload-error" class="error hidden"></span>
+          <span id="multi-upload-status" class="muted" style="margin-left: 0.6em;"></span>
+        </div>
+      </details>
+
+      <!-- Spot-check options -->
+      <details class="checks-panel" open>
+        <summary>Spot-check options <span class="muted">(toggle what to flag)</span></summary>
+
+        <div class="checks-group">
+          <div class="checks-group-title">Mechanical drawing (intra-MECH clashes)</div>
+          <label class="check">
+            <input type="checkbox" name="check" value="EQUIPMENT_OVERLAP" checked>
+            <span>Equipment overlap <span class="muted">— two equipment bodies intersecting</span></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" name="check" value="BUILDING_CLASH" checked>
+            <span>Building clash <span class="muted">— equipment outside building outline</span></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" name="check" value="CLEARANCE_VIOLATION" checked>
+            <span>Clearance &lt; 600mm <span class="muted">— equipment-to-equipment gap</span></span>
+          </label>
+        </div>
+
+        <div class="checks-group">
+          <div class="checks-group-title">Structural drawing (intra-STR clashes) <span class="muted">— usually caught during STR design</span></div>
+          <label class="check">
+            <input type="checkbox" name="check" value="BEAM_COLUMN_CLASH">
+            <span>Beam ↔ column clash <span class="muted">— beam end piercing column body</span></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" name="check" value="BEAM_BEAM_CROSSING">
+            <span>Beam ↔ beam crossing <span class="muted">— two beams crossing in plan</span></span>
+          </label>
+        </div>
+
+        <div class="checks-group">
+          <div class="checks-group-title">MECH ↔ STR overlap (cross-drawing)</div>
+          <label class="check">
+            <input type="checkbox" name="check" value="NO_BEAM_SUPPORT" checked>
+            <span>No beam support <span class="muted">— saddle not over a beam</span></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" name="check" value="COLUMN_CLASH" checked>
+            <span>Column clash <span class="muted">— saddle footprint hits a column</span></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" name="check" value="BAY_OVERHANG" checked>
+            <span>Bay overhang <span class="muted">— saddle extends outside bay</span></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" name="check" value="GRID_MISALIGN">
+            <span>Grid misalignment <span class="muted">— saddle off-grid by too much (often noisy)</span></span>
+          </label>
+        </div>
+      </details>
+
+      <button id="start-btn" type="button" class="primary" disabled>Start Overlay</button>
+      <p id="upload-error" class="error hidden"></p>
+    </section>
+
+    <!-- Section 2: Status / Inspect -->
+    <section id="status-section" class="card hidden">
+      <h2>2. Pipeline progress</h2>
+      <div class="file-cards" id="file-cards"></div>
+
+      <ol class="step-rail" id="step-rail">
+        <li data-step="1"><span class="step-num">1</span> Validate <span class="step-state">pending</span></li>
+        <li data-step="2"><span class="step-num">2</span> Inspect <span class="step-state">pending</span></li>
+        <li data-step="3"><span class="step-num">3</span> Convert <span class="step-state">pending</span></li>
+        <li data-step="4"><span class="step-num">4</span> Scan grid labels <span class="step-state">pending</span></li>
+        <li data-step="5"><span class="step-num">5</span> Derive cleaning policy <span class="step-state">pending</span></li>
+        <li data-step="6"><span class="step-num">6</span> Clean <span class="step-state">pending</span></li>
+        <li data-step="7"><span class="step-num">7</span> Grid axes <span class="step-state">pending</span></li>
+        <li data-step="8"><span class="step-num">8</span> Fit <span class="step-state">pending</span></li>
+        <li data-step="9"><span class="step-num">9</span> Overlay <span class="step-state">pending</span></li>
+        <li data-step="10"><span class="step-num">10</span> Package <span class="step-state">pending</span></li>
+        <li data-step="11"><span class="step-num">11</span> Done <span class="step-state">pending</span></li>
+      </ol>
+
+      <p id="status-message" class="muted">Initializing...</p>
+    </section>
+
+    <!-- Section 3: Grid convention picker (shown when state=awaiting_axes) -->
+    <section id="axes-section" class="card hidden">
+      <h2>3. Pick your grid naming convention</h2>
+      <p class="muted">We scanned both drawings for axis labels. Pick a pattern, or type your own.</p>
+
+      <div id="suggestions"></div>
+
+      <h3>Or type your own</h3>
+      <div class="form-row">
+        <label>Prefix:
+          <input type="text" id="prefix-input" placeholder="e.g. TP104-">
+        </label>
+        <label>Axes (space-separated):
+          <input type="text" id="axes-input" value="A B C D 1 2 3">
+        </label>
+        <button id="try-convention-btn" type="button">Try this</button>
+      </div>
+
+      <div id="axes-results" class="hidden">
+        <h3>Results</h3>
+        <div id="axes-summary"></div>
+        <button id="confirm-axes-btn" type="button" class="primary hidden">Continue →</button>
+      </div>
+
+      <!-- Advanced: project-specific cleaning policy -->
+      <details id="policy-panel" class="checks-panel" style="margin-top: 1em;">
+        <summary>Advanced — cleaning policy <span class="muted">(auto-detected from your drawings; edit if wrong)</span></summary>
+        <div class="policy-grid">
+          <div class="policy-row">
+            <label>Label regex (TEXT/MTEXT to keep):
+              <input type="text" id="policy-label-regex" class="policy-wide">
+            </label>
+          </div>
+          <div class="policy-row">
+            <label>STR block prefixes (comma-separated):
+              <input type="text" id="policy-str-prefixes" class="policy-wide">
+            </label>
+          </div>
+          <div class="policy-row">
+            <label>MECH block prefixes:
+              <input type="text" id="policy-mech-prefixes" class="policy-wide">
+            </label>
+          </div>
+          <div class="policy-row">
+            <label>Marker layer (hexagon balloons):
+              <input type="text" id="policy-marker-layer">
+            </label>
+            <label>Annotation layers:
+              <input type="text" id="policy-annotation-layers" class="policy-wide">
+            </label>
+          </div>
+          <div class="policy-row">
+            <button id="policy-save-btn" type="button">Save policy</button>
+            <span id="policy-save-status" class="muted"></span>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: Transform + Download (shown when state=done) -->
+    <section id="done-section" class="card hidden">
+      <h2>4. Done</h2>
+      <div id="transform-display"></div>
+      <div class="download-row">
+        <a id="download-link" href="#" download="superimposed.dxf" class="primary">⬇ Superimposed DXF</a>
+        <a id="download-annotated-link" href="#" download="superimposed_annotated.dxf">⬇ Annotated DXF (with spot-check clouds)</a>
+        <a id="download-docx-link" href="#" download="spotcheck.docx">⬇ Spot-check DOCX</a>
+        <a id="download-spotcheck-json-link" href="#" download="spotcheck.json">⬇ Spot-check JSON</a>
+      </div>
+    </section>
+
+    <!-- Section 5: Depth analysis + Issues (shown when state=done) -->
+    <section id="analyze-section" class="card hidden">
+      <h2>5. Depth analysis</h2>
+
+      <div class="analyze-controls">
+        <label class="strategy-label">
+          Pair:
+          <select id="analyze-pair-select" class="select-base"></select>
+        </label>
+        <span id="analyze-summary" class="muted"></span>
+        <span class="diag-readout muted"></span>
+      </div>
+
+      <h3 style="margin-top: 1em; font-size: 1em;">Grid intersection depth</h3>
+      <table id="analyze-table">
+        <thead>
+          <tr>
+            <th>Intersection</th>
+            <th>X (MECH)</th>
+            <th>Y (MECH)</th>
+            <th>Residual (u)</th>
+            <th>Normalised depth</th>
+            <th>Nearby issues</th>
+          </tr>
+        </thead>
+        <tbody id="analyze-tbody"></tbody>
+      </table>
+
+      <details id="analyze-issues-details" style="margin-top: 1em;">
+        <summary style="cursor: pointer; font-weight: 600;">Issues panel
+          (<span id="analyze-issues-count">0</span>)
+        </summary>
+        <table id="issues-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Type</th>
+              <th>Severity</th>
+              <th>X (MECH)</th>
+              <th>Y (MECH)</th>
+              <th>Distance (u)</th>
+              <th>Note</th>
+            </tr>
+          </thead>
+          <tbody id="issues-tbody"></tbody>
+        </table>
+        <button id="issues-show-more" class="secondary hidden" style="margin-top: 0.5em;">
+          Show more
+        </button>
+      </details>
+    </section>
+
+    <!-- Error banner -->
+    <section id="error-section" class="card hidden error">
+      <h2>Pipeline failed</h2>
+      <p id="error-message"></p>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

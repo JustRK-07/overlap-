@@ -1,0 +1,6 @@
+fastapi==0.140.0
+uvicorn[standard]==0.52.4
+ezdxf==1.4.4
+matplotlib==3.11.1
+python-multipart>=0.0.9
+python-docx==1.2.0

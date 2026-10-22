@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# Runtime — job outputs and uploads
+jobs/[0-9a-f]*/
+!jobs/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Build / cache
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Big test artifacts
+*.tmp
