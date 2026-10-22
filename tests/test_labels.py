@@ -49,11 +49,11 @@ def test_scan_writes_all_four_outputs(fx_isolated_jobs):
         drawing_b_name="b.dxf", drawing_b_size=10,
     )
     d = job_dir(job.job_id)
-    (d / "cleaned").mkdir(exist_ok=True)
-    _write_dxf(d / "cleaned" / "a.dxf", [
+    (d / "converted").mkdir(exist_ok=True)
+    _write_dxf(d / "converted" / "a.dxf", [
         ("TP104-A", None), ("TP104-B", None), ("TP104-1", None),
     ])
-    _write_dxf(d / "cleaned" / "b.dxf", [
+    _write_dxf(d / "converted" / "b.dxf", [
         ("TP104-A", "GridLine-A"),
         ("TP104-B", "GridLine-B"),
         ("TP104-1", "GridLine-1"),
@@ -79,11 +79,11 @@ def test_agreement_intersects_across_all_drawings(fx_isolated_jobs):
         drawing_b_name="b.dxf", drawing_b_size=10,
     )
     d = job_dir(job.job_id)
-    (d / "cleaned").mkdir(exist_ok=True)
-    _write_dxf(d / "cleaned" / "a.dxf", [
+    (d / "converted").mkdir(exist_ok=True)
+    _write_dxf(d / "converted" / "a.dxf", [
         ("TP104-A", None), ("TP104-ONLY-A", None),
     ])
-    _write_dxf(d / "cleaned" / "b.dxf", [
+    _write_dxf(d / "converted" / "b.dxf", [
         ("TP104-A", None), ("TP104-ONLY-B", None),
     ])
 
@@ -100,9 +100,9 @@ def test_case_insensitive_agreement(fx_isolated_jobs):
         drawing_b_name="b.dxf", drawing_b_size=10,
     )
     d = job_dir(job.job_id)
-    (d / "cleaned").mkdir(exist_ok=True)
-    _write_dxf(d / "cleaned" / "a.dxf", [("TP104-A", None)])
-    _write_dxf(d / "cleaned" / "b.dxf", [("tp104-a", None)])
+    (d / "converted").mkdir(exist_ok=True)
+    _write_dxf(d / "converted" / "a.dxf", [("TP104-A", None)])
+    _write_dxf(d / "converted" / "b.dxf", [("tp104-a", None)])
 
     summary = labels_mod.scan_labels_for_job(job.job_id)
     assert summary["agreement_count"] == 1
@@ -115,9 +115,9 @@ def test_protected_handles_keyed_by_dxf_name(fx_isolated_jobs):
         drawing_b_name="b.dxf", drawing_b_size=10,
     )
     d = job_dir(job.job_id)
-    (d / "cleaned").mkdir(exist_ok=True)
-    _write_dxf(d / "cleaned" / "a.dxf", [("TP104-A", None)])
-    _write_dxf(d / "cleaned" / "b.dxf", [("TP104-A", "GridLine-A")])
+    (d / "converted").mkdir(exist_ok=True)
+    _write_dxf(d / "converted" / "a.dxf", [("TP104-A", None)])
+    _write_dxf(d / "converted" / "b.dxf", [("TP104-A", "GridLine-A")])
 
     labels_mod.scan_labels_for_job(job.job_id)
     handles = json.loads((d / "stages" / "protected_handles.json").read_text())
@@ -155,8 +155,8 @@ def test_beam_section_labels_excluded_from_agreement(fx_isolated_jobs):
         drawing_b_name="b.dxf", drawing_b_size=10,
     )
     d = job_dir(job.job_id)
-    (d / "cleaned").mkdir(exist_ok=True)
-    _write_dxf(d / "cleaned" / "a.dxf", [("ISMB 600", None)])
-    _write_dxf(d / "cleaned" / "b.dxf", [("ISMB 600", None)])
+    (d / "converted").mkdir(exist_ok=True)
+    _write_dxf(d / "converted" / "a.dxf", [("ISMB 600", None)])
+    _write_dxf(d / "converted" / "b.dxf", [("ISMB 600", None)])
     summary = labels_mod.scan_labels_for_job(job.job_id)
     assert summary["agreement_count"] == 0

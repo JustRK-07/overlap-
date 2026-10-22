@@ -35,6 +35,8 @@ Public API:
 """
 from __future__ import annotations
 
+from .dxfio import read_internal as _read_internal, save as _dxf_save
+
 import json
 import math
 from collections import Counter
@@ -75,7 +77,7 @@ def bbox_diagonal(dxf_path: Path) -> float:
     """
     import ezdxf
     try:
-        doc = ezdxf.readfile(str(dxf_path))
+        doc = _read_internal(str(dxf_path))
     except Exception:
         return 0.0
     xs: list[float] = []
@@ -195,18 +197,15 @@ def analyze_pair(job_id: str, pair_id: str | None = None) -> dict:
     transform = json.loads(t_path.read_text())
     spotcheck = json.loads(s_path.read_text())
 
-    # Filenames: pulled from the pair's metadata.json if Slice-1, else
-    # from the cleaned/ dir's lexicographic order (legacy contract:
-    # alphabetical first = MECH, second = STR).
-    pair_meta_path = root / "metadata.json"
-    if pair_meta_path.exists():
-        meta = json.loads(pair_meta_path.read_text())
-        mech_file = meta.get("mech_file")
-        str_file = meta.get("str_file")
-    else:
-        cleaned = sorted((root / "cleaned").glob("*_clean.dxf"))
-        mech_file = cleaned[0].name if cleaned else None
-        str_file  = cleaned[1].name if len(cleaned) > 1 else None
+    # Filenames: explicit roles (pair.json / metadata.json / manifest) —
+    # never alphabetical order. See core.roles.resolve_pair.
+    from .roles import RoleError, resolve_pair
+    try:
+        m_p, s_p = resolve_pair(job_id, root / "cleaned" if pair_id else None,
+                                first=True)
+        mech_file, str_file = m_p.name, s_p.name
+    except RoleError:
+        mech_file = str_file = None
 
     # Per-drawing bbox diagonals (in drawing units). Both feed into
     # normalized_depth — but per the user's spec, mech_diag is what
@@ -215,16 +214,19 @@ def analyze_pair(job_id: str, pair_id: str | None = None) -> dict:
     mech_diag = bbox_diagonal(cleaned_dir / mech_file) if mech_file else 0.0
     str_diag  = bbox_diagonal(cleaned_dir / str_file)  if str_file  else 0.0
 
-    # Intersections — one row per (X-label, Y-label) cross.
+    # Intersections — one row per (X-label, Y-label) cross.  `intersections`
+    # is the legacy alias of `correspondences`; both are read.
+    rows = transform.get("intersections") or transform.get("correspondences") or []
     intersections: list[dict] = []
-    for ix in transform.get("intersections", []):
+    for ix in rows:
         residual = float(ix.get("residual", 0.0))
         intersections.append({
             "label": ix["label"],
             "str":   ix.get("str"),          # [x, y] in STR coords
             "mech":  ix.get("mech"),         # [x, y] in MECH coords
-            "predicted_mech": ix.get("predicted_mech"),
+            "predicted_mech": ix.get("predicted_mech", ix.get("predicted")),
             "residual": residual,
+            "inlier": ix.get("inlier"),
             "normalized_depth": round(normalize_depth(residual, mech_diag), 4),
         })
 
@@ -271,10 +273,23 @@ def analyze_pair(job_id: str, pair_id: str | None = None) -> dict:
         "pair_id": pair_id or "_legacy",
         "mech_file": mech_file,
         "str_file": str_file,
+        # legacy axis-aligned keys (the UI still reads them)
         "scale_x": transform.get("scale_x"),
         "scale_y": transform.get("scale_y"),
         "tx": transform.get("tx"),
         "ty": transform.get("ty"),
+        # the model that was actually fitted, and its quality
+        "model": transform.get("model"),
+        "matrix": transform.get("matrix"),
+        "scale": transform.get("scale"),
+        "rotation_deg": transform.get("rotation_deg"),
+        "mirrored": transform.get("mirrored"),
+        "units": transform.get("units"),
+        "quality": transform.get("quality"),
+        "n_inliers": transform.get("n_inliers"),
+        "n_total": transform.get("n_total"),
+        "outliers": transform.get("outliers"),
+        "loo_max": transform.get("loo_max"),
         "rms_residual": transform.get("rms_residual"),
         "max_residual": transform.get("max_residual"),
         "n_issues": len(issues),

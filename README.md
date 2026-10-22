@@ -24,8 +24,7 @@ pip install -r requirements.txt
                                            # PORT=8765 ./run.sh)
 ```
 
-Open <http://localhost:8000>, drop in two `.dwg` or `.dxf` files, pick strategy A/B/C
-and the grid convention. The pipeline runs as 9 stages with live status; when it's
+Open <http://localhost:8000>, drop in two `.dwg` or `.dxf` files, pick the grid convention. The pipeline runs as 9 stages with live status; when it's
 done (~30–75 s), a Download button appears.
 
 ### Run the smoke test (verifies everything end-to-end)
@@ -60,7 +59,7 @@ Expected output:
 | 4 | **Clean** | Strip annotations (DIMENSION/MTEXT/…), keep grid labels; strip BOX-layer hexagons, orphan blocks | 5–10s |
 | 5 | **Axes** | ⏸ Pauses for user; user picks grid convention (e.g. `TP104-` prefix + A–D, 1–3 axes) | user time |
 | 6 | **Fit** | Find gridline LINEs (not text positions); least-squares affine | 1–3s |
-| 7 | **Overlay** | Apply the affine (per-entity A / wrap-in-blocks B/C) | 5–15s |
+| 7 | **Overlay** | Apply the affine, per-entity | 5–15s |
 | 8 | **Package** | Render preview PNG, aggregate report.json | 5–20s |
 | 9 | **Done** | Job complete; Download button shown in UI | — |
 
@@ -68,18 +67,11 @@ Expected output:
 
 ---
 
-## Three overlay strategies
+## Overlay
 
-The strategy picker on the upload form lets the user pick one:
-
-| Strategy | What it does | Editability | Color policy |
-|---|---|---|---|
-| **A** (per-entity) | Every STR entity copied + transformed into MECH modelspace | HIGHEST (edit any entity directly) | **Original colors preserved** |
-| **B** (2-block) | Each drawing wrapped in 1 block; 2 INSERTs at modelspace | MEDIUM (click block to grab whole layer) | **Forced red/blue** (MECH=red ACI 1, STR=blue ACI 5) |
-| **C** (1-block) | Both merged into 1 block; 1 INSERT at origin | LOW (single grab) | **Forced red/blue** |
-
-A is the canonical default for editing downstream. B/C are useful when you just
-want a clean visual.
+The STR drawing is imported entity-by-entity into the MECH modelspace and
+transformed by the fitted affine. Every entity stays individually selectable and
+**original colors are preserved**.
 
 ---
 
@@ -88,7 +80,7 @@ want a clean visual.
 ```
 Browser
   │
-  │  POST /api/v1/overlay      (multipart: drawing_a, drawing_b, strategy)
+  │  POST /api/v1/overlay      (multipart: drawing_a, drawing_b)
   │  GET  /api/v1/overlay/{id}/status    (polled every 500ms)
   │  GET  /api/v1/overlay/{id}/axes      (suggestions + apply)
   │  POST /api/v1/overlay/{id}/axes      (user picks convention)
@@ -105,10 +97,10 @@ FastAPI (app.py)
   │   ├── validate.py         stage 1
   │   ├── inspect.py          stage 2
   │   ├── convert.py          stage 3
-  │   ├── clean.py            stage 4
+  │   ├── clean_v1.py / clean_v2.py  stage 4
   │   ├── axes.py             stage 5 (convention matcher)
   │   ├── fit.py              stage 6 (port from ISGEC/A/scripts/fit.py)
-  │   ├── overlay.py          stage 7 (A/B/C strategies)
+  │   ├── overlay.py          stage 7 (per-entity overlay)
   │   └── package.py          stage 8
   │
   └── jobs/<uuid>/            per-job storage on disk
@@ -131,7 +123,7 @@ in order; stages 6-9 only run after the user submits their convention.
 
 The single page (`static/index.html`) has 4 sections that appear in order:
 
-1. **Upload** — drag two files, pick strategy, click Start.
+1. **Upload** — drag two files, click Start.
 2. **Pipeline progress** — step rail (1–9) with active/done/failed states;
    status message; file cards.
 3. **Grid convention** (only at stage 5) — auto-suggestions + free-form
@@ -174,8 +166,6 @@ If it's missing, the validation stage will show:
 - No auth — single-tenant use only. Don't put this on a public network.
 - No DWG without ODA (or pre-converted DXF).
 - Grid-label regex is fixed (`^TP\d+-([A-Z]|\d+)\s*$`) — overrides per-job are V2.
-- B/C strategies don't fully implement their block-wrap layouts (per-entity A is
-  the most polished). B/C work, but the wrapping logic is partial.
 - Once you click Start, the worker thread runs to completion even if you close
   the browser — output sits on disk for retrieval later (just reload the page
   with the same `job_id`).
@@ -201,10 +191,10 @@ overlay-app/
 │   ├── validate.py                 Stage 1 — file format sniff
 │   ├── inspect.py                  Stage 2 — entity/layer counts
 │   ├── convert.py                  Stage 3 — DWG→DXF (ODA optional)
-│   ├── clean.py                    Stage 4 — strip annotations/markers
+│   ├── clean_v1.py, clean_v2.py    Stage 4 — strip annotations/markers
 │   ├── axes.py                     Stage 5 — convention matcher
 │   ├── fit.py                      Stage 6 — affine from gridline LINEs
-│   ├── overlay.py                  Stage 7 — A/B/C strategies
+│   ├── overlay.py                  Stage 7 — per-entity overlay
 │   └── package.py                  Stage 8 — preview + report
 │
 ├── static/

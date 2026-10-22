@@ -24,6 +24,7 @@ from ezdxf.addons.drawing import RenderContext, Frontend
 from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
 
 from jobs import job_dir
+from .transform2d import Affine2D
 
 
 def _find_usable_font() -> str | None:
@@ -183,7 +184,7 @@ def _compute_extents(doc) -> tuple[float, float, float, float] | None:
     # extents using an IQR-based bounding window. This filters out:
     #   - stray entities that landed outside the bulk drawing
     #     (e.g., a single `RTR` title-block INSERT at (307K, 1.4M))
-    #   - a few out-of-bounds outliers from `_strategy_A`'s pre-baking
+    #   - a few out-of-bounds outliers from `_overlay_per_entity`'s pre-baking
     # We use the IQR (Q1-Q3) of direct samples as the "drawing
     # range" — robust to a single outlier like the RTR INSERT — so
     # the renderer focuses on the actual structural content.
@@ -213,7 +214,7 @@ def _compute_extents(doc) -> tuple[float, float, float, float] | None:
 
     # Expand INSERTs: visit each block's contents, transformed by the
     # INSERT's insertion + scale. Drop samples that fall far outside
-    # the canonical drawing range (typically because `_strategy_A`
+    # the canonical drawing range (typically because `_overlay_per_entity`
     # baked geometry into a block but its local coords sit at
     # unrealistic values that exceed the canonical drawing scale).
     for ins in msp:
@@ -501,11 +502,26 @@ def _build_report(job_id: str, dxf_path: Path, *,
     t_path = d / "transform.json"
     if t_path.exists():
         t = json.loads(t_path.read_text())
+        aff = Affine2D.from_json(t)          # full 2-D affine (rotation-aware)
         report["transform"] = {
+            # legacy axis-aligned keys (kept for the UI / old reports)
             "scale_x": t["scale_x"], "scale_y": t["scale_y"],
             "tx": t["tx"], "ty": t["ty"],
+            # the actual model
+            "model": t.get("model"),
+            "matrix": t.get("matrix", aff.to_matrix()),
+            "scale": t.get("scale"),
+            "rotation_deg": t.get("rotation_deg"),
+            "mirrored": t.get("mirrored"),
+            # quality
             "rms_residual": t["rms_residual"],
             "max_residual": t["max_residual"],
+            "loo_max": t.get("loo_max"),
+            "n_inliers": t.get("n_inliers"),
+            "n_total": t.get("n_total"),
+            "outliers": t.get("outliers", []),
+            "units": t.get("units"),
+            "quality": t.get("quality"),
             "x_labels": t["x_labels"],
             "y_labels": t["y_labels"],
         }

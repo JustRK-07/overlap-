@@ -134,7 +134,6 @@
   // ─────────────────────────────────────────────────────────────────────
   els.startBtn.addEventListener("click", async () => {
     els.uploadError.classList.add("hidden");
-    const strategy = document.querySelector('input[name="strategy"]:checked').value;
     const cleanVersion = document.querySelector('input[name="clean_version"]:checked').value;
     const enabledChecks = Array.from(
       document.querySelectorAll('input[name="check"]:checked')
@@ -142,7 +141,6 @@
     const fd = new FormData();
     fd.append("drawing_a", fileA);
     fd.append("drawing_b", fileB);
-    fd.append("strategy", strategy);
     fd.append("clean_version", cleanVersion);
     fd.append("enabled_checks", enabledChecks.join(","));
 
@@ -404,12 +402,30 @@
       els.doneSection.classList.remove("hidden");
       if (j.transform) {
         const t = j.transform;
+        // New fits report the real model (scale/rotation/mirror) plus quality;
+        // old jobs only have the axis-aligned scale_x/scale_y/tx/ty shape.
+        const isSimilarity = t.model !== undefined;
+        const head = isSimilarity
+          ? `<div class="transform-block">
+               scale ${t.scale?.toFixed(6)} · rotation ${t.rotation_deg?.toFixed(4)}°${t.mirrored ? " · mirrored" : ""}<br>
+               tx ${t.tx?.toFixed(4)} · ty ${t.ty?.toFixed(4)}
+             </div>`
+          : `<div class="transform-block">
+               x_m = ${t.scale_x.toFixed(6)} · x_s + ${t.tx.toFixed(4)}<br>
+               y_m = ${t.scale_y.toFixed(6)} · y_s + ${t.ty.toFixed(4)}
+             </div>`;
+        const quality = isSimilarity
+          ? `<p class="muted">quality: ${t.quality?.status ?? "?"}
+               · inliers ${t.n_inliers ?? "?"}/${t.n_total ?? "?"}
+               · loo ${_fmtF(t.loo_max)} u${(t.outliers || []).length ? ` · outliers: ${(t.outliers || []).join(", ")}` : ""}</p>`
+          : "";
+        const warnings = (t.quality?.warnings || []).length
+          ? `<p class="muted">${t.quality.warnings.map(_esc).join("<br>")}</p>`
+          : "";
         els.transformDisplay.innerHTML = `
-          <div class="transform-block">
-            x_m = ${t.scale_x.toFixed(6)} · x_s + ${t.tx.toFixed(4)}<br>
-            y_m = ${t.scale_y.toFixed(6)} · y_s + ${t.ty.toFixed(4)}
-          </div>
+          ${head}
           <p class="muted">max residual: ${t.max_residual?.toFixed(4)} u  ·  rms: ${t.rms_residual?.toFixed(4)} u  ·  entities: ${j.outputs?.entity_count ?? "?"}</p>
+          ${quality}${warnings}
         `;
       } else {
         els.transformDisplay.innerHTML = `<p class="muted">No transform available.</p>`;
@@ -663,7 +679,6 @@
   els.multiStartBtn.addEventListener("click", async () => {
     els.multiUploadError.classList.add("hidden");
     els.multiUploadStatus.textContent = "Uploading...";
-    const strategy = document.querySelector('input[name="strategy"]:checked').value;
     const cleanVersion = document.querySelector('input[name="clean_version"]:checked').value;
     const enabledChecks = Array.from(
       document.querySelectorAll('input[name="check"]:checked')
@@ -677,7 +692,6 @@
       roles.push(r.role);
     }
     fd.append("roles", roles.join(","));
-    fd.append("strategy", strategy);
     fd.append("clean_version", cleanVersion);
     fd.append("enabled_checks", enabledChecks.join(","));
     fd.append("prefix", els.mfPrefix.value || "");

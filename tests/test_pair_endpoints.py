@@ -49,7 +49,6 @@ def test_list_pairs_empty(fx_client, fx_isolated_jobs):
 
     # Quick route to a fresh job_id without uploading files.
     job = create_job_legacy(
-        strategy="A",
         drawing_a_name="a.dxf", drawing_a_size=10,
         drawing_b_name="b.dxf", drawing_b_size=10,
     )

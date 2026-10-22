@@ -21,7 +21,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from jobs import create_job, create_job_legacy, load_job, job_dir
+from jobs import create_job, create_job_legacy, load_job, job_dir, save_job
 import pipelines
 
 router = APIRouter(prefix="/api/v1/overlay", tags=["overlay"])
@@ -34,15 +34,10 @@ MAX_UPLOAD_MB = 200
 async def create_overlay(
     drawing_a: UploadFile = File(..., alias="drawing_a"),
     drawing_b: UploadFile = File(..., alias="drawing_b"),
-    strategy: str = Form("A"),
     clean_version: str = Form("v1"),
     enabled_checks: str = Form(""),
 ):
-    """Upload 2 CAD files + strategy + clean_version; spawn a worker; return job_id."""
-    # Validate strategy
-    if strategy not in ("A", "B", "C"):
-        raise HTTPException(400, f"strategy must be A, B, or C; got {strategy!r}")
-
+    """Upload 2 CAD files + clean_version; spawn a worker; return job_id."""
     # Validate clean_version
     if clean_version not in ("v1", "v2"):
         raise HTTPException(400, f"clean_version must be v1 or v2; got {clean_version!r}")
@@ -59,6 +54,15 @@ async def create_overlay(
                 f"Only .dwg or .dxf files accepted; got {f.filename!r} ({ext})",
             )
 
+    # Both drawings are written to uploads/ by name; identical names would
+    # overwrite each other and silently give MECH == STR.
+    if Path(drawing_a.filename or "").name == Path(drawing_b.filename or "").name:
+        raise HTTPException(
+            400,
+            "drawing_a (MECH) and drawing_b (STR) have the same filename "
+            f"{drawing_a.filename!r}; rename one so the roles stay distinct",
+        )
+
     # Validate sizes (FastAPI streams; we just check post-upload content length)
     body_limit = MAX_UPLOAD_MB * 1024 * 1024
     for f in (drawing_a, drawing_b):
@@ -67,7 +71,6 @@ async def create_overlay(
 
     # Create job + persist uploads
     job = create_job_legacy(
-        strategy=strategy,
         drawing_a_name=drawing_a.filename or "a.dxf",
         drawing_a_size=drawing_a.size or 0,
         drawing_b_name=drawing_b.filename or "b.dxf",
@@ -89,7 +92,6 @@ async def create_overlay(
 
     return {
         "job_id": job.job_id,
-        "strategy": strategy,
         "clean_version": clean_version,
         "enabled_checks": checks,
     }
@@ -106,7 +108,6 @@ MAX_FILES_PER_JOB = 16
 async def upload_n_files(
     files: list[UploadFile] = File(..., alias="files"),
     roles: str = Form(..., alias="roles"),       # comma-separated, parallel to files
-    strategy: str = Form("A"),
     clean_version: str = Form("v1"),
     enabled_checks: str = Form(""),
     auto_run: bool = Form(True),
@@ -142,9 +143,7 @@ async def upload_n_files(
             f"file count must be 1..{MAX_FILES_PER_JOB}; got {len(files)}",
         )
 
-    # Validate strategy + clean_version.
-    if strategy not in ("A", "B", "C"):
-        raise HTTPException(400, f"strategy must be A, B, or C; got {strategy!r}")
+    # Validate clean_version.
     if clean_version not in ("v1", "v2"):
         raise HTTPException(400, f"clean_version must be v1 or v2; got {clean_version!r}")
 
@@ -188,7 +187,6 @@ async def upload_n_files(
     job = create_job(
         files=payload_files,
         pairs=[],                  # forces auto-pair via create_job
-        strategy=strategy,
         clean_version=clean_version,
         enabled_checks=checks,
     )
@@ -291,25 +289,17 @@ def _maybe_run_pairs_after_cleaning(
             "axes": list(axes),
         }))
 
-        # Filename reconciliation: match each FileMeta to the actual
-        # file in cleaned/. The cleaner's rename rule is "strip _clean,
-        # re-add it" so the cleaned name is generally
-        # `stem + _clean.dxf` where stem = uploaded_name without `_clean`
-        # and `.dxf`. We try exact match first, then the rename rule.
+        # FileMeta.cleaned_filename is written by the cleaner (stage 6).
+        # Only for jobs whose cleaner predates that (or pre-cleaned
+        # fixtures) look the file up by name via core.roles.
+        from core.roles import locate_cleaned
         cleaned_dir = job_dir(job_id) / "cleaned"
-        cleaned_files = set(p.name for p in cleaned_dir.glob("*_clean.dxf"))
         for fid, meta in job.files.items():
+            current = meta.get("cleaned_filename") if isinstance(meta, dict) else meta.cleaned_filename
+            if current and (cleaned_dir / current).exists():
+                continue
             original = meta.get("name") if isinstance(meta, dict) else meta.name
-            if original in cleaned_files:
-                cleaned_name = original
-            else:
-                # Apply the rename rule: strip `_clean` suffix + `.dxf`,
-                # re-add `_clean.dxf`.
-                stem = Path(original).stem
-                if stem.endswith("_clean"):
-                    stem = stem[: -len("_clean")]
-                candidate = f"{stem}_clean.dxf"
-                cleaned_name = candidate if candidate in cleaned_files else original
+            cleaned_name = locate_cleaned(cleaned_dir, original) or original
             if isinstance(meta, dict):
                 meta["cleaned_filename"] = cleaned_name
             else:
@@ -434,6 +424,8 @@ async def save_policy(job_id: str, body: dict):
         if key in ("keep_block_prefixes_str",
                    "keep_block_prefixes_mech",
                    "annotation_layers",
+                   "marker_block_prefixes",
+                   "triangle_marker_layers",
                    "known_orphan_blocks"):
             if not isinstance(v, list):
                 v = [x.strip() for x in str(v).split(",") if x.strip()]
@@ -446,6 +438,8 @@ async def save_policy(job_id: str, body: dict):
     _merge("keep_block_prefixes_mech", "keep_block_prefixes_mech")
     _merge("marker_layer", "marker_layer")
     _merge("annotation_layers", "annotation_layers")
+    _merge("marker_block_prefixes", "marker_block_prefixes")
+    _merge("triangle_marker_layers", "triangle_marker_layers")
     _merge("known_orphan_blocks", "known_orphan_blocks")
 
     # Persist
@@ -474,15 +468,17 @@ async def apply_axes(job_id: str, body: dict):
     if not isinstance(axes, list):
         raise HTTPException(400, "axes must be a list")
 
-    # Locate cleaned DXFs (alphabetical: drawing_a, drawing_b)
-    cleaned = sorted((job_dir(job_id) / "cleaned").glob("*_clean.dxf"))
-    if len(cleaned) != 2:
-        raise HTTPException(500, f"Expected 2 cleaned DXFs; found {len(cleaned)}")
+    # Locate cleaned DXFs by explicit role (first MECH, first STR).
+    from core.roles import RoleError, resolve_pair
+    try:
+        mech_path, str_path = resolve_pair(job_id, first=True)
+    except RoleError as e:
+        raise HTTPException(500, str(e))
 
-    # Match in each
+    # Match in each (a = MECH, b = STR)
     from core import axes as axes_mod
-    found_a = axes_mod.find_axes(cleaned[0], prefix, axes)
-    found_b = axes_mod.find_axes(cleaned[1], prefix, axes)
+    found_a = axes_mod.find_axes(mech_path, prefix, axes)
+    found_b = axes_mod.find_axes(str_path, prefix, axes)
 
     # Build paired list (matched by suffix)
     pairs = []
@@ -546,10 +542,12 @@ async def download(job_id: str):
     legacy = job_dir(job_id) / "out" / "superimposed.dxf"
     slice1 = None
     pairs_root = job_dir(job_id) / "out" / "pairs"
-    if pairs_root.exists():
-        pair_dirs = list(pairs_root.glob("*"))
-        if pair_dirs and (pair_dirs[0] / "out" / "superimposed.dxf").exists():
-            slice1 = pair_dirs[0] / "out" / "superimposed.dxf"
+    job = load_job(job_id)
+    if pairs_root.exists() and job is not None:
+        # The active pair, not whichever directory glob() lists first.
+        active = job.active_pair_id or (job.pairs[0].pair_id if job.pairs else None)
+        if active and (pairs_root / active / "out" / "superimposed.dxf").exists():
+            slice1 = pairs_root / active / "out" / "superimposed.dxf"
     chosen = slice1 if slice1 else legacy
     if not chosen.exists():
         raise HTTPException(404, f"Overlay not ready: {legacy}")
@@ -716,7 +714,6 @@ async def create_pair(job_id: str, body: dict):
           "str_file":  "TP-104 STR GA_clean3.dxf",
           "prefix":    "TP104-",
           "axes":      ["A","B","C","D","1","2","3"],
-          "strategy":  "A",
           "enabled_checks": null | [...]
         }
 
@@ -744,11 +741,6 @@ async def create_pair(job_id: str, body: dict):
         raise HTTPException(400, f"mech_file {mech_filename!r} not in cleaned/")
     if not (cleaned_dir / str_filename).exists():
         raise HTTPException(400, f"str_file {str_filename!r} not in cleaned/")
-
-    # Validate strategy up-front so we don't half-run before failing.
-    strategy = body.get("strategy") or job.strategy or "A"
-    if strategy not in ("A", "B", "C"):
-        raise HTTPException(400, f"strategy must be A, B, or C; got {strategy!r}")
 
     prefix = body.get("prefix")
     axes = body.get("axes")
@@ -779,7 +771,6 @@ async def create_pair(job_id: str, body: dict):
             pair_id=pair_id,
             prefix=prefix,
             axes=list(axes),
-            strategy=strategy,
             enabled_checks=enabled_checks if enabled_checks else None,
         )
     except FileNotFoundError as e:
@@ -822,7 +813,6 @@ async def list_pairs(job_id: str):
             "pair_id": pair_id,
             "mech_file": meta.get("mech_file"),
             "str_file": meta.get("str_file"),
-            "strategy": meta.get("strategy"),
             "status": status_by_pair.get(pair_id, "done"),
             "created_at": meta.get("created_at"),
             "completed_at": meta.get("completed_at"),

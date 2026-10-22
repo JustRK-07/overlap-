@@ -16,7 +16,7 @@ Stages:
   4. clean      — strip annotations/markers (clean_v1 or clean_v2)
   5. axes       — AUTO-SCAN + WAIT for user convention
   6. fit        — least-squares affine
-  7. overlay    — apply transform per chosen strategy (A/B/C)
+  7. overlay    — apply transform (per-entity)
   8. package    — preview PNG + report JSON
   9. done       — final marker
 """
@@ -87,11 +87,10 @@ def resume_after_axes(job_id: str, *, pair_id: str | None = None) -> None:
     """
     started = time.time()
 
-    # Resolve the pair (if any) for strategy passthrough.
+    # Resolve the pair (if any).
     job = load_job(job_id)
     pair = None
     pair_dir_arg = None
-    strategy_arg = None
     if pair_id is not None and job is not None:
         for p in job.pairs:
             if p.pair_id == pair_id:
@@ -102,7 +101,6 @@ def resume_after_axes(job_id: str, *, pair_id: str | None = None) -> None:
             return
         from core.pair_runner import pair_root
         pair_dir_arg = pair_root(job_id, pair_id) / "cleaned"
-        strategy_arg = pair.strategy
 
     # Stage 8 — fit.
     update_status(job_id, state="running", current_step=8,
@@ -118,10 +116,9 @@ def resume_after_axes(job_id: str, *, pair_id: str | None = None) -> None:
     # Stage 9 — overlay.
     update_status(job_id, state="running", current_step=9,
                   step_name="Building overlay",
-                  message="Applying transform with strategy...")
+                  message="Applying transform...")
     try:
-        _run_stage_module("overlay", job_id,
-                          pair_dir=pair_dir_arg, strategy=strategy_arg)
+        _run_stage_module("overlay", job_id, pair_dir=pair_dir_arg)
         update_status(job_id, message="Overlay built.")
     except Exception as e:
         update_status(job_id, message=f"Overlay failed: {e}", error=str(e))

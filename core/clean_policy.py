@@ -18,6 +18,8 @@ in the file.
 
 from __future__ import annotations
 
+from .dxfio import read_internal as _read_internal, save as _dxf_save
+
 import json
 import re
 from collections import Counter, defaultdict
@@ -56,18 +58,32 @@ class CleaningPolicy:
 
     # Layers that are always documentation, never real geometry.
     # All entities on these layers are stripped.
+    # Matching (see clean_common.layer_matches): an entry ending in '-', '_',
+    # '$' or '*' is a PREFIX; any other entry is an EXACT layer name
+    # (case-insensitive). Bare words such as "FRAME" or "CIVIL" are
+    # deliberately absent: as exact names they would not hit FRAME-STEEL,
+    # and as prefixes they would delete structural layers.
     annotation_layers: list[str] = field(
         default_factory=lambda: [
-            "DIM",        # dimensioning
-            "CIVIL",      # civil markers
-            "AM_",        # annotation markers (AM_5, AM_VIEWS, etc.)
-            "REV-",       # revision triangles (REV-A, REV-B, REV-C)
+            "DIM",        # dimensioning (exact)
+            "AM_",        # annotation markers (AM_5, AM_VIEWS, ...)
+            "REV-",       # revision triangles (REV-A, REV-B, ...)
             "DEFPOINTS",  # dimension definition points layer
-            "AM_VIEWS",
             "TITLE",      # title block
             "BORDER",     # drawing border
-            "FRAME",      # view frame
         ]
+    )
+
+    # Container block names starting with one of these identify blocks
+    # whose triangles/solids are markers (section marks etc.).
+    marker_block_prefixes: list[str] = field(
+        default_factory=lambda: ["SectionMark-", "Mark-"]
+    )
+
+    # Layers (same matching rules as annotation_layers) on which
+    # triangle-shaped entities are removed.
+    triangle_marker_layers: list[str] = field(
+        default_factory=lambda: ["REV-", "SECTION", "AM_"]
     )
 
     # Block names always safe to delete (in addition to unreferenced ones).
@@ -82,6 +98,8 @@ class CleaningPolicy:
             "keep_block_prefixes_mech": self.keep_block_prefixes_mech,
             "marker_layer": self.marker_layer,
             "annotation_layers": self.annotation_layers,
+            "marker_block_prefixes": self.marker_block_prefixes,
+            "triangle_marker_layers": self.triangle_marker_layers,
             "known_orphan_blocks": self.known_orphan_blocks,
         }
 
@@ -180,8 +198,8 @@ def derive_policy_from_drawing_pair(mech_path, str_path) -> "CleaningPolicy":
       4. Auto-derive block prefixes by walking INSERTs.
       5. Fall back to DEFAULT if no agreement found.
     """
-    mech_doc = ezdxf.readfile(str(mech_path))
-    str_doc = ezdxf.readfile(str(str_path))
+    mech_doc = _read_internal(str(mech_path))
+    str_doc = _read_internal(str(str_path))
 
     mech_labels = _strip_metadata_labels(extract_labels(mech_doc))
     str_labels = _strip_metadata_labels(extract_labels(str_doc))
@@ -292,12 +310,18 @@ def run(job_id: str) -> None:
     stages_dir = d / "stages"
     stages_dir.mkdir(exist_ok=True)
 
-    cleaned = sorted(cleaned_dir.glob("*.dxf"))
-    if len(cleaned) < 2:
+    # Roles from the manifest: first MECH + first STR (see core.roles).
+    from .roles import first_of_each, resolve_inputs
+    mech_e, str_e = first_of_each(
+        [e for e in resolve_inputs(job_id) if (d / e.converted).exists()])
+    if mech_e is not None and str_e is not None:
+        policy = derive_policy_from_drawing_pair(d / mech_e.converted, d / str_e.converted)
+    else:
         # Fallback: one input DXF (rare). Derive from whatever we have.
-        if cleaned:
+        only = mech_e or str_e
+        if only is not None:
             from .axes import extract_labels_for_path
-            labels = extract_labels_for_path(cleaned[0])
+            labels = extract_labels_for_path(d / only.converted)
             if labels:
                 suffixes = sorted({c.suffix for c in labels})
                 prefix = labels[0].prefix or ""
@@ -307,8 +331,6 @@ def run(job_id: str) -> None:
                 policy = CleaningPolicy()
         else:
             policy = CleaningPolicy()
-    else:
-        policy = derive_policy_from_drawing_pair(cleaned[0], cleaned[1])
 
     # Augment with agreement-derived block prefixes (label-first safety net).
     agreement_path = stages_dir / "cross_drawing_agreement.json"

@@ -17,6 +17,7 @@ Public API:
   Re-exported from clean_policy:
     DEFAULT_POLICY, CleaningPolicy
   Functions:
+    layer_matches, reachable_blocks, _strip_non_grid_attribs,
     _is_grid_label, _strip_annotations_in, _strip_non_grid_text_in,
     _strip_marker_hexagons, _strip_triangles_in, _strip_orphan_inserts,
     _strip_non_grid_inserts, _strip_orphan_blocks,
@@ -99,12 +100,51 @@ def _is_protected(entity, protected: set[str] | None) -> bool:
         return False
 
 
+_PREFIX_END = ("-", "_", "$", "*")
+
+
+def layer_matches(layer: str, entry: str) -> bool:
+    """Case-insensitive layer match against one policy entry.
+
+    An entry ending in '-', '_', '$' or '*' is a PREFIX (a trailing '*' is
+    stripped first); any other entry is an EXACT layer name. So "REV-"
+    matches REV-A but "FRAME" matches only a layer named FRAME, never
+    FRAME-STEEL.
+    """
+    layer = (layer or "").upper()
+    entry = (entry or "").upper()
+    if not layer or not entry:
+        return False
+    if entry[-1] in _PREFIX_END:
+        prefix = entry[:-1] if entry[-1] == "*" else entry
+        return bool(prefix) and layer.startswith(prefix)
+    return layer == entry
+
+
+def _layer_in(layer: str, entries) -> bool:
+    return any(layer_matches(layer, x) for x in entries)
+
+
+def _label_text(entity) -> str | None:
+    """Text content of a TEXT / MTEXT / ATTRIB entity (None otherwise)."""
+    t = entity.dxftype()
+    try:
+        if t in ("TEXT", "ATTRIB"):
+            return entity.dxf.text
+        if t == "MTEXT":
+            return entity.plain_text()
+    except Exception:
+        return None
+    return None
+
+
 def _is_grid_label(entity, *, policy: CleaningPolicy = DEFAULT_POLICY) -> bool:
-    """True if this TEXT is a grid label we want to keep."""
-    if entity.dxftype() != "TEXT":
+    """True if this TEXT / MTEXT / ATTRIB is a grid label we want to keep."""
+    if entity.dxftype() not in ("TEXT", "MTEXT", "ATTRIB"):
         return False
     try:
-        return bool(_compile_label_re(policy).match(entity.dxf.text.strip()))
+        txt = _label_text(entity)
+        return txt is not None and bool(_compile_label_re(policy).match(txt.strip()))
     except Exception:
         return False
 
@@ -126,7 +166,7 @@ def _strip_annotations_in(container, *, annot_types,
                 if _is_protected(e, protected):
                     continue
                 # Don't delete grid-label TEXT (matches policy.label_regex)
-                if t == "TEXT" and _is_grid_label(e, policy=policy):
+                if t in ("TEXT", "MTEXT") and _is_grid_label(e, policy=policy):
                     kept += 1
                     continue
                 container.delete_entity(e)
@@ -158,8 +198,35 @@ def _strip_non_grid_text_in(container,
                     container.delete_entity(e)
                     removed += 1
             elif t == "MTEXT":
-                # MTEXT is never a grid label
-                container.delete_entity(e)
+                if _is_grid_label(e, policy=policy):
+                    kept += 1
+                else:
+                    container.delete_entity(e)
+                    removed += 1
+        except Exception:
+            pass
+    return removed, kept
+
+
+def _strip_non_grid_attribs(container,
+                            *, policy: CleaningPolicy = DEFAULT_POLICY,
+                            protected: set[str] | None = None) -> tuple[int, int]:
+    """On every INSERT in `container`, delete ATTRIBs that are not grid labels.
+
+    Returns (removed, kept). ATTRIBs live on the INSERT, not in the
+    container, so the per-container annotation strip never sees them.
+    Protected ATTRIBs are kept.
+    """
+    removed, kept = 0, 0
+    for ins in list(container):
+        try:
+            if ins.dxftype() != "INSERT":
+                continue
+            for att in list(ins.attribs):
+                if _is_protected(att, protected) or _is_grid_label(att, policy=policy):
+                    kept += 1
+                    continue
+                ins.delete_attrib(att.dxf.tag)
                 removed += 1
         except Exception:
             pass
@@ -191,37 +258,41 @@ def _strip_marker_hexagons(modelspace, *,
     return removed
 
 
+def _is_triangle(e) -> bool:
+    t = e.dxftype()
+    if t in ("SOLID", "3DFACE", "TRACE"):
+        return True
+    if t == "LWPOLYLINE":
+        return len(list(e.vertices())) == 3
+    return False
+
+
 def _strip_triangles_in(container,
-                         protected: set[str] | None = None) -> int:
-    """Remove triangle-shaped entities (3-vertex LWPOLYLINE, SOLID, 3DFACE,
-    TRACE) from a modelspace or block container.
+                         protected: set[str] | None = None, *,
+                         container_name: str = "",
+                         policy: CleaningPolicy = DEFAULT_POLICY) -> int:
+    """Remove triangle-shaped MARKER entities from a modelspace or block.
 
-    These are unambiguously annotation markers in structural drawings:
-      - Section marks (e.g. "A-A" with hatched triangle)
-      - Revision triangles (REV-A, REV-B, REV-C layers)
-      - Hidden-line view indicators
-      - Detail callout pointers
-
-    Real structural geometry uses ≥ 4 vertices (rectangles, polygons) or
-    HATCHES that follow geometry outlines — none of those are affected.
+    A SOLID / TRACE / 3DFACE / 3-vertex LWPOLYLINE / 3-vertex HATCH path is
+    removed ONLY when it is identified as a marker by context: its layer
+    matches policy.triangle_marker_layers or policy.annotation_layers, or
+    `container_name` starts with one of policy.marker_block_prefixes.
+    Shape alone never triggers removal (gusset plates are triangles).
 
     Protected entities are never deleted.
     """
+    in_marker_block = any(container_name.startswith(p)
+                          for p in policy.marker_block_prefixes if p)
+    marker_layers = list(policy.triangle_marker_layers) + list(policy.annotation_layers)
     removed = 0
     for e in list(container):
         try:
             if _is_protected(e, protected):
                 continue
+            if not (in_marker_block or _layer_in(e.dxf.layer, marker_layers)):
+                continue
             t = e.dxftype()
-            if t in ("SOLID", "3DFACE", "TRACE"):
-                container.delete_entity(e)
-                removed += 1
-            elif t == "LWPOLYLINE":
-                v = list(e.vertices())
-                if len(v) == 3:
-                    container.delete_entity(e)
-                    removed += 1
-            elif t == "HATCH":
+            if t == "HATCH":
                 stripped_any = False
                 for path in list(e.paths):
                     try:
@@ -240,6 +311,9 @@ def _strip_triangles_in(container,
                         pass
                 if stripped_any:
                     removed += 1
+            elif _is_triangle(e):
+                container.delete_entity(e)
+                removed += 1
         except Exception:
             pass
     return removed
@@ -293,98 +367,118 @@ def _strip_non_grid_inserts(modelspace, *, keep_prefixes,
         if _is_protected(e, protected):
             continue
         block_name = e.dxf.name
+        # Anonymous '*' blocks (arrays, dynamic blocks, *U/*X) carry real
+        # geometry and nested INSERTs; they are kept and walked by
+        # reachable_blocks.
+        if block_name.startswith("*"):
+            continue
         if not any(block_name.startswith(p) for p in keep_prefixes):
             modelspace.delete_entity(e)
             removed += 1
     return removed
 
 
-def _strip_orphan_blocks(doc, *,
-                         policy: CleaningPolicy = DEFAULT_POLICY,
-                         protected_blocks: set[str] | None = None) -> int:
-    """Drop blocks that are no longer referenced by anyone.
+def reachable_blocks(doc) -> set[str]:
+    """Names of all blocks reachable from the drawing.
 
-    Removes:
-      - Always: known-orphan policy.known_orphan_blocks
-      - A$C* anonymous blocks not referenced anywhere
-      - Named-prefix blocks (Part-*, Bolt-*, Mark-*, etc.) not referenced
-
-    IMPORTANT: blocks referenced by DIMSTYLE table entries (arrow heads,
-    GENAXEH, etc.) must NEVER be deleted — doing so breaks the dimstyle
-    serialization and produces a corrupt DXF.
-
-    `protected_blocks`: any block whose name is in this set is preserved
-    regardless of reference count. Used by stage 3.5a (`core/labels.py`)
-    to keep `GridLine-*` block defs alive even when no INSERT references
-    them any more — because they still hold a cross-drawing-agreement
-    TEXT label.
+    BFS roots: modelspace and every paperspace layout, DIMSTYLE block
+    attributes, and DIMENSION.dxf.geometry (anonymous *D blocks). Any
+    INSERT inside a reachable block -- including '*' anonymous blocks --
+    makes its target reachable. Layout blocks are always included.
     """
-    # 1. Build set of still-referenced block names — from INSERT entities.
-    referenced = set()
-    for e in doc.modelspace():
-        try:
-            if e.dxftype() == "INSERT":
-                referenced.add(e.dxf.name)
-        except Exception:
-            pass
-    for block in doc.blocks:
-        if block.name.startswith("*"):
-            continue
-        for e in block:
+    reachable: set[str] = set()
+    queue: list = []
+
+    def add(name):
+        if name and name not in reachable:
+            reachable.add(name)
+            queue.append(name)
+
+    def scan(container):
+        for e in container:
             try:
-                if e.dxftype() == "INSERT":
-                    referenced.add(e.dxf.name)
+                t = e.dxftype()
+                if t == "INSERT":
+                    add(e.dxf.name)
+                elif t == "DIMENSION":
+                    add(getattr(e.dxf, "geometry", None))
             except Exception:
                 pass
 
-    # 1b. Also collect blocks referenced by DIMSTYLE table entries.
-    #     Arrow blocks, GENAXEH, DIMBLK_*, DIMLDRBLK, DIMTXSTY/BLK etc. must
-    #     be preserved even if no INSERT points to them.
+    try:
+        scan(doc.modelspace())
+    except Exception:
+        pass
+    for layout in doc.layouts:
+        try:
+            add(layout.block_record_name)
+            scan(layout)
+        except Exception:
+            pass
+    for block in doc.blocks:
+        n = block.name
+        if n.lower() == "*model_space" or n.lower().startswith("*paper_space"):
+            add(n)
     try:
         for dimstyle in doc.dimstyles:
-            for attr in ("dimblk", "dimmblk", "dimblk1", "dimblk2",
-                         "dimldrblk", "dimltype"):
+            for attr in ("dimblk", "dimblk1", "dimblk2", "dimldrblk", "dimltype"):
                 try:
-                    name = getattr(dimstyle.dxf, attr, None)
-                    if name:
-                        referenced.add(name)
+                    add(getattr(dimstyle.dxf, attr, None))
                 except Exception:
                     pass
     except Exception:
         pass
 
-    # 2. Delete unreferenced blocks — be defensive: only delete
-    #    named-pattern blocks (A$C*, Part-*, Bolt-*, Mark-*, etc.) and
-    #    never blocks with CAD-system names.
-    def _is_safe_to_delete(name):
-        # Always safe: A$C* anonymous blocks
-        if name.startswith("A$C"):
-            return True
-        # Always safe: known Part-/Bolt-/Mark-/GridLine-/etc. block patterns
-        safe_prefixes = (
-            "Part-", "Bolt-", "Connection-", "Mark-",
-            "StraightDimension-", "Text-", "Line-",
-            "ReferenceModel-", "SectionMark-", "Unknown-",
-            "GridLine-",
-        )
-        return any(name.startswith(p) for p in safe_prefixes)
+    while queue:
+        name = queue.pop()
+        try:
+            block = doc.blocks.get(name)
+        except Exception:
+            block = None
+        if block is not None:
+            scan(block)
+    return reachable
 
+
+def _is_layout_block(name: str) -> bool:
+    low = name.lower()
+    return low == "*model_space" or low.startswith("*paper_space")
+
+
+_SAFE_PREFIXES = (
+    "Part-", "Bolt-", "Connection-", "Mark-",
+    "StraightDimension-", "Text-", "Line-",
+    "ReferenceModel-", "SectionMark-", "Unknown-",
+    "GridLine-",
+)
+
+
+def _is_safe_to_delete(name: str) -> bool:
+    return name.startswith("A$C") or any(name.startswith(p) for p in _SAFE_PREFIXES)
+
+
+def _strip_orphan_blocks(doc, *,
+                         policy: CleaningPolicy = DEFAULT_POLICY,
+                         protected_blocks: set[str] | None = None) -> int:
+    """Drop blocks that are no longer reachable (see `reachable_blocks`).
+
+    Removes known-orphan policy blocks and unreachable A$C* / Part-* /
+    Bolt-* / Mark-* ... blocks. Anonymous '*' blocks and layout blocks are
+    never deleted here. Blocks reachable only through '*' blocks, paperspace,
+    DIMENSION geometry or DIMSTYLE entries are kept.
+
+    `protected_blocks` are preserved regardless (stage 3.5a labels).
+    """
+    reachable = reachable_blocks(doc)
     known_orphans = set(policy.known_orphan_blocks)
     protected = protected_blocks or set()
     removed = 0
     for block in list(doc.blocks):
         name = block.name
-        if name.startswith("*"):
-            continue
-        if name in protected:
-            # Stage 3.5a marked this block — leave it intact even if it's
-            # no longer referenced anywhere.
+        if name.startswith("*") or name in protected:
             continue
         try:
-            if name in known_orphans:
-                doc.blocks.delete_block(name, safe=False)
-                removed += 1
-            elif name not in referenced and _is_safe_to_delete(name):
+            if name in known_orphans or (name not in reachable and _is_safe_to_delete(name)):
                 doc.blocks.delete_block(name, safe=False)
                 removed += 1
         except Exception:
@@ -395,92 +489,41 @@ def _strip_orphan_blocks(doc, *,
 def _strip_orphan_blocks_aggressive(doc, *,
                                     policy: CleaningPolicy = DEFAULT_POLICY,
                                     protected_blocks: set[str] | None = None) -> int:
-    """V1 variant of orphan-block removal.
+    """V1 variant: also deletes unreachable *U* / *D* blocks and empty blocks.
 
-    v1 also deletes *U* and *D* (paper-space / dimension internal
-    sub-blocks) when unreferenced, and empty blocks. v2 leaves these
-    alone (less aggressive).
-
-    `protected_blocks`: same semantics as `_strip_orphan_blocks` — names
-    in this set are preserved regardless of reference count.
+    Reachability is computed by `reachable_blocks` (walks into '*' blocks),
+    so a block referenced only from an anonymous block is kept.
     """
-    referenced = set()
-    for e in doc.modelspace():
-        try:
-            if e.dxftype() == "INSERT":
-                referenced.add(e.dxf.name)
-        except Exception:
-            pass
-    for block in doc.blocks:
-        if block.name.startswith("*"):
-            continue
-        for e in block:
-            try:
-                if e.dxftype() == "INSERT":
-                    referenced.add(e.dxf.name)
-            except Exception:
-                pass
-    try:
-        for dimstyle in doc.dimstyles:
-            for attr in ("dimblk", "dimmblk", "dimblk1", "dimblk2",
-                         "dimldrblk", "dimltype"):
-                try:
-                    name = getattr(dimstyle.dxf, attr, None)
-                    if name:
-                        referenced.add(name)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # 1c. Empty blocks (no entities) are never useful — mark for deletion,
-    # but never if they're in the protected set.
+    reachable = reachable_blocks(doc)
     protected = protected_blocks or set()
+
+    # Empty, unreachable blocks are never useful.
     for block in list(doc.blocks):
+        name = block.name
+        if name.startswith("*") or name in protected or name in reachable:
+            continue
         try:
             if any(True for _ in block):
                 continue
+            doc.blocks.delete_block(name, safe=False)
         except Exception:
-            continue
-        name = block.name
-        if name in protected:
-            continue
-        if not name.startswith("*") and name not in referenced:
-            try:
-                doc.blocks.delete_block(name, safe=False)
-            except Exception:
-                pass
-
-    def _is_safe_to_delete(name):
-        if name.startswith("A$C"):
-            return True
-        safe_prefixes = (
-            "Part-", "Bolt-", "Connection-", "Mark-",
-            "StraightDimension-", "Text-", "Line-",
-            "ReferenceModel-", "SectionMark-", "Unknown-",
-            "GridLine-",
-        )
-        return any(name.startswith(p) for p in safe_prefixes)
+            pass
 
     known_orphans = set(policy.known_orphan_blocks)
     removed = 0
     for block in list(doc.blocks):
         name = block.name
-        # Skip model-space and paper-space layout blocks — those are
-        # essential structural anchors. Delete *U* and *D* (internal
-        # sub-blocks of paper space / dimensions) only if not referenced.
+        if name not in doc.blocks:
+            continue
         if name.startswith("*"):
-            if name in ("*Model_Space", "*Paper_Space", "*Paper_Space0"):
+            if _is_layout_block(name):
                 continue
             if not (name.startswith("*U") or name.startswith("*D")):
                 continue
         if name in protected:
             continue
         try:
-            if name in known_orphans:
-                doc.blocks.delete_block(name, safe=False)
-                removed += 1
-            elif name not in referenced and _is_safe_to_delete(name):
+            if name in known_orphans or (name not in reachable and _is_safe_to_delete(name)):
                 doc.blocks.delete_block(name, safe=False)
                 removed += 1
         except Exception:
@@ -491,7 +534,7 @@ def _strip_orphan_blocks_aggressive(doc, *,
 def _strip_annotation_layer_entities(container, *,
                                      policy: CleaningPolicy = DEFAULT_POLICY,
                                      protected: set[str] | None = None) -> int:
-    """Strip entities on policy.annotation_layers (DIM, CIVIL, AM_*, REV-*).
+    """Strip entities on policy.annotation_layers (DIM, AM_*, REV-*, ...).
 
     Per AutoCAD layer naming conventions, these layers are always for
     documentation — never real geometry. Affects MECH A$C* blocks mostly.
@@ -499,21 +542,15 @@ def _strip_annotation_layer_entities(container, *,
     Protected entities are never deleted.
     """
     removed = 0
-    layers_upper = tuple(l.upper() for l in policy.annotation_layers)
     for e in list(container):
         try:
             if _is_protected(e, protected):
                 continue
-            layer = (e.dxf.layer or "").upper()
-        except Exception:
-            continue
-        if not layer:
-            continue
-        for prefix in layers_upper:
-            if layer == prefix or layer.startswith(prefix):
+            if _layer_in(e.dxf.layer, policy.annotation_layers):
                 container.delete_entity(e)
                 removed += 1
-                break
+        except Exception:
+            continue
     return removed
 
 
@@ -529,16 +566,13 @@ def _strip_annotation_layer_text(modelspace, *,
     Protected entities are never deleted.
     """
     removed = 0
-    # Subset: only the dimension text layers, not the wide annotation set
-    layers_upper = ("DIM", "AM_", "REV-", "CIVIL")
     for e in list(modelspace):
         try:
             if _is_protected(e, protected):
                 continue
             if e.dxftype() not in ("TEXT", "MTEXT"):
                 continue
-            layer = (e.dxf.layer or "").upper()
-            if any(layer == p or layer.startswith(p) for p in layers_upper):
+            if _layer_in(e.dxf.layer, policy.annotation_layers):
                 modelspace.delete_entity(e)
                 removed += 1
         except Exception:

@@ -29,7 +29,7 @@ Why a dedicated module?
 Public API:
   encode_pair_id(mech_filename, str_filename) -> str
   run_pair(job_id, *, mech_filename, str_filename, pair_id,
-           prefix, axes, strategy="A",
+           prefix, axes,
            enabled_checks=None) -> dict
 """
 from __future__ import annotations
@@ -110,7 +110,6 @@ def run_pair(
     pair_id: str,
     prefix: str,
     axes: list[str],
-    strategy: str = "A",
     enabled_checks: list[str] | None = None,
 ) -> dict:
     """Run a single pair end-to-end (stages 6 → 8.5).
@@ -147,6 +146,11 @@ def run_pair(
     shutil.copyfile(src_cleaned / mech_filename, pair_cleaned / mech_filename)
     shutil.copyfile(src_cleaned / str_filename, pair_cleaned / str_filename)
 
+    # Explicit roles for every stage below (they call roles.resolve_pair
+    # with this pair_dir). Written BEFORE any stage runs.
+    from .roles import write_pair_json
+    write_pair_json(root, mech_filename, str_filename, pair_id)
+
     # Pre-create the per-pair stages/ and out/ directories. Each stage
     # expects to write into them but doesn't mkdir()-and-write atomically;
     # we make them up front so the first stage write doesn't FileNotFound.
@@ -175,9 +179,7 @@ def run_pair(
     fit_mod.run(job_id, pair_dir=pair_cleaned)
 
     # 7 — overlay (depends on transform). Writes out/superimposed.dxf.
-    # `strategy` is per-pair (Slice 2) — overlay.run accepts it explicitly
-    # so we don't mutate the job-level strategy field.
-    overlay_mod.run(job_id, pair_dir=pair_cleaned, strategy=strategy)
+    overlay_mod.run(job_id, pair_dir=pair_cleaned)
 
     # 7.5 — split spotchecks into MECH intra, STR intra, cross, then
     # annotate the DXF. Order matches pipelines.resume_after_axes().
@@ -209,7 +211,6 @@ def run_pair(
         "pair_id": pair_id,
         "mech_file": mech_filename,
         "str_file": str_filename,
-        "strategy": strategy,
         "prefix": prefix,
         "axes": list(axes),
         "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -235,7 +236,6 @@ def run_pair(
         "pair_id": pair_id,
         "mech_file": mech_filename,
         "str_file": str_filename,
-        "strategy": strategy,
         "prefix": prefix,
         "axes": list(axes),
         "status": "done",
@@ -314,9 +314,16 @@ def run_pairs_for_job(
             raise FileNotFoundError(
                 f"file_id {fid!r} not in JobState.files for job {job_id!r}",
             )
+        from .roles import locate_cleaned
         if isinstance(meta, dict):
-            return meta.get("name") or meta.get("cleaned_filename") or fid
-        return meta.cleaned_filename or meta.name
+            name, cleaned = meta.get("name"), meta.get("cleaned_filename")
+        else:
+            name, cleaned = meta.name, meta.cleaned_filename
+        cdir = job_dir(job_id) / "cleaned"
+        if cleaned and (cdir / cleaned).exists():
+            return cleaned
+        # Cleaner predates cleaned_filename (old job) -> look up by name.
+        return (name and locate_cleaned(cdir, name)) or name or fid
 
     results: list[dict] = []
     for pair in pairs:
@@ -335,7 +342,6 @@ def run_pairs_for_job(
                 pair_id=pair_id,
                 prefix=prefix,
                 axes=list(axes),
-                strategy=pair.strategy,
                 enabled_checks=pair.enabled_checks if pair.enabled_checks else enabled_checks,
             )
             # Copy metrics/artifacts into the Pair so the UI sees them.

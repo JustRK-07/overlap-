@@ -33,6 +33,8 @@ Writes: jobs/<id>/out/superimposed_annotated.dxf
 
 from __future__ import annotations
 
+from .dxfio import read_internal as _read_internal, save as _dxf_save
+
 import json
 import re
 from pathlib import Path
@@ -138,7 +140,7 @@ def annotate_dxf(job_id: str, *, pair_dir=None) -> int:
     src = root / "out" / "superimposed.dxf"
     if not src.exists():
         raise RuntimeError(f"superimposed.dxf missing at {src}")
-    doc = ezdxf.readfile(str(src))
+    doc = _read_internal(str(src))
     _ensure_layer(doc, ANNOTATION_LAYER, SEVERITY_COLOR["CRITICAL"])
     msp = doc.modelspace()
 
@@ -159,7 +161,7 @@ def annotate_dxf(job_id: str, *, pair_dir=None) -> int:
 
     # Save annotated copy alongside the original
     out = root / "out" / "superimposed_annotated.dxf"
-    doc.saveas(str(out))
+    _dxf_save(doc, str(out))
     return n_drawn
 
 

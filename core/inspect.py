@@ -16,6 +16,8 @@ Writes jobs/<id>/stages/inspect.json with:
 
 from __future__ import annotations
 
+from .dxfio import read_internal as _read_internal, save as _dxf_save
+
 import json
 from collections import Counter
 from pathlib import Path
@@ -28,7 +30,7 @@ from jobs import job_dir
 def _inspect_dxf(path: Path) -> dict:
     """Return entity-type histogram + layer list for a DXF."""
     try:
-        doc = ezdxf.readfile(str(path))
+        doc = _read_internal(str(path))
     except Exception as e:
         return {"error": str(e)}
 

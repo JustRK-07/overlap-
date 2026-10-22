@@ -32,6 +32,8 @@ makes the data drive the cleaner's decisions instead of heuristics.
 """
 from __future__ import annotations
 
+from .dxfio import read_internal as _read_internal, save as _dxf_save
+
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -55,12 +57,19 @@ def scan_labels_for_job(job_id: str) -> dict:
     stages_dir = d / "stages"
     stages_dir.mkdir(exist_ok=True)
 
-    # Find DXFs that the convert stage produced (skip any pre-existing
-    # `_clean.dxf` outputs).
-    dxfs = sorted(
-        p for p in cleaned_dir.glob("*.dxf")
-        if not p.stem.endswith("_clean")
-    )
+    # Roles come from the manifest (core.roles) — never from names.
+    # Scan every MECH/STR input that exists; the cross-drawing agreement
+    # itself is computed from the first MECH + first STR only.
+    from .roles import first_of_each, resolve_inputs
+    entries = [e for e in resolve_inputs(job_id) if e.role in ("mech", "str")]
+    entries = [e for e in entries if (d / e.converted).exists()]
+    dxfs = [d / e.converted for e in entries]
+    agree_names = {
+        e.converted_name for e in first_of_each(entries) if e is not None
+    }
+    if len(entries) > len(agree_names):
+        print(f"  labels: agreement computed from {sorted(agree_names)}; "
+              f"{len(entries) - len(agree_names)} further file(s) scanned only")
 
     if not dxfs:
         # Nothing to scan — write empty outputs so downstream stages
@@ -72,7 +81,7 @@ def scan_labels_for_job(job_id: str) -> dict:
 
     per_drawing: dict[str, list[dict]] = {}
     for dxf in dxfs:
-        doc = ezdxf.readfile(str(dxf))
+        doc = _read_internal(str(dxf))
         labels = extract_labels(doc)
         per_drawing[dxf.name] = [_label_to_dict(c) for c in labels]
 
@@ -84,6 +93,7 @@ def scan_labels_for_job(job_id: str) -> dict:
     text_sets: dict[str, set[str]] = {
         name: {lab["text"].upper() for lab in labs}
         for name, labs in per_drawing.items()
+        if name in agree_names
     }
 
     if len(text_sets) < 2:
@@ -110,7 +120,7 @@ def scan_labels_for_job(job_id: str) -> dict:
     block_to_insert_handles: dict[str, dict[str, set[str]]] = defaultdict(
         lambda: defaultdict(set)
     )
-    for dxf_path_str, doc in ((str(p), __import__("ezdxf").readfile(str(p))) for p in dxfs):
+    for dxf_path_str, doc in ((str(p), _read_internal(str(p))) for p in dxfs):
         dxf_name = Path(dxf_path_str).name
         for ins in doc.modelspace():
             try:

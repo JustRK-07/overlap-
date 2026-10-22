@@ -19,6 +19,8 @@ Output:
 
 from __future__ import annotations
 
+from .dxfio import read_internal as _read_internal, save as _dxf_save
+
 import json
 import math
 from dataclasses import asdict, dataclass, field
@@ -362,16 +364,12 @@ def run(job_id: str, *,
     d = job_dir(job_id)
     if pair_dir is not None:
         root = Path(pair_dir).parent
-        cleaned = sorted(Path(pair_dir).glob("*_clean.dxf"))
     else:
         root = d
-        cleaned = sorted((d / "cleaned").glob("*_clean.dxf"))
-    # STR is alphabetically second
-    str_path = cleaned[1] if len(cleaned) > 1 else None
-    if str_path is None or not str_path.exists():
-        raise RuntimeError("STR cleaned DXF missing")
+    from .roles import resolve_pair
+    _, str_path = resolve_pair(job_id, pair_dir)   # explicit roles
 
-    doc = ezdxf.readfile(str(str_path))
+    doc = _read_internal(str(str_path))
     beams, columns = _extract_members(doc)
 
     result = StrIntraResult(
