@@ -11,7 +11,7 @@ same INSERT).
 
 Public API
 ----------
-walk_world(doc, layout=None, *, max_depth=16) -> Iterator[WorldItem]
+walk_world(doc, layout=None, *, root=None, max_depth=16) -> Iterator[WorldItem]
 label_occurrences(doc, prefix, suffixes) -> dict[suffix, list[LabelOcc]]
 candidate_segments(doc) -> list[Segment]
 merge_collinear(segs, ang_tol=1e-6, off_tol=...) -> list[GridLineCand]
@@ -55,6 +55,10 @@ class WorldItem:
     m: Matrix44                      # entity coordinates -> world
     chain: tuple = ()                # block names from modelspace down
     handles: tuple = ()              # INSERT handles from modelspace down
+    #: Layer a layer-"0" entity inherits here: the nearest INSERT in the
+    #: chain whose layer is not "0" ("" when there is none).  Added for
+    #: core/mismatch/features.py; ignored by every other consumer.
+    inherited_layer: str = ""
 
 
 def _insert_instances(ins):
@@ -74,7 +78,8 @@ def _insert_instances(ins):
     yield "", ins
 
 
-def walk_world(doc, layout=None, *, max_depth: int = 16) -> Iterator[WorldItem]:
+def walk_world(doc, layout=None, *, root: Matrix44 | None = None,
+               max_depth: int = 16) -> Iterator[WorldItem]:
     """Depth-first walk of a layout, recursing into INSERTs.
 
     ``m_child = insert.matrix44() * m_parent`` (ezdxf row-vector
@@ -85,19 +90,27 @@ def walk_world(doc, layout=None, *, max_depth: int = 16) -> Iterator[WorldItem]:
     ATTRIBs are yielded with the *parent* matrix (their coordinates are
     already in the INSERT's parent space).  Cycles and depth beyond
     ``max_depth`` are skipped.
+
+    ``root`` (step 8b.3) is the matrix applied *first*: modelspace items
+    are yielded with it and every INSERT composes on top, so
+    ``m_child = insert.matrix44() * root * …``.  It is how the STR drawing
+    is mapped into MECH world — ``Affine2D.to_matrix44()`` from
+    ``transform.json``.  ``None`` means the identity, which is the
+    pre-8b.3 behaviour.
     """
     if layout is None:
         layout = doc.modelspace()
-    yield from _walk(doc, layout, Matrix44(), (), (), max_depth)
+    m0 = Matrix44() if root is None else root
+    yield from _walk(doc, layout, m0, (), (), "", max_depth)
 
 
-def _walk(doc, container, m, chain, handles, depth) -> Iterator[WorldItem]:
+def _walk(doc, container, m, chain, handles, inherited, depth) -> Iterator[WorldItem]:
     for e in container:
         t = e.dxftype()
         if t != "INSERT":
-            yield WorldItem(e, m, chain, handles)
+            yield WorldItem(e, m, chain, handles, inherited)
             continue
-        yield WorldItem(e, m, chain, handles)
+        yield WorldItem(e, m, chain, handles, inherited)
         try:
             name = e.dxf.name
         except Exception:
@@ -107,6 +120,12 @@ def _walk(doc, container, m, chain, handles, depth) -> Iterator[WorldItem]:
             continue
         if any(name.lower() == c.lower() for c in chain):     # cycle guard
             continue
+        try:
+            ins_layer = str(e.dxf.layer)
+        except Exception:
+            ins_layer = "0"
+        # layer "0" keeps whatever the enclosing INSERTs established
+        child_inh = ins_layer if ins_layer != "0" else inherited
         base_h = str(e.dxf.handle)
         for sfx, inst in _insert_instances(e):
             h = handles + (base_h + sfx,)
@@ -115,8 +134,8 @@ def _walk(doc, container, m, chain, handles, depth) -> Iterator[WorldItem]:
             except Exception:
                 continue
             for a in e.attribs:
-                yield WorldItem(a, m, chain + (name,), h)
-            yield from _walk(doc, block, mc, chain + (name,), h, depth - 1)
+                yield WorldItem(a, m, chain + (name,), h, child_inh)
+            yield from _walk(doc, block, mc, chain + (name,), h, child_inh, depth - 1)
 
 
 def _world_pt(m: Matrix44, p) -> Vec2:
@@ -235,14 +254,17 @@ def _entity_segments(e):
 
 
 def _extent(doc, lines) -> float:
-    """Diagonal-ish extent: max(width, height) of the drawing."""
-    try:
-        from ezdxf import bbox
-        bb = bbox.extents(doc.modelspace(), fast=True)
-        if bb.has_data:
-            return max(bb.size.x, bb.size.y)
-    except Exception:
-        pass
+    """Robust drawing extent: max(width, height), resistant to strays.
+
+    A single title block, stray INSERT or RTR marker sitting far outside
+    the plan (the synthetic fixture puts one at 1e7) would inflate a full
+    bounding box so much that no gridline can clear `MIN_LEN_FRAC * ext`
+    and the fit reports zero shared intersections. We therefore size the
+    drawing from the bulk of the *segment* endpoints using an
+    IQR-expanded window, which ignores a handful of outliers by
+    construction, and fall back to the full bbox when the sample is too
+    small for that to be meaningful.
+    """
     xs, ys = [], []
     for it in lines:
         for a, b in _entity_segments(it.entity):
@@ -250,7 +272,40 @@ def _extent(doc, lines) -> float:
                 w = _world_pt(it.m, p)
                 xs.append(w.x)
                 ys.append(w.y)
-    return max((max(xs) - min(xs)), (max(ys) - min(ys))) if xs else 0.0
+
+    def _full() -> float:
+        try:
+            from ezdxf import bbox
+            bb = bbox.extents(doc.modelspace(), fast=True)
+            if bb.has_data:
+                return max(bb.size.x, bb.size.y)
+        except Exception:
+            pass
+        return max((max(xs) - min(xs)), (max(ys) - min(ys))) if xs else 0.0
+
+    if len(xs) < 8:
+        return _full()
+
+    def _window(vals: list) -> float:
+        v = sorted(vals)
+        n = len(v)
+        q1, q3 = v[int(n * 0.25)], v[int(n * 0.75)]
+        iqr = q3 - q1
+        lo = q1 - 1.5 * iqr
+        hi = q3 + 1.5 * iqr
+        inside = [x for x in v if lo <= x <= hi]
+        # Too few survivors means the "bulk" window mis-fit the data
+        # (a very small or very uniform drawing) — use the full range.
+        if len(inside) < max(4, n // 20):
+            return v[-1] - v[0]
+        return max(inside) - min(inside)
+
+    robust = max(_window(xs), _window(ys))
+    if robust > 0.0:
+        return robust
+    # Degenerate bulk window (every point identical, or the sample was
+    # too small) — fall back to the full bbox.
+    return _full()
 
 
 def candidate_segments(doc, *, _lines=None, _extent_val=None,
