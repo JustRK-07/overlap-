@@ -2,13 +2,16 @@
 """routers/api.py — overlay API endpoints.
 
 POST   /api/v1/overlay              create a job from 2 file uploads
+POST   /api/v1/overlay/upload       create a job from N file uploads (roles[])
 GET    /api/v1/overlay/{id}         full job state
 GET    /api/v1/overlay/{id}/status  lightweight status (polled every 500ms)
 GET    /api/v1/overlay/{id}/axes    suggested conventions + matched axes
 POST   /api/v1/overlay/{id}/axes    submit a convention (re-scan + proceed)
 POST   /api/v1/overlay/{id}/axes/confirm  confirm axes (worker resumes)
 GET    /api/v1/overlay/{id}/download  stream final DXF
-GET    /api/v1/overlay/{id}/preview.png  preview PNG
+GET    /api/v1/overlay/{id}/preview.png        preview PNG (full extents)
+GET    /api/v1/overlay/{id}/preview_grid.png   preview PNG (grid box + 10%)
+GET    /api/v1/overlay/{id}/preview_meta.json  world → pixel map of preview.png
 GET    /api/v1/overlay/{id}/report.json  aggregate job report
 """
 
@@ -18,10 +21,11 @@ import json
 import threading
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from jobs import create_job, create_job_legacy, load_job, job_dir, save_job
+from jobs import (create_job, create_job_legacy, load_job, job_dir,
+                  normalize_options, save_job)
 import pipelines
 
 router = APIRouter(prefix="/api/v1/overlay", tags=["overlay"])
@@ -30,14 +34,144 @@ ALLOWED_EXTS = {".dwg", ".dxf"}
 MAX_UPLOAD_MB = 200
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Job options (PLAN.md step 9)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Five user-facing knobs, all validated here (400 on a bad value) and
+# persisted verbatim in `job.options` (the shape lives in jobs.py —
+# `DEFAULT_OPTIONS` + `normalize_options`). The two readers are:
+#
+#   core.fit.FitOptions.from_job   — flat keys `fit_model` / `allow_weak_fit`
+#                                    (aliases `model` / `force`)
+#   core.overlay.OverlayStyle      — flat keys, or the `options["overlay"]`
+#                                    sub-dict, which wins over the flat ones
+#
+# See README.md §"Options".
+
+COLOR_MODES = ("original", "contrast")
+FIT_MODELS = ("similarity", "affine")
+MAX_LINEWEIGHT = 211       # DXF lineweights are 1/100 mm; 211 = 2.11 mm
+
+_TRUE = {"1", "true", "yes", "on", "t", "y"}
+_FALSE = {"0", "false", "no", "off", "f", "n", ""}
+
+
+def _parse_bool(value, default: bool, *, field: str) -> bool:
+    """Form/JSON bool. Anything but a recognised token is a 400."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in _TRUE:
+            return True
+        if v in _FALSE:
+            return False
+    raise HTTPException(
+        400,
+        f"{field} must be a boolean (true/false, 1/0, on/off); got {value!r}",
+    )
+
+
+def _parse_lineweight(value, *, field: str = "str_lineweight") -> int | None:
+    """An int in DXF's 1/100 mm range, or empty/None → None (unset)."""
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        n = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(
+            400,
+            f"{field} must be an integer number of hundredths of a mm "
+            f"(0..{MAX_LINEWEIGHT}) or empty; got {value!r}",
+        ) from None
+    if not 0 <= n <= MAX_LINEWEIGHT:
+        raise HTTPException(
+            400,
+            f"{field} must be 0..{MAX_LINEWEIGHT} (hundredths of a mm); got {n}",
+        )
+    return n
+
+
+def resolve_options(
+    *,
+    color_mode: str = "original",
+    fit_model: str = "similarity",
+    allow_weak_fit: bool = False,
+    str_lineweight=None,
+    qa_grid: bool = True,
+) -> dict:
+    """Validate the five options and return the ``job.options`` shape.
+
+    Raises ``HTTPException(400)`` with a message naming the offending
+    field and listing what is accepted.
+    """
+    mode = (color_mode or "").strip().lower()
+    if mode not in COLOR_MODES:
+        raise HTTPException(
+            400,
+            f"color_mode must be one of {' | '.join(COLOR_MODES)}; "
+            f"got {color_mode!r}",
+        )
+    model = (fit_model or "").strip().lower()
+    if model not in FIT_MODELS:
+        raise HTTPException(
+            400,
+            f"fit_model must be one of {' | '.join(FIT_MODELS)}; "
+            f"got {fit_model!r}",
+        )
+
+    return normalize_options({
+        "color_mode": mode,
+        "fit_model": model,
+        "allow_weak_fit": _parse_bool(allow_weak_fit, False, field="allow_weak_fit"),
+        "str_lineweight": _parse_lineweight(str_lineweight),
+        "qa_grid": _parse_bool(qa_grid, True, field="qa_grid"),
+    })
+
+
+def set_option(job, key: str, value) -> None:
+    """Patch one option on a loaded job, keeping the namespaces in sync.
+
+    Used by ``POST /{job_id}/axes/confirm`` for `force`, which arrives
+    after the job was created (and can therefore not be a form field).
+    """
+    job.options = normalize_options({**(job.options or {}), key: value})
+
+
 @router.post("")
 async def create_overlay(
     drawing_a: UploadFile = File(..., alias="drawing_a"),
     drawing_b: UploadFile = File(..., alias="drawing_b"),
     clean_version: str = Form("v1"),
     enabled_checks: str = Form(""),
+    color_mode: str = Form("original"),
+    fit_model: str = Form("similarity"),
+    # Declared `str`, not `bool`: FastAPI/pydantic would answer 422 for a
+    # bad token, and the option contract here is a 400 that names the field.
+    allow_weak_fit: str = Form("false"),
+    str_lineweight: str = Form(""),
+    qa_grid: str = Form("true"),
 ):
-    """Upload 2 CAD files + clean_version; spawn a worker; return job_id."""
+    """Upload 2 CAD files + options; spawn a worker; return job_id.
+
+    `drawing_a` is the **MECH** drawing, `drawing_b` the **STR** one.
+    Roles are explicit and never inferred from the filenames.
+    """
+    # Validate the tunables first — a bad option must not leave a job dir
+    # behind for a request that is going to be rejected anyway.
+    options = resolve_options(
+        color_mode=color_mode,
+        fit_model=fit_model,
+        allow_weak_fit=allow_weak_fit,
+        str_lineweight=str_lineweight,
+        qa_grid=qa_grid,
+    )
+
     # Validate clean_version
     if clean_version not in ("v1", "v2"):
         raise HTTPException(400, f"clean_version must be v1 or v2; got {clean_version!r}")
@@ -77,6 +211,7 @@ async def create_overlay(
         drawing_b_size=drawing_b.size or 0,
         clean_version=clean_version,
         enabled_checks=checks,
+        options=options,
     )
 
     d = job_dir(job.job_id) / "uploads"
@@ -94,6 +229,7 @@ async def create_overlay(
         "job_id": job.job_id,
         "clean_version": clean_version,
         "enabled_checks": checks,
+        "options": options,
     }
 
 
@@ -113,23 +249,40 @@ async def upload_n_files(
     auto_run: bool = Form(True),
     prefix: str = Form(""),
     axes: str = Form(""),                      # space-separated, e.g. "A B C 1 2 3"
+    color_mode: str = Form("original"),
+    fit_model: str = Form("similarity"),
+    allow_weak_fit: str = Form("false"),   # str, not bool — see create_overlay
+    str_lineweight: str = Form(""),
+    qa_grid: str = Form("true"),
 ):
     """Upload N CAD files with per-file roles (MECH / STR / other).
 
     The server auto-creates every MECH×STR combination as a Pair. If
     `auto_run=True` (default), every pair runs sequentially in a worker
     thread before returning — same UX as the 2-file endpoint but
-    fan-out. Returns the job_id, file_count, pair_count, and a summary
-    of each pair's status + metrics.
+    fan-out. Returns the job_id, file_count, pair_count, the resolved
+    `options`, and a summary of each pair's status + metrics.
 
     Notes:
       - The legacy `POST ""` endpoint is preserved for the 2-file flow.
       - For now, `prefix`/`axes` are job-level (shared by every pair).
         Per-pair axes can be added later by extending the form fields.
+      - The stage options (`color_mode`, `fit_model`, `allow_weak_fit`,
+        `str_lineweight`, `qa_grid`) are job-level too — every pair runs
+        with them.
     """
     # FastAPI form fields don't accept list[str] — split the comma-
     # separated `roles` string ourselves.
     role_list = [r.strip() for r in roles.split(",") if r.strip()]
+
+    # Validate the tunables before anything touches disk.
+    options = resolve_options(
+        color_mode=color_mode,
+        fit_model=fit_model,
+        allow_weak_fit=allow_weak_fit,
+        str_lineweight=str_lineweight,
+        qa_grid=qa_grid,
+    )
 
     # Validate counts.
     if len(files) != len(role_list):
@@ -189,6 +342,7 @@ async def upload_n_files(
         pairs=[],                  # forces auto-pair via create_job
         clean_version=clean_version,
         enabled_checks=checks,
+        options=options,
     )
 
     # Persist uploads to jobs/<id>/uploads/.
@@ -235,6 +389,7 @@ async def upload_n_files(
                 {"pair_id": p.pair_id, "status": p.status}
                 for p in job.pairs
             ],
+            "options": options,
             "auto_run": False,
             "message": "Pairs queued. Run them via POST /{id}/pairs or wait for the worker.",
         }
@@ -249,6 +404,7 @@ async def upload_n_files(
             {"pair_id": p.pair_id, "status": p.status}
             for p in job.pairs
         ],
+        "options": options,
         "auto_run": True,
     }
 
@@ -314,6 +470,10 @@ def _maybe_run_pairs_after_cleaning(
             pairs=list(job.pairs),
             prefix=prefix,
             axes=list(axes),
+            # The job-level options (color_mode / fit_model /
+            # allow_weak_fit / str_lineweight / qa_grid) are job-wide —
+            # every pair runs with them.
+            options=job.options or None,
         )
         # Mark job done so the UI moves past section 2.
         update_status(job_id, state="done", current_step=9,
@@ -454,9 +614,85 @@ async def save_policy(job_id: str, body: dict):
     return {"ok": True, "clean_policy": policy}
 
 
+_UNKNOWN_AXIS_STATUS = {
+    "status": "missing",
+    "reasons": ["not scanned"],
+    "n_occurrences": 0,
+}
+
+
+def _scan_axes(path: Path, prefix: str, suffixes: list[str]):
+    """(label occurrences, grid verdict per label) for one cleaned drawing.
+
+    ``found`` is exactly what :func:`core.axes.find_axes` returns — the
+    first TEXT/MTEXT/ATTRIB occurrence of ``prefix + suffix`` in world
+    coordinates — so the legacy `pairs` deltas keep their meaning.
+    ``status`` adds :func:`core.grid.detect_grid`'s verdict for the same
+    suffix: which gridline (if any) the label's occurrences voted for.
+
+    The document is read once. Grid detection is advisory: if it raises
+    (an exotic DXF), the label positions still come back and the status
+    falls back to "missing" rather than failing the request.
+    """
+    from core import grid
+    from core.dxfio import read_internal
+
+    try:
+        doc = read_internal(str(path))
+    except Exception as exc:                       # noqa: BLE001 — reported, not raised
+        found = []
+        status = {s: {**_UNKNOWN_AXIS_STATUS,
+                      "reasons": [f"could not read the drawing: {exc}"]}
+                  for s in suffixes}
+        return found, status
+
+    occs = grid.label_occurrences(doc, prefix, suffixes)
+    found = [
+        {"suffix": sfx,
+         "type": "letter" if sfx.isalpha() else "number",
+         "x": float(occs[sfx][0].world_pt.x),
+         "y": float(occs[sfx][0].world_pt.y)}
+        for sfx in suffixes if occs.get(sfx)
+    ]
+
+    try:
+        result = grid.detect_grid(doc, prefix, suffixes)
+    except Exception:                              # noqa: BLE001 — advisory only
+        return found, {s: dict(_UNKNOWN_AXIS_STATUS) for s in suffixes}
+
+    status = {}
+    for sfx in suffixes:
+        ax = result.axes.get(sfx)
+        if ax is None:
+            status[sfx] = {
+                "status": "missing",
+                "reasons": ["no label occurrence matches this prefix + suffix"],
+                "n_occurrences": 0,
+            }
+            continue
+        status[sfx] = {
+            "status": ax.status,
+            "reasons": list(ax.reasons),
+            "n_occurrences": ax.n_occ,
+            "n_agree": ax.n_agree,
+            "point": None if ax.point is None else [ax.point.x, ax.point.y],
+            "dir": None if ax.dir is None else [ax.dir.x, ax.dir.y],
+            "length": ax.length,
+        }
+    return found, status
+
+
 @router.post("/{job_id}/axes")
 async def apply_axes(job_id: str, body: dict):
-    """User submitted a convention {prefix, axes}. Re-scan and return matched axes."""
+    """User submitted a convention {prefix, axes}. Re-scan and return matched axes.
+
+    On top of the legacy `pairs` list (one entry per suffix found in BOTH
+    drawings, with the axis-offset delta) the response carries a per-label
+    `labels` array with the grid-detection verdict from
+    :func:`core.grid.detect_grid` for each drawing — `"ok"`, `"ambiguous"`
+    or `"missing"`, with the detector's reasons. That is what tells the
+    user *why* an axis did not match, instead of just "4 / 7".
+    """
     job = load_job(job_id)
     if job is None:
         raise HTTPException(404, f"No such job: {job_id}")
@@ -475,10 +711,9 @@ async def apply_axes(job_id: str, body: dict):
     except RoleError as e:
         raise HTTPException(500, str(e))
 
-    # Match in each (a = MECH, b = STR)
-    from core import axes as axes_mod
-    found_a = axes_mod.find_axes(mech_path, prefix, axes)
-    found_b = axes_mod.find_axes(str_path, prefix, axes)
+    # Match in each (a = MECH, b = STR) + the per-label grid verdict.
+    found_a, status_a = _scan_axes(mech_path, prefix, axes)
+    found_b, status_b = _scan_axes(str_path, prefix, axes)
 
     # Build paired list (matched by suffix)
     pairs = []
@@ -499,6 +734,34 @@ async def apply_axes(job_id: str, body: dict):
                 "delta": delta,
             })
 
+    # Per-label status — every requested suffix appears, whether it matched
+    # or not, so the UI can list what is missing instead of what isn't.
+    labels = []
+    problems = []
+    for sfx in axes:
+        sa = status_a.get(sfx) or _UNKNOWN_AXIS_STATUS
+        sb = status_b.get(sfx) or _UNKNOWN_AXIS_STATUS
+        a = next((x for x in found_a if x["suffix"] == sfx), None)
+        b = next((x for x in found_b if x["suffix"] == sfx), None)
+        matched = bool(a and b)
+        entry = {
+            "suffix": sfx,
+            "type": "letter" if str(sfx).isalpha() else "number",
+            "mech": sa,
+            "str": sb,
+            "matched": matched,
+            "status": ("ok" if matched else
+                       ("ambiguous" if "ambiguous" in (sa["status"], sb["status"])
+                        else "missing")),
+        }
+        labels.append(entry)
+        for source, st in (("mech", sa), ("str", sb)):
+            if st["status"] != "ok":
+                problems.append({
+                    "suffix": sfx, "source": source,
+                    "status": st["status"], "reasons": list(st.get("reasons") or []),
+                })
+
     result = {
         "prefix": prefix,
         "axes": axes,
@@ -506,6 +769,10 @@ async def apply_axes(job_id: str, body: dict):
         "b_found": len(found_b),
         "all_matched": len(pairs) == len(axes),
         "pairs": pairs,
+        # ── added in step 9 ──
+        "labels": labels,
+        "all_ok": all(l["status"] == "ok" for l in labels),
+        "problems": problems,
     }
 
     # Persist for fit.py to read
@@ -514,13 +781,46 @@ async def apply_axes(job_id: str, body: dict):
 
 
 @router.post("/{job_id}/axes/confirm")
-async def confirm_axes(job_id: str):
-    """User confirmed the axis pairing. Resumes the pipeline (stages 6-9)."""
+async def confirm_axes(job_id: str, request: Request):
+    """User confirmed the axis pairing. Resumes the pipeline (stages 6-9).
+
+    Optional JSON body::
+
+        {"force": true}
+
+    ``force`` maps to :class:`core.fit.FitOptions`' ``force``, i.e. every
+    fit quality gate (too few inliers, a bad leave-one-out residual, a
+    scale that contradicts ``$INSUNITS``) becomes a warning and the fit
+    is written with ``quality.status == "forced"``. It is the same knob
+    as the upload form's `allow_weak_fit`; because it is also a sensible
+    thing to flip *after* seeing the axes report, it can be set here too.
+
+    The body is optional — a POST with no body keeps the job's options as
+    they were. A non-JSON body is a 400 rather than a silent no-op.
+    """
     job = load_job(job_id)
     if job is None:
         raise HTTPException(404, f"No such job: {job_id}")
     if job.state != "awaiting_axes":
         raise HTTPException(400, f"Job is in state {job.state!r}, not awaiting_axes")
+
+    raw = await request.body()
+    if raw.strip():
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise HTTPException(400, f"body must be JSON: {e}") from None
+        if not isinstance(body, dict):
+            raise HTTPException(400, "body must be a JSON object, e.g. {\"force\": true}")
+        if "force" in body:
+            force = _parse_bool(body["force"], False, field="force")
+            # `force` and `allow_weak_fit` are aliases of the same knob in
+            # core.fit; write both so a hand-edited job.json can't have
+            # them disagree (FitOptions takes whichever key it finds
+            # first, which would otherwise be a silent surprise).
+            set_option(job, "force", force)
+            set_option(job, "allow_weak_fit", force)
+            save_job(job)
 
     # Spawn worker for stages 6-9
     threading.Thread(
@@ -528,7 +828,7 @@ async def confirm_axes(job_id: str):
         args=(job_id,),
         daemon=True,
     ).start()
-    return {"status": "resuming"}
+    return {"status": "resuming", "options": job.options}
 
 
 @router.get("/{job_id}/download")
@@ -558,13 +858,35 @@ async def download(job_id: str):
     )
 
 
+def _serve(job_id: str, name: str, media_type: str):
+    """Stream ``jobs/<id>/out/<name>``, 404 when the stage hasn't written it."""
+    path = job_dir(job_id) / "out" / name
+    if not path.exists():
+        raise HTTPException(404, f"No {name} yet: {path}")
+    return FileResponse(str(path), media_type=media_type)
+
+
 @router.get("/{job_id}/preview.png")
 async def preview(job_id: str):
-    """Render preview PNG (stage 8 output)."""
-    preview_path = job_dir(job_id) / "out" / "preview.png"
-    if not preview_path.exists():
-        raise HTTPException(404, f"No preview yet: {preview_path}")
-    return FileResponse(str(preview_path), media_type="image/png")
+    """Preview PNG on the FULL extents (stage 8 output) — nothing is cropped."""
+    return _serve(job_id, "preview.png", "image/png")
+
+
+@router.get("/{job_id}/preview_grid.png")
+async def preview_grid(job_id: str):
+    """Preview PNG cropped to the grid bbox + 10% — the legible close-up.
+
+    `preview.png` shows everything, including the stray geometry the report
+    lists as outliers; a drawing with one badly-placed entity therefore
+    renders tiny. This is the same render over the grid box only.
+    """
+    return _serve(job_id, "preview_grid.png", "image/png")
+
+
+@router.get("/{job_id}/preview_meta.json")
+async def preview_meta(job_id: str):
+    """World → pixel map of `preview.png`, so the UI can place markers."""
+    return _serve(job_id, "preview_meta.json", "application/json")
 
 
 @router.get("/{job_id}/report.json")
@@ -714,8 +1036,13 @@ async def create_pair(job_id: str, body: dict):
           "str_file":  "TP-104 STR GA_clean3.dxf",
           "prefix":    "TP104-",
           "axes":      ["A","B","C","D","1","2","3"],
-          "enabled_checks": null | [...]
+          "enabled_checks": null | [...],
+          "options":   { ... }          // optional per-run override
         }
+
+    `options` (optional) overrides the job's stage tunables for this pair
+    only — see `resolve_options()` for the accepted keys. Without it the
+    job's `job.options` (set at upload time) applies.
 
     If `prefix` / `axes` are missing we fall back to the saved
     `axes/convention.json` (the user's choices from the legacy flow).
@@ -763,6 +1090,10 @@ async def create_pair(job_id: str, body: dict):
     if isinstance(enabled_checks, str):
         enabled_checks = [c.strip() for c in enabled_checks.split(",") if c.strip()]
 
+    options = body.get("options")
+    if options is not None and not isinstance(options, dict):
+        raise HTTPException(400, "options must be a JSON object")
+
     try:
         result = run_pair(
             job_id,
@@ -772,6 +1103,7 @@ async def create_pair(job_id: str, body: dict):
             prefix=prefix,
             axes=list(axes),
             enabled_checks=enabled_checks if enabled_checks else None,
+            options=options,
         )
     except FileNotFoundError as e:
         raise HTTPException(400, str(e))
@@ -833,7 +1165,8 @@ async def get_pair_artifact(job_id: str, pair_id: str, artifact: str):
     `artifact` is one of:
       transform.json, spotcheck.json, mech_intra.json, str_intra.json,
       superimposed.dxf, superimposed_annotated.dxf, preview.png,
-      report.json, spotcheck.docx, metadata.json
+      preview_grid.png, preview_meta.json, report.json, spotcheck.docx,
+      metadata.json
 
     Anything else → 400. `..` traversal → 400.
     """
@@ -844,8 +1177,9 @@ async def get_pair_artifact(job_id: str, pair_id: str, artifact: str):
     # (artifact lives under <pair_root>/out/). The pair_runner writes
     # `transform.json`, `metadata.json`, `*_intra.json`, and
     # `axes/convention.json` at the pair root, while `superimposed.dxf`,
-    # `superimposed_annotated.dxf`, `preview.png`, `report.json`,
-    # `spotcheck.json`, `spotcheck.docx` all land under `out/`.
+    # `superimposed_annotated.dxf`, `preview.png`, `preview_grid.png`,
+    # `preview_meta.json`, `report.json`, `spotcheck.json`,
+    # `spotcheck.docx` all land under `out/`.
     valid = {
         "transform.json":              ("application/json", None),
         "metadata.json":               ("application/json", None),
@@ -856,6 +1190,8 @@ async def get_pair_artifact(job_id: str, pair_id: str, artifact: str):
         "superimposed.dxf":            ("application/dxf", "out"),
         "superimposed_annotated.dxf":  ("application/dxf", "out"),
         "preview.png":                 ("image/png", "out"),
+        "preview_grid.png":            ("image/png", "out"),
+        "preview_meta.json":           ("application/json", "out"),
         "spotcheck.docx":              (
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "out",
@@ -876,8 +1212,10 @@ async def get_pair_artifact(job_id: str, pair_id: str, artifact: str):
     download_name = artifact
     if download_name.startswith("superimposed") and download_name.endswith(".dxf"):
         download_name = f"superimposed_{safe_id}.dxf"
-    elif download_name == "preview.png":
-        download_name = f"preview_{safe_id}.png"
+    elif download_name.startswith("preview"):
+        # preview.png, preview_grid.png — a pair's preview is useless
+        # without knowing which pair it came from.
+        download_name = f"{Path(download_name).stem}_{safe_id}{Path(download_name).suffix}"
 
     return FileResponse(
         str(path),

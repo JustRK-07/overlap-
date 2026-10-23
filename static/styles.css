@@ -490,3 +490,28 @@ button:disabled {
 }
 .secondary:hover { background: #f1f5f9; }
 #analyze-summary { font-size: 0.9em; }
+
+/* ── Step 9 — options + fit quality ─────────────────────────────────────
+   The badges below reuse the severity palette above so a "forced" fit
+   reads the same as a WARNING issue in the analyze table. */
+.axis-status {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 0.75em;
+  font-weight: 700;
+  text-transform: lowercase;
+}
+.axis-status.ok   { background: #dcfce7; color: #166534; }
+.axis-status.warn { background: #fef3c7; color: #92400e; }
+.axis-status.bad  { background: #fee2e2; color: #991b1b; }
+
+.fit-warnings {
+  margin: 0.5em 0 0;
+  padding-left: 1.2em;
+  font-size: 0.9em;
+}
+.fit-warnings li { margin-bottom: 0.25em; }
+
+#options-panel .strategy-row { margin-top: 0.2em; }
+#options-panel .form-row { align-items: center; }

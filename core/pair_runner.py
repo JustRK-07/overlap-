@@ -30,7 +30,7 @@ Public API:
   encode_pair_id(mech_filename, str_filename) -> str
   run_pair(job_id, *, mech_filename, str_filename, pair_id,
            prefix, axes,
-           enabled_checks=None) -> dict
+           enabled_checks=None, options=None) -> dict
 """
 from __future__ import annotations
 
@@ -89,6 +89,8 @@ def pair_root(job_id: str, pair_id: str) -> Path:
             stages/spotcheck.json
             out/superimposed.dxf
             out/preview.png
+            out/preview_grid.png
+            out/preview_meta.json
             out/report.json
             out/spotcheck.docx
             out/spotcheck.json
@@ -102,6 +104,30 @@ def pair_root(job_id: str, pair_id: str) -> Path:
 # Orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
+def apply_options(job_id: str, options: dict | None) -> dict:
+    """Merge ``options`` over the job's stage tunables and persist.
+
+    ``core.fit`` and ``core.overlay`` re-read ``load_job(job_id).options``
+    when they run (there is no per-pair options channel in their
+    signatures), so an override can only reach them through job.json. The
+    merged dict is normalised by :func:`jobs.normalize_options`, which
+    fills in the defaults and re-derives the `fit` / `overlay`
+    namespaces. Returns the effective options.
+
+    With ``options=None`` this is a no-op read: the job's own options
+    apply, which is the normal upload path.
+    """
+    from jobs import load_job, normalize_options, save_job
+
+    job = load_job(job_id)
+    if job is None:
+        return dict(normalize_options(options))
+    if options:
+        job.options = normalize_options({**(job.options or {}), **options})
+        save_job(job)
+    return dict(job.options or {})
+
+
 def run_pair(
     job_id: str,
     *,
@@ -111,6 +137,7 @@ def run_pair(
     prefix: str,
     axes: list[str],
     enabled_checks: list[str] | None = None,
+    options: dict | None = None,
 ) -> dict:
     """Run a single pair end-to-end (stages 6 → 8.5).
 
@@ -123,10 +150,13 @@ def run_pair(
       - prefix and axes are non-empty (else fall back to saved convention)
 
     Effects:
+      - Merges `options` (the stage tunables — color_mode, fit_model,
+        allow_weak_fit, str_lineweight, qa_grid) over the job's own, so
+        stages 6-8.5 run with them.
       - Copies the two cleaned DXFs into the pair dir.
       - Writes axes/convention.json (per-pair).
       - Runs each stage with pair_dir=<pair_root>/cleaned/.
-      - Persists a metadata.json sidecar with metrics.
+      - Persists a metadata.json sidecar with metrics + the options used.
     """
     d = job_dir(job_id)
     src_cleaned = d / "cleaned"
@@ -140,6 +170,10 @@ def run_pair(
             f"str_file {str_filename!r} not in {src_cleaned}"
         )
 
+    # The stage tunables this pair runs with (no-op when the job already
+    # carries them — the upload path).
+    effective_options = apply_options(job_id, options)
+
     root = pair_root(job_id, pair_id)
     pair_cleaned = root / "cleaned"
     pair_cleaned.mkdir(parents=True, exist_ok=True)
@@ -147,9 +181,12 @@ def run_pair(
     shutil.copyfile(src_cleaned / str_filename, pair_cleaned / str_filename)
 
     # Explicit roles for every stage below (they call roles.resolve_pair
-    # with this pair_dir). Written BEFORE any stage runs.
+    # with this pair_dir). Written BEFORE any stage runs. `roles` reads
+    # only `mech` / `str`; the options ride along so a pair directory is
+    # self-describing after the fact.
     from .roles import write_pair_json
-    write_pair_json(root, mech_filename, str_filename, pair_id)
+    write_pair_json(root, mech_filename, str_filename, pair_id,
+                    options=effective_options)
 
     # Pre-create the per-pair stages/ and out/ directories. Each stage
     # expects to write into them but doesn't mkdir()-and-write atomically;
@@ -215,6 +252,7 @@ def run_pair(
         "axes": list(axes),
         "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "completed_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "options": effective_options,
         "metrics": metrics,
         "artifacts": {
             "transform":           str(root / "transform.json"),
@@ -224,6 +262,8 @@ def run_pair(
             "superimposed":        str(root / "out" / "superimposed.dxf"),
             "superimposed_annotated": str(root / "out" / "superimposed_annotated.dxf"),
             "preview":             str(root / "out" / "preview.png"),
+            "preview_grid":        str(root / "out" / "preview_grid.png"),
+            "preview_meta":        str(root / "out" / "preview_meta.json"),
             "report":              str(root / "out" / "report.json"),
             "spotcheck_docx":      str(root / "out" / "spotcheck.docx"),
             "spotcheck_json":      str(root / "out" / "spotcheck.json"),
@@ -239,6 +279,7 @@ def run_pair(
         "prefix": prefix,
         "axes": list(axes),
         "status": "done",
+        "options": effective_options,
         "artifacts": metadata["artifacts"],
         "metrics": metrics,
     }
@@ -285,6 +326,7 @@ def run_pairs_for_job(
     prefix: str,
     axes: list[str],
     enabled_checks: list[str] | None = None,
+    options: dict | None = None,
     pair_root_resolver=None,
 ) -> list[dict]:
     """Run every Pair through stages 6 → 8.5 with status updates.
@@ -295,6 +337,11 @@ def run_pairs_for_job(
     `run_pair()`. Status transitions: queued → running → done (or
     failed). A failed pair does NOT stop the others — mirrors current
     Spot-check non-fatal behaviour.
+
+    `options` is the job-level stage tunables (color_mode, fit_model,
+    allow_weak_fit, str_lineweight, qa_grid) recorded at upload time;
+    every pair runs with them. `None` falls back to whatever
+    `job.options` already holds.
 
     Intended caller: `routers/api.py:upload_n_files`.
     """
@@ -343,6 +390,7 @@ def run_pairs_for_job(
                 prefix=prefix,
                 axes=list(axes),
                 enabled_checks=pair.enabled_checks if pair.enabled_checks else enabled_checks,
+                options=options,
             )
             # Copy metrics/artifacts into the Pair so the UI sees them.
             _update_pair_status(
@@ -353,6 +401,7 @@ def run_pairs_for_job(
                 completed_at=datetime.datetime.now().isoformat(timespec="seconds"),
             )
             results.append({"pair_id": pair_id, "status": "done",
+                            "options": result.get("options"),
                             "artifacts": result["artifacts"], "metrics": result["metrics"]})
         except Exception as e:
             _update_pair_status(job_id, pair_id, status="failed", error=str(e))

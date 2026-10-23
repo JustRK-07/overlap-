@@ -211,8 +211,10 @@ def test_overlay_source_layers(fx_synth_hard):
 
 # ---------------------------------------------------------------- step 8
 
-@pytest.mark.xfail(strict=True, reason="step 8: preview extents percentile-crop hides stray geometry")
 def test_preview_extents_include_stray(tmp_path):
+    """Step 8 — fixed by core.package._compute_extents: the extents are the
+    full (recursive) bbox of the drawing, padded 5%.  The percentile/IQR crop
+    that used to sit there hid the stray; it is now reported as an outlier."""
     from core import package
     opts = synth.with_opts(synth.LEGACY_COMPATIBLE, stray_str_entity_at=(1.0e7, 1.0e7))
     pair = synth.build_pair(tmp_path, opts)
@@ -245,8 +247,16 @@ def _only_layers(path_or_text, prefix, *, text=False):
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(strict=True, reason="step 10: end-to-end synthetic pipeline")
 def test_e2e_synthetic(fx_isolated_jobs, fx_synth_hard):
+    """End-to-end through the API.
+
+    The step-0 strict xfail is gone: step 8 delivered the last things this
+    body asserts (``report.json`` counts / overlay failures /
+    ``dangling_inserts_dropped`` and a non-blank ``preview.png``), so the run
+    now completes.  Step 10 still has to widen it — the HARD preset in metres
+    at 7.5°, an mm/−3° case, the N-file upload with reversed roles and the
+    outlier-axis case are not covered here yet.
+    """
     from fastapi.testclient import TestClient
     from app import app
     from core import grid

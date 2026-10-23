@@ -100,6 +100,19 @@ def _add_linetype(doc, name, pattern=(0.5, -0.25)):
     return name
 
 
+def _snapshot(layer) -> dict:
+    """The properties apply_source_layers has to carry over to the copy."""
+    return {
+        "color": layer.dxf.color,
+        "linetype": layer.dxf.linetype,
+        "lineweight": layer.dxf.lineweight,
+        "plot": layer.dxf.plot,
+        "off": layer.is_off(),
+        "frozen": layer.is_frozen(),
+        "locked": layer.is_locked(),
+    }
+
+
 def _blocks_named(doc, prefix="STR"):
     return {b.name: b for b in doc.blocks
             if not b.name.startswith(("*Model_Space", "*Paper_Space"))}
@@ -306,6 +319,8 @@ def doc_audit_clean(doc) -> bool:
 def test_original_mode_preserves_layer_props(fx_synth_hard):
     """color_mode="original": STR|FRAME-STEEL keeps the STR drawing's colour,
     linetype, lineweight and flags; MECH|CENTER keeps MECH's."""
+    seen = {}
+
     def prep(mech, str_doc):
         for doc in (mech, str_doc):
             _add_linetype(doc, "DASHED")
@@ -314,23 +329,34 @@ def test_original_mode_preserves_layer_props(fx_synth_hard):
                    plot=0, frozen=True)
         _set_props(str_doc, "FRAME-STEEL", color=6, linetype="DASHED",
                    lineweight=35, plot=1, locked=True)
+        # snapshot: the originals are deleted by the time the test can look
+        seen["mech"] = _snapshot(mech.layers.get("CENTER"))
+        seen["str"] = _snapshot(str_doc.layers.get("FRAME-STEEL"))
+        # an entity colour that must survive (this is not the contrast mode)
+        if not str_doc.layers.has_entry("MINE"):
+            str_doc.layers.new("MINE")
+        line = str_doc.modelspace().add_line((1.0, 2.0), (3.0, 4.0),
+                                             dxfattribs={"layer": "MINE", "color": 5})
+        line.dxf.true_color = 0x00FF00
 
-    mech, str_doc, report = _overlay(fx_synth_hard, style=OverlayStyle(), prep=prep)
+    mech, _, report = _overlay(fx_synth_hard, style=OverlayStyle(), prep=prep)
 
-    src_mech = mech.layers.get("CENTER")
-    src_str = str_doc.layers.get("FRAME-STEEL")
+    renamed = report.str_layer_map["FRAME-STEEL"]
     dst_mech = mech.layers.get(report.layers.mech_layers["CENTER"])
-    dst_str = mech.layers.get(report.layers.str_layers[src_str.dxf.name])
+    dst_str = mech.layers.get(report.layers.str_layers[renamed])
     assert dst_mech.dxf.name == "MECH|CENTER"
     assert dst_str.dxf.name == "STR|FRAME-STEEL"
 
     for name in ("color", "linetype", "lineweight", "plot"):
-        assert getattr(dst_mech.dxf, name) == getattr(src_mech.dxf, name), name
-        assert getattr(dst_str.dxf, name) == getattr(src_str.dxf, name), name
+        assert getattr(dst_mech.dxf, name) == seen["mech"][name], name
+        assert getattr(dst_str.dxf, name) == seen["str"][name], name
     assert dst_mech.is_frozen() is True
     assert dst_str.is_locked() is True
     # entity colours are untouched too (this is not the contrast mode)
-    assert any(e.dxf.get("color", 256) != 256 for e in mech.modelspace())
+    kept = [e for e in mech.modelspace() if e.dxf.layer == "STR|MINE"]
+    assert len(kept) == 1
+    assert kept[0].dxf.color == 5
+    assert kept[0].dxf.true_color == 0x00FF00
 
 
 def test_contrast_mode_colors(fx_synth_hard):
@@ -488,9 +514,8 @@ def test_qa_grid_circles_at_mech_intersections(fx_synth_job):
     labels = [e.dxf.text for e in msp.query("TEXT")
               if e.dxf.layer == QA_GRID_LAYER]
     assert len(labels) == 12
-    assert sorted(t.split(" ")[0] for t in labels) == \
-        sorted(c["label"] for c in transform["correspondences"])
-    assert all(t.endswith(" r=0") for t in labels)         # exact fit, no noise
+    assert sorted(labels) == sorted(
+        f"{c['label']} r={c['residual']:.3g}" for c in transform["correspondences"])
 
     assert not [e for e in msp if e.dxf.layer == QA_OUTLIER_LAYER]
 
@@ -576,7 +601,7 @@ def test_output_reopens_audits_clean_with_pipe_layers(fx_synth_hard, tmp_path):
     out = ezdxf.readfile(str(path))
     auditor = out.audit()
     assert auditor.has_errors is False, [e.message for e in auditor.errors]
-    assert auditor.fixes == 0, [str(f) for f in auditor.fixes]
+    assert not auditor.fixes, [str(f) for f in auditor.fixes]
 
     before = _names(mech)
     assert _names(out) == before

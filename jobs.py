@@ -297,6 +297,59 @@ def _new_job_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _clean_options(options: dict | None) -> dict:
+    """Normalise a caller-supplied ``options`` mapping.
+
+    ``None`` → ``{}`` (every stage default). Anything that isn't a
+    mapping raises — a silently-ignored options dict is exactly the bug
+    step 9 exists to prevent. Values are *not* validated here: the API
+    owns validation (400 on a bad value), and a job.json written by an
+    older build must still load.
+    """
+    if options is None:
+        return {}
+    if not isinstance(options, dict):
+        raise ValueError(f"options must be a dict; got {type(options).__name__}")
+    return dict(options)
+
+
+# The stage tunables (PLAN.md step 9) and their defaults. Readers:
+#   core.fit.FitOptions.from_job  — fit_model / allow_weak_fit (aliases
+#                                  model / force)
+#   core.overlay.OverlayStyle     — color_mode / str_lineweight / qa_grid
+#                                  (flat keys, or the `overlay` sub-dict)
+DEFAULT_OPTIONS: dict = {
+    "color_mode": "original",
+    "fit_model": "similarity",
+    "allow_weak_fit": False,
+    "str_lineweight": None,
+    "qa_grid": True,
+}
+
+# The `fit` / `overlay` keys are derived from the flat ones, never set by
+# hand — see `normalize_options`.
+_DERIVED_OPTIONS = ("fit", "overlay")
+
+
+def normalize_options(options: dict | None) -> dict:
+    """Fill in the defaults and (re)derive the ``fit`` / ``overlay`` namespaces.
+
+    The flat keys are what the stage readers use; the namespaces exist so
+    a hand-edited job.json can group them, and are always regenerated from
+    the flat keys so the two can never disagree.
+    """
+    flat = {k: v for k, v in (options or {}).items() if k not in _DERIVED_OPTIONS}
+    resolved = {**DEFAULT_OPTIONS, **flat}
+    resolved["fit"] = {"model": resolved["fit_model"],
+                       "force": resolved["allow_weak_fit"]}
+    resolved["overlay"] = {
+        "color_mode": resolved["color_mode"],
+        "str_lineweight": resolved["str_lineweight"],
+        "qa_grid": resolved["qa_grid"],
+    }
+    return resolved
+
+
 def _ensure_dirs(d: Path) -> None:
     """Make sure every per-job subdir exists. Idempotent."""
     (d / "uploads").mkdir(parents=True, exist_ok=True)
@@ -312,6 +365,7 @@ def create_job(
     pairs: list[dict] | None = None,
     clean_version: str = "v1",
     enabled_checks: list[str] | None = None,
+    options: dict | None = None,
 ) -> JobState:
     """Create a new N-file job: dirs + initial state + Pair list.
 
@@ -326,11 +380,19 @@ def create_job(
     (the /upload endpoint computes it from the user's `roles[]` form
     field).
 
+    `options` is the stage-tunables dict (step 9) — `color_mode`,
+    `fit_model`, `allow_weak_fit`, `str_lineweight`, `qa_grid`. It is
+    stored verbatim on `JobState.options`; `core.fit.FitOptions` and
+    `core.overlay.OverlayStyle` are the readers. `None` means "all
+    defaults", which is also what an old job.json without the field
+    loads as.
+
     Returns the JobState. The caller writes the uploads to
     `job_dir(job_id)/uploads/` and starts the worker thread.
     """
     import datetime
 
+    options = _clean_options(options)
     if not files:
         raise ValueError("files must be a non-empty list")
     for f in files:
@@ -410,6 +472,7 @@ def create_job(
         active_pair_id=pair_list[0].pair_id if pair_list else None,
         legacy_v2=False,
         enabled_checks=enabled_checks or [],
+        options=options,
     )
     save_job(job)
     return job
@@ -423,6 +486,7 @@ def create_job_legacy(
     drawing_b_size: int,
     clean_version: str = "v1",
     enabled_checks: list[str] | None = None,
+    options: dict | None = None,
 ) -> JobState:
     """Backwards-compat shim for the 2-file upload endpoint.
 
@@ -432,9 +496,13 @@ def create_job_legacy(
     synthesises the v2 `pairs` field — but only for jobs read back from
     disk. Jobs freshly created via this shim get the v2 fields at
     create time too, just synthesised here rather than at load.
+
+    `options` is the same stage-tunables dict `create_job` takes; see
+    there for the shape and the readers.
     """
     import datetime
 
+    options = _clean_options(options)
     job_id = _new_job_id()
     d = job_dir(job_id)
     _ensure_dirs(d)
@@ -470,6 +538,7 @@ def create_job_legacy(
         active_pair_id=pair_id,
         legacy_v2=True,
         enabled_checks=enabled_checks or [],
+        options=options,
     )
     save_job(job)
     return job

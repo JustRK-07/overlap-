@@ -522,12 +522,11 @@ class _SceneCase:
 
 # -- MECH block definitions ---------------------------------------------------
 
-def _define_mech_scene_blocks(doc: SynthOptions | None = None) -> None:
+def _define_mech_scene_blocks(doc, opts: SynthOptions) -> None:
     """Every MECH scene block, defined exactly once per document."""
-    opts = doc or opts_default
-    if doc is not None and doc.blocks.get("BOLT-M20-4") is not None:
+    if doc.blocks.get("BOLT-M20-4") is not None:
         return
-    d = _mech_doc
+    d = doc
     b = d.blocks.new("BOLT-M20-4")
     for p in B4:
         b.add_circle(p, B4_R10, dxfattribs={"layer": LAYER_BOLT})
@@ -743,7 +742,7 @@ def _case_bolt_off_plate(opts):
     O = _cell(opts, 1, 1)
     mech_at = (O[0] + shift, O[1])
     x_out = mech_at[0] + 100.0                    # the bolt that clears the plate edge
-    outside = PLATE_HALF + shift - 100.0          # distance past the plate edge
+    outside = (shift + 100.0) - PLATE_HALF        # distance past the plate edge
     return _SceneCase(
         "bolt_off_plate",
         (_ins("BOLT-M20-4", mech_at, LAYER_BOLT),),
@@ -831,9 +830,14 @@ def _case_missing_counterpart(opts):
 def _outside_case(opts, name, c, shift, control):
     O = _cell(opts, c, 2)
     at = (O[0] + shift, O[1])
-    # skid 1800 x 1000 on a 2000 x 1200 plinth: worst vertex is (900+shift, +-500)
-    worst_x = 900.0 + shift
-    outside = worst_x - 1000.0
+    # skid 1800 x 1000 centred at (shift, 0) on a 2000 x 1200 plinth at O:
+    # the skid's right-hand vertices sit at x = O.x + 900 + shift, y = +/-500.
+    # The nearest boundary of the plinth to such a vertex is the right-hand
+    # edge (x = O.x + 1000) whenever the y margin is the larger one, which is
+    # what the `min` below encodes.
+    corner_x = 900.0 + shift
+    worst = (O[0] + corner_x, O[1] + 500.0)
+    outside = corner_x - 1000.0
     ops_m = (_ins("SKID-1800x1000", at, LAYER_SKID),)
     ops_s = (_ins("Part-PLINT2000x1200", O, LAYER_FOOTING),)
     if control:
@@ -841,16 +845,18 @@ def _outside_case(opts, name, c, shift, control):
                           controls=(ControlRegion(name, _to_mech(opts, at), 600.0),))
     if outside > 0.0:
         exp = (ExpectedFinding(name, "OUTSIDE_OUTLINE", "CRITICAL",
-                               location_mech=_to_mech(opts, (worst_x, 500.0)),
+                               location_mech=_to_mech(opts, worst),
                                magnitude_mm=outside, offset_mm=(-outside, 0.0)),)
     else:
-        edge = 1000.0 - worst_x                     # 70 -> 30 mm, 0 -> 100 mm
-        edge = min(edge, 600.0 - 500.0)
+        edge = min(1000.0 - corner_x, 600.0 - 500.0)      # 70 -> 30 mm, 0 -> 100 mm
         if edge < 50.0:
+            shortfall = 50.0 - edge
             exp = (ExpectedFinding(name, "EDGE_DISTANCE", "WARNING",
-                                   location_mech=_to_mech(opts, (worst_x, -500.0)),
-                                   magnitude_mm=50.0 - edge,
-                                   offset_mm=(-(50.0 - edge), 0.0),
+                                   # ties between the two right-hand corners are
+                                   # broken by taking the lower y
+                                   location_mech=_to_mech(opts, (worst[0], O[1] - 500.0)),
+                                   magnitude_mm=shortfall,
+                                   offset_mm=(-shortfall, 0.0),
                                    details={"edge_distance_mm": edge}),)
         else:
             exp = ()
@@ -878,7 +884,10 @@ def _case_ctl_outline(opts):
 def _clash_case(opts, name, c, shift, control):
     O = _cell(opts, c, 2)
     at = (O[0] + shift, O[1])
-    overlap = 150.0 - (shift + 500.0) + 150.0     # column x=-150..150 vs rect
+    # equipment 1000 x 1000 centred at (shift, 0); Part-COL300 spans x,y = +/-150
+    x_lo = max(shift - 500.0, -150.0)
+    x_hi = min(shift + 500.0, 150.0)
+    overlap = x_hi - x_lo
     ops = (_ins("EQUIP-1000", at, LAYER_EQUIP),)
     ops_s = (_ins("Part-COL300", O, LAYER_COLUMN),)
     if control or overlap <= 1.0:
@@ -911,11 +920,14 @@ def _case_pattern_array(opts):
     for c in range(n):
         for r in range(n):
             O = (opts.scene_origin[0] + pitch * c, opts.scene_origin[1] + pitch * r)
-            mech_at = (O[0] + gx, O[1] + gy)
+            at = O
             if (c, r) == tuple(dcell):
-                mech_at = (mech_at[0], mech_at[1] + extra)
-            mech_ops.append(_ins("BOLT-M20-4", mech_at, LAYER_BOLT))
+                at = (at[0], at[1] + extra)
+            mech_ops.append(_ins("BOLT-M20-4", at, LAYER_BOLT))
             str_ops.append(_ins("Part-PLATE300-H4", O, LAYER_PLATE))
+            # mismatch_global_shift_mm is applied to every MECH draw at draw
+            # time (see _shift_mech_ops), so the truth has to add it back.
+            mech_at = (at[0] + gx, at[1] + gy)
             off = (O[0] - mech_at[0], O[1] - mech_at[1])
             mag = math.hypot(*off)
             if mag > 1e-9:
@@ -956,6 +968,20 @@ ALL_MISMATCH_CASES = (
     "saddle_off_beam", "ctl_saddle", "pipe_support_off_flange",
     "ctl_pipe_support", "missing_counterpart", "outside_outline",
     "edge_distance", "ctl_outline", "clash", "ctl_clash",
+)
+
+#: Block names the scene defines.  None of the MECH ones may start with
+#: ``A$C`` / ``RTR`` (those survive the MECH cleaner, so a detector that
+#: read ``cleaned/`` would find nothing) and every STR one starts with
+#: ``Part-``.  ``BOLT-M20-4-X…`` is the parameterised bolt_offset block.
+MECH_SCENE_BLOCKS = (
+    "BOLT-M20-4", "BOLT-ASYM", "BASEPLATE-400", "FLANGE-8B",
+    "SADDLE-300x150", "SADDLE-400x250", "PS-01", "SKID-1800x1000", "EQUIP-1000",
+)
+STR_SCENE_BLOCKS = (
+    "Part-HOLE-R11", "Part-PLATE300-H4", "Part-PLATE300-H3", "Part-PLATE300",
+    "Part-PLATE-ASYM", "Part-ANCHOR4", "Part-FLGPLATE-8H", "Part-BEAM-W200",
+    "Part-PLINT2000x1200",
 )
 
 
@@ -1046,10 +1072,15 @@ def build_pair(out_dir: Path, opts: SynthOptions | None = None) -> SynthPair:
     out_dir.mkdir(parents=True, exist_ok=True)
     u = 1.0 if opts.str_units == "mm" else 0.001
     truth = truth_for(opts)
+    cases = scene_cases(opts)
+    expected, controls = mismatch_truth(cases)
 
     # MECH
     mdoc = _new_doc(4)
     _populate_mech(mdoc, opts)
+    _define_mech_scene_blocks(mdoc, opts)
+    _draw_ops(mdoc, tuple(op for c in cases for op in
+                          _shift_mech_ops(c.mech_ops, opts.mismatch_global_shift_mm)))
     _ensure_layers(mdoc)
     B = Matrix44.translate(opts.mech_offset[0], opts.mech_offset[1], 0.0)
     ez_transform.inplace(list(mdoc.modelspace()), B)
@@ -1059,6 +1090,8 @@ def build_pair(out_dir: Path, opts: SynthOptions | None = None) -> SynthPair:
     # STR
     sdoc = _new_doc(4 if opts.str_units == "mm" else 6)
     _populate_str(sdoc, opts)
+    _define_str_scene_blocks(sdoc)
+    _draw_ops(sdoc, tuple(op for c in cases for op in c.str_ops))
     _ensure_layers(sdoc)
     A = Matrix44.chain(
         Matrix44.translate(opts.str_offset[0], opts.str_offset[1], 0.0),
@@ -1100,10 +1133,23 @@ def build_pair(out_dir: Path, opts: SynthOptions | None = None) -> SynthPair:
 
     return SynthPair(mech_path=mech_path, str_path=str_path, truth=truth, opts=opts,
                      grid_p=grid_p, intersections_mech=inter_mech,
-                     intersections_str=inter_str, grid_mech=grid_mech, grid_str=grid_str)
+                     intersections_str=inter_str, grid_mech=grid_mech, grid_str=grid_str,
+                     mismatch_expected=expected, mismatch_controls=controls)
 
 
 def with_opts(base: SynthOptions, **kw) -> SynthOptions:
     """dataclasses.replace shortcut (copies mutable fields)."""
     kw.setdefault("shift_str_axis", dict(base.shift_str_axis))
+    kw.setdefault("mismatch_params", dict(base.mismatch_params))
     return replace(base, **kw)
+
+
+# ── mismatch-scene presets (step 8b.1) ──────────────────────────────────────
+
+#: Every named case, with the two "array" forms kept out so the cell grid
+#: stays one case per cell.
+MISMATCH = with_opts(LEGACY_COMPATIBLE, mismatch_cases=ALL_MISMATCH_CASES)
+MISMATCH_HARD = with_opts(HARD, mismatch_cases=ALL_MISMATCH_CASES)
+#: One systematic, drawing-wide MECH shift plus a single extra local defect.
+MISMATCH_GLOBAL = with_opts(LEGACY_COMPATIBLE, mismatch_cases=("pattern_array",),
+                            mismatch_global_shift_mm=(25.0, 0.0))

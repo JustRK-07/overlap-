@@ -56,8 +56,17 @@
     multiStartBtn: $("multi-start-btn"),
     multiUploadError: $("multi-upload-error"),
     multiUploadStatus: $("multi-upload-status"),
+    // Step 9 — stage options (shared by the legacy and N-file forms)
+    fitModel: $("fit-model"),
+    allowWeakFit: $("allow-weak-fit"),
+    strLineweight: $("str-lineweight"),
+    qaGrid: $("qa-grid"),
     doneSection: $("done-section"),
     transformDisplay: $("transform-display"),
+    fitQualityDisplay: $("fit-quality-display"),
+    previewLink: $("preview-link"),
+    previewGridLink: $("preview-grid-link"),
+    reportLink: $("report-link"),
     downloadLink: $("download-link"),
     errorSection: $("error-section"),
     errorMessage: $("error-message"),
@@ -130,6 +139,21 @@
   }
 
   // ─────────────────────────────────────────────────────────────────────
+  // Step 9 — stage options
+  // ─────────────────────────────────────────────────────────────────────
+  // Read once by both upload forms; the server validates and echoes them
+  // back, and stores them in job.options for the fit / overlay stages.
+  function appendOptions(fd) {
+    const colorMode = document.querySelector('input[name="color_mode"]:checked').value;
+    const lineweight = els.strLineweight ? els.strLineweight.value.trim() : "";
+    fd.append("color_mode", colorMode);
+    fd.append("fit_model", els.fitModel ? els.fitModel.value : "similarity");
+    fd.append("allow_weak_fit", String(!!(els.allowWeakFit && els.allowWeakFit.checked)));
+    fd.append("str_lineweight", lineweight);       // "" = as drawn
+    fd.append("qa_grid", String(!(els.qaGrid && !els.qaGrid.checked)));
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
   // Start
   // ─────────────────────────────────────────────────────────────────────
   els.startBtn.addEventListener("click", async () => {
@@ -143,6 +167,7 @@
     fd.append("drawing_b", fileB);
     fd.append("clean_version", cleanVersion);
     fd.append("enabled_checks", enabledChecks.join(","));
+    appendOptions(fd);
 
     els.startBtn.disabled = true;
     els.startBtn.textContent = "Uploading...";
@@ -159,10 +184,10 @@
       els.statusSection.classList.remove("hidden");
       // Show file cards
       els.fileCards.innerHTML = `
-        <div class="file-card"><h4>Drawing A</h4>
+        <div class="file-card"><h4>MECH drawing</h4>
           <div class="row"><span>${fileA.name}</span><span class="muted">${(fileA.size/1e6).toFixed(1)} MB</span></div>
         </div>
-        <div class="file-card"><h4>Drawing B</h4>
+        <div class="file-card"><h4>STR drawing</h4>
           <div class="row"><span>${fileB.name}</span><span class="muted">${(fileB.size/1e6).toFixed(1)} MB</span></div>
         </div>`;
       // Start polling
@@ -356,10 +381,27 @@
 
   function renderAxesResult(j) {
     chosenAxes = j;
+    // `labels` is the per-label grid-detection verdict (step 9). Older
+    // servers don't return it — fall back to just the delta summary.
+    const labelRows = (j.labels || []).map((l) => {
+      const mech = l.mech || {};
+      const str = l.str || {};
+      const badge = (st) => {
+        const cls = st.status === "ok" ? "ok" : (st.status === "ambiguous" ? "warn" : "bad");
+        const why = (st.reasons || []).join("; ");
+        return `<span class="axis-status ${cls}" title="${_esc(why)}">${_esc(st.status)}</span>`;
+      };
+      return `
+        <div class="pair">
+          <span><code>${_esc(l.suffix)}</code> ${_esc(l.type || "")}</span>
+          <span>MECH ${badge(mech)} · STR ${badge(str)}</span>
+        </div>`;
+    }).join("");
+
     els.axesSummary.innerHTML = `
       <div class="axes-summary">
-        <div class="pair"><span>Drawing A</span><span>${j.a_found} / ${j.axes.length} axes</span></div>
-        <div class="pair"><span>Drawing B</span><span>${j.b_found} / ${j.axes.length} axes</span></div>
+        <div class="pair"><span>MECH drawing</span><span>${j.a_found} / ${j.axes.length} axes</span></div>
+        <div class="pair"><span>STR drawing</span><span>${j.b_found} / ${j.axes.length} axes</span></div>
         <div class="pair"><span>All paired?</span><span>${j.all_matched ? "✓ yes" : "✗ no — missing some"}</span></div>
         ${(j.pairs || []).map(p => `
           <div class="pair">
@@ -367,7 +409,12 @@
             <span class="muted">Δ ${p.delta.toFixed(2)}</span>
           </div>
         `).join("")}
+        ${labelRows}
       </div>
+      ${(j.problems || []).length ? `
+        <p class="muted">Not every axis resolved:
+          ${j.problems.map(p => `<code>${_esc(p.suffix)}</code> (${_esc(p.source)}: ${_esc(p.status)})`).join(", ")}.
+          The fit only uses the axes that resolved in both drawings.</p>` : ""}
     `;
     if (j.all_matched) {
       els.confirmAxesBtn.classList.remove("hidden");
@@ -395,6 +442,60 @@
   // ─────────────────────────────────────────────────────────────────────
   // Done (stage 9)
   // ─────────────────────────────────────────────────────────────────────
+
+  // The fit's quality section: what the transform actually is, how well it
+  // agreed with the grid, and every warning the gates raised.
+  function renderFitQuality(t) {
+    if (!t || t.model === undefined) {          // pre-step-5 job: no quality
+      els.fitQualityDisplay.innerHTML = "";
+      return;
+    }
+    const q = t.quality || {};
+    const status = q.status || "?";
+    const cls = status === "forced" ? "warn" : (status === "ok" ? "ok" : "bad");
+    const outliers = t.outliers || [];
+    const rows = [
+      ["Transform model", t.model + (t.mirrored ? " (mirrored)" : "")],
+      ["Scale", _fmtF(t.scale)],
+      ["Rotation", `${_fmtF(t.rotation_deg)}°`],
+      ["Inliers", `${t.n_inliers ?? "?"} / ${t.n_total ?? "?"}`],
+      ["RMS residual", `${_fmtF(t.rms_residual)} u`],
+      ["Max residual", `${_fmtF(t.max_residual)} u`],
+      ["Leave-one-out max", t.loo_max == null ? "n/a" : `${_fmtF(t.loo_max)} u`],
+      ["Outlier labels", outliers.length ? outliers.join(", ") : "none"],
+    ].map(([k, v]) => `<div class="pair"><span>${_esc(k)}</span><span>${_esc(v)}</span></div>`).join("");
+
+    const warnings = (q.warnings || []).length
+      ? `<ul class="muted fit-warnings">${q.warnings.map((w) => `<li>${_esc(w)}</li>`).join("")}</ul>`
+      : "";
+    els.fitQualityDisplay.innerHTML = `
+      <h3 style="font-size: 1em; margin: 1em 0 0.4em;">Fit quality
+        <span class="axis-status ${cls}">${_esc(status)}</span></h3>
+      <div class="axes-summary">${rows}</div>
+      ${warnings}
+    `;
+  }
+
+  // How many STR entities the overlay could not transform (exploded or
+  // dropped). A non-zero count is not fatal but is worth showing.
+  async function loadOverlayFailures() {
+    try {
+      const r = await fetch(`${API}/${jobId}/report.json`);
+      if (!r.ok) return;
+      const rep = await r.json();
+      const ov = rep.overlay || {};
+      const n = (ov.failures || []).length;
+      if (!n) return;
+      const line = `<p class="muted">Overlay: ${n} STR entit${n === 1 ? "y" : "ies"} could not be
+        transformed (${ov.dropped || 0} dropped, ${ov.exploded || 0} exploded) —
+        see report.json → overlay.failures.</p>`;
+      const holder = els.fitQualityDisplay;
+      holder.insertAdjacentHTML("beforeend", line);
+    } catch (e) {
+      console.warn("report fetch failed:", e);
+    }
+  }
+
   async function loadDone() {
     try {
       const r = await fetch(`${API}/${jobId}`);
@@ -414,26 +515,24 @@
                x_m = ${t.scale_x.toFixed(6)} · x_s + ${t.tx.toFixed(4)}<br>
                y_m = ${t.scale_y.toFixed(6)} · y_s + ${t.ty.toFixed(4)}
              </div>`;
-        const quality = isSimilarity
-          ? `<p class="muted">quality: ${t.quality?.status ?? "?"}
-               · inliers ${t.n_inliers ?? "?"}/${t.n_total ?? "?"}
-               · loo ${_fmtF(t.loo_max)} u${(t.outliers || []).length ? ` · outliers: ${(t.outliers || []).join(", ")}` : ""}</p>`
+        const units = (t.units && t.units.expected_scale != null)
+          ? `<p class="muted">$INSUNITS says 1:${_fmtF(t.units.expected_scale)}
+             (STR ${t.units.str} → MECH ${t.units.mech})</p>`
           : "";
-        const warnings = (t.quality?.warnings || []).length
-          ? `<p class="muted">${t.quality.warnings.map(_esc).join("<br>")}</p>`
-          : "";
-        els.transformDisplay.innerHTML = `
-          ${head}
-          <p class="muted">max residual: ${t.max_residual?.toFixed(4)} u  ·  rms: ${t.rms_residual?.toFixed(4)} u  ·  entities: ${j.outputs?.entity_count ?? "?"}</p>
-          ${quality}${warnings}
-        `;
+        els.transformDisplay.innerHTML = `${head}${units}`;
+        renderFitQuality(t);
       } else {
         els.transformDisplay.innerHTML = `<p class="muted">No transform available.</p>`;
+        els.fitQualityDisplay.innerHTML = "";
       }
       els.downloadLink.href = `${API}/${jobId}/download`;
       els.downloadAnnotatedLink.href = `${API}/${jobId}/annotated.dxf`;
       els.downloadDocxLink.href = `${API}/${jobId}/spotcheck.docx`;
       els.downloadSpotcheckJsonLink.href = `${API}/${jobId}/spotcheck.json`;
+      els.previewLink.href = `${API}/${jobId}/preview.png`;
+      els.previewGridLink.href = `${API}/${jobId}/preview_grid.png`;
+      els.reportLink.href = `${API}/${jobId}/report.json`;
+      loadOverlayFailures().catch((e) => console.warn("loadOverlayFailures failed:", e));
       // Section 5 — populate the analyze panel after we know we have a
       // completed pipeline run. Failures here are non-fatal (the user
       // still has the legacy transforms + downloads).
@@ -696,6 +795,7 @@
     fd.append("enabled_checks", enabledChecks.join(","));
     fd.append("prefix", els.mfPrefix.value || "");
     fd.append("axes", els.mfAxes.value || "");
+    appendOptions(fd);
 
     els.multiStartBtn.disabled = true;
     els.multiStartBtn.textContent = "Uploading...";

@@ -259,8 +259,18 @@ def resolve_pair(job_id: str, pair_dir: Path | None = None, *,
     return mech, strc
 
 
-def write_pair_json(root: Path, mech_name: str, str_name: str, pair_id: str) -> Path:
+def write_pair_json(root: Path, mech_name: str, str_name: str, pair_id: str,
+                    *, options: dict | None = None) -> Path:
+    """Write the pair's role manifest: `{pair_id, mech, str, options?}`.
+
+    ``options`` (step 9) records the stage tunables this pair runs with so
+    the pair directory is self-describing afterwards. ``_pair_from_json``
+    reads only `mech` / `str`, so the extra key is inert for resolution.
+    """
     root.mkdir(parents=True, exist_ok=True)
+    payload = {"pair_id": pair_id, "mech": mech_name, "str": str_name}
+    if options:
+        payload["options"] = dict(options)
     p = root / "pair.json"
-    p.write_text(json.dumps({"pair_id": pair_id, "mech": mech_name, "str": str_name}, indent=2))
+    p.write_text(json.dumps(payload, indent=2))
     return p
