@@ -64,8 +64,8 @@ import numpy as np
 
 from . import grid
 from .dxfio import read_internal as _read_internal
-from .transform2d import (Affine2D, FitError, fit_affine, loo_residuals,
-                          ransac_similarity, rms)
+from .transform2d import (Affine2D, FitError, TransformError, fit_affine,
+                          loo_residuals, ransac_similarity, rms)
 
 from jobs import job_dir, load_job
 
@@ -374,14 +374,21 @@ def solve(inp: FitInputs, options: FitOptions | None = None) -> dict:
     inlier_idx = [i for i in range(n_total) if mask[i]]
     loo_by_index: dict[int, float] = {}
     if len(inlier_idx) >= 3:
-        loo = loo_residuals(src, dst, inlier_idx)
-        loo_by_index = {i: float(v) for i, v in zip(inlier_idx, loo)}
-        loo_max = float(max(loo_by_index.values()))
-        # ── gate 4: the fit must not depend on any single point ────────────
-        gate(loo_max <= opts.loo_tol_rel * spacing,
-             f"leave-one-out residual {loo_max:.4g} exceeds "
-             f"{opts.loo_tol_rel:g} × the median grid spacing ({spacing:.4g}). "
-             "The fit is unstable — check for a mis-paired grid label.")
+        try:
+            loo = loo_residuals(src, dst, inlier_idx)
+        except TransformError as exc:
+            # A degenerate refit is a *verification failure*, not a crash:
+            # it becomes a gate, so `force` can override it like the others.
+            loo_max = None
+            gate(False, f"the fit could not be verified by leave-one-out: {exc}")
+        else:
+            loo_by_index = {i: float(v) for i, v in zip(inlier_idx, loo)}
+            loo_max = float(max(loo_by_index.values()))
+            # ── gate 4: the fit must not depend on any single point ────────
+            gate(loo_max <= opts.loo_tol_rel * spacing,
+                 f"leave-one-out residual {loo_max:.4g} exceeds "
+                 f"{opts.loo_tol_rel:g} × the median grid spacing ({spacing:.4g}). "
+                 "The fit is unstable — check for a mis-paired grid label.")
     else:
         loo_max = None
 

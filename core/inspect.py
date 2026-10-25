@@ -16,7 +16,7 @@ Writes jobs/<id>/stages/inspect.json with:
 
 from __future__ import annotations
 
-from .dxfio import read_internal as _read_internal, save as _dxf_save
+from .dxfio import read_input as _read_input, save as _dxf_save
 
 import json
 from collections import Counter
@@ -30,7 +30,9 @@ from jobs import job_dir
 def _inspect_dxf(path: Path) -> dict:
     """Return entity-type histogram + layer list for a DXF."""
     try:
-        doc = _read_internal(str(path))
+        # An upload is an INPUT: PLAN.md decision 8 says inputs are read with
+        # `recover.readfile`, so a file stage 1 accepted does not fail here.
+        doc, _audit = _read_input(str(path))
     except Exception as e:
         return {"error": str(e)}
 

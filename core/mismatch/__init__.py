@@ -256,7 +256,10 @@ def detect(mech_doc, str_doc, affine=None, *, policy=None, fit_ctx=None,
 def _as_doc(doc, ezdxf):
     if hasattr(doc, "modelspace"):
         return doc
-    return ezdxf.readfile(str(doc))
+    # PLAN.md step 2: every read goes through core.dxfio — `ezdxf.readfile`
+    # must not appear outside core/dxfio.py and core/package.py.
+    from core.dxfio import read_internal
+    return read_internal(str(doc))
 
 
 def _resolve_policy(policy, DEFAULT_POLICY, MismatchPolicy) -> MismatchPolicy:

@@ -152,13 +152,22 @@ the unfixed code*. A fix with no test is not done — it is a hope.
 
 ## Part B — `PLAN.md` "Done when" criteria still unmet
 
-| ID | Criterion | File:line | Fix | Verification |
-|---|---|---|---|---|
-| B1 | "no `ezdxf.readfile(` outside `core/dxfio.py` / `core/package.py`" | `core/mismatch/__init__.py:256` | route through `dxfio.read_internal` | `tests/test_dxfio.py::test_no_readfile_outside_dxfio` (AST scan of `core/`) |
-| B2 | "inputs (uploads/converted) go through `recover.readfile`" | `inspect.py:33`, `labels.py:84,123`, `clean_policy.py:201-202`, `clean_v1.py:95`, `clean_v2.py:74` | use `dxfio.read_input` for uploads/converted | `tests/test_dxfio.py::test_input_stages_use_the_recovering_reader` |
-| B3 | "no silent fallback" in the fit | `core/transform2d.py:494-495` | the LOO refit must not silently switch model — raise, or record the model change | `tests/test_fit.py::test_loo_does_not_silently_switch_to_affine` |
-| B4 | "nothing in `package.py` silently discards geometry" | `core/package.py:562-563` | MTEXT is excluded from both previews and **not reported** | `tests/test_package.py::test_report_records_skipped_mtext` |
-| B5 | step 10: `tests/test_e2e_synthetic.py` | new file | 3 named e2e cases | the file itself |
+| ID | Criterion | File:line | Fix | Verification | Status |
+|---|---|---|---|---|---|
+| B1 | "no `ezdxf.readfile(` outside `core/dxfio.py` / `core/package.py`" | `core/mismatch/__init__.py:256` | route through `dxfio.read_internal` | `tests/test_plan_acceptance.py::test_no_readfile_outside_dxfio_and_package` (AST scan of `core/`) | VERIFIED |
+| B2 | "inputs (uploads/converted) go through `recover.readfile`" | `inspect.py:33`, `labels.py:84,123`, `clean_policy.py:201-202`, `clean_v1.py:95`, `clean_v2.py:74` | use `dxfio.read_input` for uploads/converted | `tests/test_plan_acceptance.py::test_inspect_accepts_a_recoverable_upload` + `test_input_stages_use_the_recovering_reader` (5 modules) | VERIFIED |
+| B3 | "no silent fallback" in the fit | `core/transform2d.py:494-495` | the LOO refit must not silently switch model — it now raises, and `core/fit.py` turns that into a **gate failure** (so `force` can override it like every other gate) | `tests/test_plan_acceptance.py::test_loo_does_not_silently_switch_to_an_affine_model` + `test_a_degenerate_loo_becomes_a_fit_gate_not_a_crash` | VERIFIED |
+| B4 | "nothing in `package.py` silently discards geometry" | `core/package.py:562-563` | the preview no longer filters MTEXT out unconditionally; what the picture cannot show is now **reported**: `mtext_entities` / `mtext_drawn` / `mtext_not_drawn` in `report.json`, plus a per-image `mtext_skipped` for the retry path | `tests/test_plan_acceptance.py::test_mtext_is_not_filtered_out_of_the_preview` + `test_the_report_records_the_mtext_it_could_not_draw` | VERIFIED |
+| B5 | step 10: `tests/test_e2e_synthetic.py` | new file | 3 named e2e cases | the file itself | OPEN |
+
+**B4 — what the investigation found.** The blanket MTEXT exclusion turned out to be
+*cosmetic* on this machine: ezdxf's font manager has no font, so MTEXT draws no
+glyphs either way — the rendered pixels are identical with and without the
+filter. The real defect was the **silence**: the reported extents counted the
+MTEXT while the picture could not show it, and nothing said so. The fix is
+therefore to draw MTEXT when a font exists, to report what could not be drawn,
+and to keep a retry-without-MTEXT path for a font-specific crash (reported as
+`mtext_skipped`).
 
 ---
 
@@ -253,3 +262,4 @@ the unfixed code*. A fix with no test is not done — it is a hope.
 |---|---|---|
 | 2026-10-25 | Analysis | 7 review agents + 3 fix-mapping agents; 84 files; defects independently reproduced |
 | 2026-10-25 | Phase 1 (Tier 1) | **A1–A10 all VERIFIED.** 16 new regression tests; suite 389 → **405 passed**, 24 skipped, 0 failed. Every new test proven to FAIL on the original code (A1/A3/A5–A8 by temporary revert; A2/A4/A9/A10 by construction). |
+| 2026-10-25 | Phase 2 (PLAN.md criteria) | **B1–B4 VERIFIED.** 13 new tests in `tests/test_plan_acceptance.py`; suite 405 → **418 passed**, 24 skipped, 0 failed. 11 of the 13 proven to FAIL on the original code by temporary revert of all 9 touched modules. |

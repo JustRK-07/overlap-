@@ -491,7 +491,14 @@ def loo_residuals(src, dst, indices) -> np.ndarray:
         rest = np.delete(idx, k)
         try:
             m = fit_similarity(s[rest], t[rest])
-        except TransformError:
-            m = fit_affine(s[rest], t[rest])
+        except TransformError as exc:
+            # Never silently switch model: an affine absorbs far more error
+            # than a similarity, so a LOO residual measured against one
+            # under-reports exactly the instability this gate exists to catch.
+            raise TransformError(
+                f"leave-one-out refit on the remaining {rest.size} inliers is "
+                f"degenerate: {exc}. The similarity model cannot be refitted "
+                f"without that point, so the fit cannot be verified."
+            ) from exc
         out[k] = residuals(m, s[i:i + 1], t[i:i + 1])[0]
     return out

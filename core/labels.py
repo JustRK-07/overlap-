@@ -32,7 +32,7 @@ makes the data drive the cleaner's decisions instead of heuristics.
 """
 from __future__ import annotations
 
-from .dxfio import read_internal as _read_internal, save as _dxf_save
+from .dxfio import read_input as _read_input, save as _dxf_save
 
 import json
 from collections import defaultdict
@@ -81,7 +81,7 @@ def scan_labels_for_job(job_id: str) -> dict:
 
     per_drawing: dict[str, list[dict]] = {}
     for dxf in dxfs:
-        doc = _read_internal(str(dxf))
+        doc, _audit = _read_input(str(dxf))
         labels = extract_labels(doc)
         per_drawing[dxf.name] = [_label_to_dict(c) for c in labels]
 
@@ -120,7 +120,7 @@ def scan_labels_for_job(job_id: str) -> dict:
     block_to_insert_handles: dict[str, dict[str, set[str]]] = defaultdict(
         lambda: defaultdict(set)
     )
-    for dxf_path_str, doc in ((str(p), _read_internal(str(p))) for p in dxfs):
+    for dxf_path_str, doc in ((str(p), _read_input(str(p))[0]) for p in dxfs):
         dxf_name = Path(dxf_path_str).name
         for ins in doc.modelspace():
             try:

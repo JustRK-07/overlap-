@@ -48,7 +48,7 @@ subtypes, OLE frames, paper space, annotation layers, and triangles.
 
 from __future__ import annotations
 
-from .dxfio import read_internal as _read_internal, save as _dxf_save
+from .dxfio import read_input as _read_input, read_internal as _read_internal, save as _dxf_save
 
 import json
 from pathlib import Path
@@ -92,7 +92,9 @@ def _clean_one(path: Path, out_path: Path, *, is_str: bool,
         if no INSERT references them. Used so that a `GridLine-*` block
         holding a protected label survives orphan-block cleanup.
     """
-    doc = _read_internal(str(path))
+    # `converted/` is an INPUT (PLAN.md decision 8) — read it with the
+    # recovering reader so a file convert accepted is not rejected here.
+    doc, _audit = _read_input(str(path))
     msp = doc.modelspace()
 
     # Step 1a: strip annotation entities in modelspace.
