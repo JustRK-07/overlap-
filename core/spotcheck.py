@@ -29,6 +29,9 @@ Writes:
 
 from __future__ import annotations
 
+from .dxfio import read_internal as _read_internal, save as _dxf_save
+from .transform2d import Affine2D
+
 import json
 import math
 from dataclasses import asdict, dataclass, field
@@ -339,45 +342,33 @@ def _extract_str_bolts(doc) -> list[tuple[float, float]]:
 
 
 def _extract_str_gridlines(doc) -> list[tuple[float, str]]:
-    """Walk every GridLine-* INSERT; return (axis_coord, 'X'|'Y')."""
+    """Walk every GridLine-* INSERT; return (axis_coord, 'X'|'Y').
+
+    Uses `grid.walk_world`, so block base point / rotation / nesting are
+    applied through the ezdxf INSERT matrices (world coordinates).
+    """
+    from . import grid
     coords = []
-    for ins in doc.modelspace():
-        if ins.dxftype() != "INSERT":
+    for it in grid.walk_world(doc):
+        e = it.entity
+        if e.dxftype() != "LINE" or not it.chain:
             continue
-        nm = ins.dxf.name
+        nm = it.chain[-1]
         if not (nm.startswith("GridLine-") or nm.startswith(" Line-")):
             continue
         try:
-            ix, iy = ins.dxf.insert[0], ins.dxf.insert[1]
-            sx = ins.dxf.xscale or 1.0
-            sy = ins.dxf.yscale if ins.dxf.hasattr("yscale") and ins.dxf.yscale else sx
+            a = grid._world_pt(it.m, e.dxf.start)
+            b = grid._world_pt(it.m, e.dxf.end)
         except Exception:
             continue
-        block = None
-        for b in doc.blocks:
-            if b.name == ins.dxf.name:
-                block = b
-                break
-        if block is None:
+        dx, dy = b.x - a.x, b.y - a.y
+        length = math.hypot(dx, dy)
+        if length < 100:
             continue
-        for e in block:
-            if e.dxftype() != "LINE":
-                continue
-            try:
-                s, end = e.dxf.start, e.dxf.end
-            except Exception:
-                continue
-            x1 = ix + sx * s[0]; y1 = iy + sy * s[1]
-            x2 = ix + sx * end[0]; y2 = iy + sy * end[1]
-            dx = x2 - x1
-            dy = y2 - y1
-            length = math.hypot(dx, dy)
-            if length < 100:
-                continue
-            if abs(dx) < 0.1 * length:    # vertical → X gridline
-                coords.append((x1, "X"))
-            elif abs(dy) < 0.1 * length:  # horizontal → Y gridline
-                coords.append((y1, "Y"))
+        if abs(dx) < 0.1 * length:    # vertical -> X gridline
+            coords.append((a.x, "X"))
+        elif abs(dy) < 0.1 * length:  # horizontal -> Y gridline
+            coords.append((a.y, "Y"))
     return coords
 
 
@@ -453,18 +444,15 @@ def _seg_in_bay(footprint: list[tuple[float, float]],
 # Public entrypoint
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _affine_to_str(scale_x, scale_y, tx, ty, x, y) -> tuple[float, float]:
-    """Map STR coord → MECH coord using fitted transform."""
-    return (scale_x * x + tx, scale_y * y + ty)
+def _affine_from(t: dict) -> Affine2D:
+    """The fitted STR → MECH transform as a full 2-D affine.
 
-
-def _affine_to_mech(scale_x, scale_y, tx, ty, x, y) -> tuple[float, float]:
-    """Inverse: MECH coord → STR coord. Solves y = ax*x + bx for x = (y - bx) / ax."""
-    if abs(scale_x) < 1e-9:
-        return (0.0, 0.0)
-    if abs(scale_y) < 1e-9:
-        return (0.0, 0.0)
-    return ((x - tx) / scale_x, (y - ty) / scale_y)
+    Reads the ``matrix`` written by ``core.fit`` (falling back to the legacy
+    ``scale_x/scale_y/tx/ty`` diagonal shape), so a rotated fit is honoured:
+    STR coordinates are obtained with ``Affine2D.inverse().apply(...)``,
+    never by dividing by the diagonal.
+    """
+    return Affine2D.from_json(t)
 
 
 # Subset of MECH↔STR checks handled by spotcheck itself.
@@ -593,27 +581,21 @@ def run(job_id: str, *,
     d = job_dir(job_id)
     if pair_dir is not None:
         root = Path(pair_dir).parent
-        cleaned = sorted(Path(pair_dir).glob("*_clean.dxf"))
     else:
         root = d
-        cleaned = sorted((d / "cleaned").glob("*_clean.dxf"))
-    if len(cleaned) != 2:
-        raise RuntimeError(f"Need 2 cleaned DXFs; found {len(cleaned)}")
+    from .roles import resolve_pair
+    mech_path, str_path = resolve_pair(job_id, pair_dir)   # explicit roles
 
-    # The MECH drawing is the one with the equipment — alphabetical order
-    # from convert.py places MECH first (drawing_a → TP-104 MECH GA_clean3.dxf).
-    mech_path = cleaned[0]
-    str_path = cleaned[1]
-
-    # The transform is MECH ← STR (scale_x * STR_x + tx = MECH_x).
+    # The transform maps STR → MECH; MECH points are compared against STR
+    # geometry, so everything below works through its inverse.
     tpath = root / "transform.json"
     if not tpath.exists():
         raise RuntimeError("transform.json missing")
     t = json.loads(tpath.read_text())
-    ax, ay, bx, by = t["scale_x"], t["scale_y"], t["tx"], t["ty"]
+    to_str = _affine_from(t).inverse()
 
-    mech_doc = ezdxf.readfile(str(mech_path))
-    str_doc = ezdxf.readfile(str(str_path))
+    mech_doc = _read_internal(str(mech_path))
+    str_doc = _read_internal(str(str_path))
 
     saddles = _find_mech_saddles(mech_doc)
     beams, columns = _extract_str_beams_and_columns(str_doc)
@@ -635,7 +617,7 @@ def run(job_id: str, *,
         cx, cy = saddle["centroid"]
 
         # 1) Nearest STR beam (in STR coords → transform saddle to STR space first)
-        sx, sy = _affine_to_mech(ax, ay, bx, by, cx, cy)
+        sx, sy = to_str.apply((cx, cy))
         beam_dist, beam_seg = _nearest_beam_distance(sx, sy, beams)
 
         # 1b) Nearest STR bolt — saddles bolted to structure count as supported
@@ -648,7 +630,7 @@ def run(job_id: str, *,
         grid_dist, grid_kind = _nearest_gridline_distance(sx, sy, gridlines)
 
         # 3) Column clash (transform footprint to STR coords)
-        footprint_str = [_affine_to_mech(ax, ay, bx, by, p[0], p[1])
+        footprint_str = [to_str.apply((p[0], p[1]))
                          for p in saddle["footprint"]]
         col_seg = _column_collision(footprint_str, columns, column_tolerance)
 

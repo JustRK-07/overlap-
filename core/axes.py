@@ -25,6 +25,8 @@ Convention detection algorithm:
 
 from __future__ import annotations
 
+from .dxfio import read_internal as _read_internal, save as _dxf_save
+
 import json
 import math
 import re
@@ -211,7 +213,7 @@ def extract_labels(doc) -> list[LabelCandidate]:
     seen: set[str] = set()
 
     def _record(e, container: str, block_name: str | None = None):
-        if e.dxftype() not in ("TEXT", "MTEXT"):
+        if e.dxftype() not in ("TEXT", "MTEXT", "ATTRIB"):
             return
         try:
             txt = e.dxf.text.strip()
@@ -242,6 +244,17 @@ def extract_labels(doc) -> list[LabelCandidate]:
 
     for e in doc.modelspace():
         _record(e, "modelspace")
+        # Grid bubbles often carry their label as an ATTRIB on the
+        # bubble's INSERT rather than as TEXT. Walking `doc.modelspace()`
+        # never yields ATTRIBs, so collect them here or the label is
+        # invisible to the cross-drawing agreement and the cleaner
+        # strips it from both drawings.
+        if e.dxftype() == "INSERT":
+            try:
+                for attrib in e.attribs:
+                    _record(attrib, "modelspace", block_name=e.dxf.name)
+            except Exception:
+                continue
     for block in doc.blocks:
         if block.name.startswith("*"):
             continue
@@ -321,34 +334,29 @@ def _transform_pt(local: tuple[float, float],
 
 
 def _build_world_gridline_cache(doc, *, min_length: float = MIN_GRIDLINE_LENGTH) -> list:
-    """Build a cache of all long axis-aligned gridline segments in
-    world coordinates, as `((x1, y1), (x2, y2))` tuples.
+    """Cache of all long straight LINE / open-LWPOLYLINE segments in WORLD
+    coordinates, as `((x1, y1), (x2, y2))` tuples.
 
-    Modelspace lines: kept as-is (already world coords).
-    Block-def lines: transformed by the parent INSERT (insert + scale)
-    so they land in world coords. This is the fix for the prior
-    mixed-coord-system bug — comparing block-local label positions
-    against block-local line endpoints gave false-positive proximity.
+    Thin wrapper over `grid.walk_world`, so block base points, rotation,
+    mirroring and nesting are handled by ezdxf's INSERT matrices. Blocks
+    that no INSERT reaches are never visited (their lines would be
+    invisible in the rendered drawing). `min_length` is measured in world
+    units.
     """
-    from .geom import long_axis_lines
-    insert_lookup = _build_insert_lookup(doc)
-
+    from . import grid
     segs = []
-    # 1) Modelspace lines are already in world coords.
-    segs.extend(long_axis_lines(doc.modelspace(), min_length=min_length))
-
-    # 2) Block-def lines: transform by the block's parent INSERT.
-    for block in doc.blocks:
-        if block.name.startswith("*"):
+    for it in grid.walk_world(doc):
+        if it.entity.dxftype() not in ("LINE", "LWPOLYLINE"):
             continue
-        tx = insert_lookup.get(block.name)
-        if tx is None:
-            # No INSERT references this block — lines would be invisible
-            # in the rendered drawing, so skip them.
+        try:
+            pieces = grid._entity_segments(it.entity)
+        except Exception:
             continue
-        for (p, q) in long_axis_lines(block, min_length=min_length):
-            segs.append((_transform_pt(p, tx), _transform_pt(q, tx)))
-
+        for a, b in pieces:
+            p, q = grid._world_pt(it.m, a), grid._world_pt(it.m, b)
+            if math.hypot(q.x - p.x, q.y - p.y) < min_length:
+                continue
+            segs.append(((float(p.x), float(p.y)), (float(q.x), float(q.y))))
     return segs
 
 
@@ -356,18 +364,31 @@ def _compute_world_positions(doc, labels: list[LabelCandidate]) -> None:
     """Mutate `labels` in-place: set `world_position` for each.
 
     Modelspace labels: `world_position = position` (already world coords).
-    Block-def labels: apply the parent INSERT transform.
+    Block-def labels: the entity's world matrix from `grid.walk_world`
+    (first reachable instance). Labels in blocks no INSERT reaches keep
+    their local position.
     """
-    insert_lookup = _build_insert_lookup(doc)
+    from . import grid
+    in_block = [c for c in labels if c.container != "modelspace" and c.block_name is not None]
+    in_block_ids = {id(c) for c in in_block}
+    first_m = {}
+    if in_block:
+        wanted = {c.entity.dxf.handle for c in in_block if c.entity is not None}
+        for it in grid.walk_world(doc):
+            if not it.chain:
+                continue
+            h = it.entity.dxf.handle
+            if h in wanted and h not in first_m:
+                first_m[h] = it.m
+                if len(first_m) == len(wanted):
+                    break
     for c in labels:
-        if c.container == "modelspace" or c.block_name is None:
+        m = first_m.get(c.entity.dxf.handle) if (id(c) in in_block_ids and c.entity is not None) else None
+        if m is None:
             c.world_position = c.position
-            continue
-        tx = insert_lookup.get(c.block_name)
-        if tx is None:
-            c.world_position = c.position  # fallback: treat as world
-            continue
-        c.world_position = _transform_pt(c.position, tx)
+        else:
+            w = grid._world_pt(m, c.entity.dxf.insert)
+            c.world_position = (float(w.x), float(w.y))
 
 
 def _annotate_proximity(labels: list, world_gridlines: list,
@@ -484,7 +505,7 @@ def suggest(path: Path) -> list[dict]:
     avoids the prior bug where comparing block-local label positions
     against block-local line endpoints gave false-positive proximity.
     """
-    doc = ezdxf.readfile(str(path))
+    doc = _read_internal(str(path))
     labels = extract_labels(doc)
     _compute_world_positions(doc, labels)
     world_gridlines = _build_world_gridline_cache(doc)
@@ -520,54 +541,32 @@ def suggest(path: Path) -> list[dict]:
 
 
 def find_axes(dxf_path: Path, prefix: str, suffixes: list[str]) -> list[dict]:
-    """Strict match: TEXT equals prefix + suffix (case-insensitive).
+    """Strict match: TEXT / MTEXT / ATTRIB equals prefix + suffix
+    (case-insensitive, whitespace-tolerant).
 
-    Returns one entry per suffix with its (x, y) position in the drawing.
+    Returns one entry per suffix with the WORLD (x, y) of its first
+    occurrence (modelspace order, block contents expanded through INSERT
+    matrices). Use `grid.label_occurrences` for every occurrence.
     """
-    wanted = {(prefix + sfx).strip().upper(): sfx for sfx in suffixes}
-    seen_at: dict[str, tuple[float, float]] = {}
-
-    def _record(e):
-        if e.dxftype() not in ("TEXT", "MTEXT"):
-            return
-        try:
-            txt = e.dxf.text.strip().upper()
-        except Exception:
-            return
-        if txt not in wanted or txt in seen_at:
-            return
-        try:
-            pos = (float(e.dxf.insert[0]), float(e.dxf.insert[1]))
-        except Exception:
-            pos = (0.0, 0.0)
-        seen_at[txt] = pos
-
-    doc = ezdxf.readfile(str(dxf_path))
-    for e in doc.modelspace():
-        _record(e)
-    for block in doc.blocks:
-        if block.name.startswith("*"):
-            continue
-        for e in block:
-            _record(e)
-
+    from . import grid
+    doc = _read_internal(str(dxf_path))
+    occs = grid.label_occurrences(doc, prefix, suffixes)
     found = []
     for sfx in suffixes:
-        key = (prefix + sfx).strip().upper()
-        if key in seen_at:
-            x, y = seen_at[key]
+        if occs.get(sfx):
+            o = occs[sfx][0]
             found.append({
                 "suffix": sfx,
                 "type": "letter" if sfx.isalpha() else "number",
-                "x": x,
-                "y": y,
+                "x": float(o.world_pt.x),
+                "y": float(o.world_pt.y),
             })
     return found
 
 
 def extract_labels_for_path(dxf_path: Path) -> list["LabelCandidate"]:
     """Convenience wrapper: open a path, walk TEXT/MTEXT, return labels."""
-    doc = ezdxf.readfile(str(dxf_path))
+    doc = _read_internal(str(dxf_path))
     return extract_labels(doc)
 
 
@@ -578,12 +577,12 @@ def run(job_id: str) -> None:
     stages = d / "stages"
     stages.mkdir(exist_ok=True)
 
-    cleaned_dxfs = sorted(cleaned.glob("*_clean.dxf"))
-    if len(cleaned_dxfs) != 2:
-        cleaned_dxfs = sorted(cleaned.glob("*.dxf"))[:2]
+    # Roles from the manifest: first MECH + first STR (see core.roles).
+    from .roles import resolve_pair
+    cleaned_dxfs = list(resolve_pair(job_id, first=True))   # [mech, str]
 
-    sugs_a = suggest(cleaned_dxfs[0]) if len(cleaned_dxfs) > 0 else []
-    sugs_b = suggest(cleaned_dxfs[1]) if len(cleaned_dxfs) > 1 else []
+    sugs_a = suggest(cleaned_dxfs[0])      # MECH
+    sugs_b = suggest(cleaned_dxfs[1])      # STR
 
     common = []
     for sa in sugs_a:

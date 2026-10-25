@@ -74,7 +74,6 @@ class Pair:
     mech_file_id: str
     str_file_id: str
     status: str = "queued"                    # queued | running | done | failed
-    strategy: str = "A"                       # "A" | "B" | "C"
     prefix: str = ""
     axes: list[str] = field(default_factory=list)
     enabled_checks: list[str] | None = None
@@ -91,7 +90,6 @@ class JobState:
 
     job_id: str
     created_at: str
-    strategy: str = "A"                       # "A" | "B" | "C"  (job-level default; Pair.strategy overrides)
     clean_version: str = "v1"                 # "v1" (aggressive, default) | "v2" (less aggressive)
 
     state: str = "queued"                     # queued | running | awaiting_axes | done | failed
@@ -109,6 +107,7 @@ class JobState:
     transform: dict | None = None                        # filled at stage 6 (legacy single-pair convenience)
     detected_axes: dict | None = None                    # filled at stage 5
     enabled_checks: list[str] = field(default_factory=list)  # spot-check toggles
+    options: dict = field(default_factory=dict)          # stage tunables; core.fit reads its own keys
 
     outputs: dict = field(default_factory=dict)           # {dxf_path, preview_png, zip, report} (legacy)
     error: str | None = None
@@ -155,7 +154,6 @@ def _migrate_legacy(data: dict) -> dict:
             "mech_file_id":  "drawing_a",
             "str_file_id":   "drawing_b",
             "status":        "done" if data.get("state") == "done" else "queued",
-            "strategy":      data.get("strategy", "A"),
             "prefix":        "",
             "axes":          [],
             "enabled_checks": data.get("enabled_checks"),
@@ -182,7 +180,6 @@ def _migrate_legacy(data: dict) -> dict:
             "mech_file_id": mech_ids[0],
             "str_file_id":  str_ids[0],
             "status":       "done" if data.get("state") == "done" else "queued",
-            "strategy":     data.get("strategy", "A"),
         }]
         data["active_pair_id"] = data["pairs"][0]["pair_id"]
         data["legacy_v2"] = True
@@ -243,7 +240,11 @@ def load_job(job_id: str) -> JobState | None:
     filtered = {k: v for k, v in data.items() if k in valid_fields}
     # Coerce pairs: list of dicts → list of Pair instances.
     raw_pairs = filtered.get("pairs") or []
-    filtered["pairs"] = [Pair(**p) if isinstance(p, dict) else p for p in raw_pairs]
+    pair_fields = set(Pair.__dataclass_fields__)
+    filtered["pairs"] = [
+        Pair(**{k: v for k, v in p.items() if k in pair_fields}) if isinstance(p, dict) else p
+        for p in raw_pairs
+    ]
     # Coerce v2-shaped files values (have file_id + kind) to FileMeta.
     # Legacy flat dicts (drawing_a/drawing_b) stay as plain dicts so
     # back-compat consumers keep working.
@@ -296,9 +297,63 @@ def _new_job_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _clean_options(options: dict | None) -> dict:
+    """Normalise a caller-supplied ``options`` mapping.
+
+    ``None`` → ``{}`` (every stage default). Anything that isn't a
+    mapping raises — a silently-ignored options dict is exactly the bug
+    step 9 exists to prevent. Values are *not* validated here: the API
+    owns validation (400 on a bad value), and a job.json written by an
+    older build must still load.
+    """
+    if options is None:
+        return {}
+    if not isinstance(options, dict):
+        raise ValueError(f"options must be a dict; got {type(options).__name__}")
+    return dict(options)
+
+
+# The stage tunables (PLAN.md step 9) and their defaults. Readers:
+#   core.fit.FitOptions.from_job  — fit_model / allow_weak_fit (aliases
+#                                  model / force)
+#   core.overlay.OverlayStyle     — color_mode / str_lineweight / qa_grid
+#                                  (flat keys, or the `overlay` sub-dict)
+DEFAULT_OPTIONS: dict = {
+    "color_mode": "original",
+    "fit_model": "similarity",
+    "allow_weak_fit": False,
+    "str_lineweight": None,
+    "qa_grid": True,
+}
+
+# The `fit` / `overlay` keys are derived from the flat ones, never set by
+# hand — see `normalize_options`.
+_DERIVED_OPTIONS = ("fit", "overlay")
+
+
+def normalize_options(options: dict | None) -> dict:
+    """Fill in the defaults and (re)derive the ``fit`` / ``overlay`` namespaces.
+
+    The flat keys are what the stage readers use; the namespaces exist so
+    a hand-edited job.json can group them, and are always regenerated from
+    the flat keys so the two can never disagree.
+    """
+    flat = {k: v for k, v in (options or {}).items() if k not in _DERIVED_OPTIONS}
+    resolved = {**DEFAULT_OPTIONS, **flat}
+    resolved["fit"] = {"model": resolved["fit_model"],
+                       "force": resolved["allow_weak_fit"]}
+    resolved["overlay"] = {
+        "color_mode": resolved["color_mode"],
+        "str_lineweight": resolved["str_lineweight"],
+        "qa_grid": resolved["qa_grid"],
+    }
+    return resolved
+
+
 def _ensure_dirs(d: Path) -> None:
     """Make sure every per-job subdir exists. Idempotent."""
     (d / "uploads").mkdir(parents=True, exist_ok=True)
+    (d / "converted").mkdir(parents=True, exist_ok=True)
     (d / "cleaned").mkdir(parents=True, exist_ok=True)
     (d / "axes").mkdir(parents=True, exist_ok=True)
     (d / "out").mkdir(parents=True, exist_ok=True)
@@ -308,9 +363,9 @@ def create_job(
     *,
     files: list[dict],
     pairs: list[dict] | None = None,
-    strategy: str = "A",
     clean_version: str = "v1",
     enabled_checks: list[str] | None = None,
+    options: dict | None = None,
 ) -> JobState:
     """Create a new N-file job: dirs + initial state + Pair list.
 
@@ -319,17 +374,25 @@ def create_job(
     per file and used as the key in `JobState.files`.
 
     `pairs` is an explicit list of `{mech_file_id, str_file_id,
-    strategy?, prefix?, axes?, enabled_checks?}` dicts, or None — when
+    prefix?, axes?, enabled_checks?}` dicts, or None — when
     None and exactly one MECH + one STR exist, we auto-create the
     MECH×STR pair. The cross-product is the caller's responsibility
     (the /upload endpoint computes it from the user's `roles[]` form
     field).
+
+    `options` is the stage-tunables dict (step 9) — `color_mode`,
+    `fit_model`, `allow_weak_fit`, `str_lineweight`, `qa_grid`. It is
+    stored verbatim on `JobState.options`; `core.fit.FitOptions` and
+    `core.overlay.OverlayStyle` are the readers. `None` means "all
+    defaults", which is also what an old job.json without the field
+    loads as.
 
     Returns the JobState. The caller writes the uploads to
     `job_dir(job_id)/uploads/` and starts the worker thread.
     """
     import datetime
 
+    options = _clean_options(options)
     if not files:
         raise ValueError("files must be a non-empty list")
     for f in files:
@@ -372,7 +435,6 @@ def create_job(
                 mech_file_id=mech_fid,
                 str_file_id=str_fid,
                 status="queued",
-                strategy=p.get("strategy", strategy),
                 prefix=p.get("prefix", ""),
                 axes=list(p.get("axes", [])),
                 enabled_checks=p.get("enabled_checks", enabled_checks),
@@ -390,7 +452,6 @@ def create_job(
                     mech_file_id=mech_fid,
                     str_file_id=str_fid,
                     status="queued",
-                    strategy=strategy,
                     enabled_checks=enabled_checks,
                     created_at=datetime.datetime.now().isoformat(timespec="seconds"),
                 ))
@@ -398,7 +459,6 @@ def create_job(
     job = JobState(
         job_id=job_id,
         created_at=datetime.datetime.now().isoformat(timespec="seconds"),
-        strategy=strategy,
         clean_version=clean_version,
         state="queued",
         current_step=0,
@@ -412,6 +472,7 @@ def create_job(
         active_pair_id=pair_list[0].pair_id if pair_list else None,
         legacy_v2=False,
         enabled_checks=enabled_checks or [],
+        options=options,
     )
     save_job(job)
     return job
@@ -423,9 +484,9 @@ def create_job_legacy(
     drawing_a_size: int,
     drawing_b_name: str,
     drawing_b_size: int,
-    strategy: str = "A",
     clean_version: str = "v1",
     enabled_checks: list[str] | None = None,
+    options: dict | None = None,
 ) -> JobState:
     """Backwards-compat shim for the 2-file upload endpoint.
 
@@ -435,9 +496,13 @@ def create_job_legacy(
     synthesises the v2 `pairs` field — but only for jobs read back from
     disk. Jobs freshly created via this shim get the v2 fields at
     create time too, just synthesised here rather than at load.
+
+    `options` is the same stage-tunables dict `create_job` takes; see
+    there for the shape and the readers.
     """
     import datetime
 
+    options = _clean_options(options)
     job_id = _new_job_id()
     d = job_dir(job_id)
     _ensure_dirs(d)
@@ -449,7 +514,6 @@ def create_job_legacy(
         mech_file_id="drawing_a",
         str_file_id="drawing_b",
         status="queued",
-        strategy=strategy,
         prefix="",
         axes=[],
         enabled_checks=enabled_checks,
@@ -459,7 +523,6 @@ def create_job_legacy(
     job = JobState(
         job_id=job_id,
         created_at=created_at,
-        strategy=strategy,
         clean_version=clean_version,
         state="queued",
         current_step=0,
@@ -468,13 +531,14 @@ def create_job_legacy(
         # Flat v1 shape — every existing consumer reads
         # files.drawing_a.name etc. and stays bit-equivalent.
         files={
-            "drawing_a": {"name": drawing_a_name, "size": drawing_a_size},
-            "drawing_b": {"name": drawing_b_name, "size": drawing_b_size},
+            "drawing_a": {"name": drawing_a_name, "size": drawing_a_size, "kind": "mech"},
+            "drawing_b": {"name": drawing_b_name, "size": drawing_b_size, "kind": "str"},
         },
         pairs=[legacy_pair],
         active_pair_id=pair_id,
         legacy_v2=True,
         enabled_checks=enabled_checks or [],
+        options=options,
     )
     save_job(job)
     return job

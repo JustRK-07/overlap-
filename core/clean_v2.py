@@ -30,6 +30,8 @@ See `clean_v1.py` for the recommended default.
 
 from __future__ import annotations
 
+from .dxfio import read_internal as _read_internal, save as _dxf_save
+
 import json
 from pathlib import Path
 
@@ -40,6 +42,7 @@ from .clean_common import (
     _strip_annotations_in,
     _strip_annotation_layer_text,
     _strip_marker_hexagons,
+    _strip_non_grid_attribs,
     _strip_non_grid_inserts,
     _strip_non_grid_text_in,
     _strip_orphan_blocks,
@@ -68,7 +71,7 @@ def _clean_one(path: Path, out_path: Path, *, is_str: bool,
     protected_blocks: set of block names that must NOT be deleted even
         if no INSERT references them.
     """
-    doc = ezdxf.readfile(str(path))
+    doc = _read_internal(str(path))
     msp = doc.modelspace()
 
     # Step 1: strip annotation entities (DIMENSION, MTEXT, etc.) in modelspace.
@@ -117,6 +120,12 @@ def _clean_one(path: Path, out_path: Path, *, is_str: bool,
             block, policy=policy, protected=protected,
         )
 
+    # Step 2e: delete non-grid ATTRIBs on INSERTs (grid ATTRIBs are kept).
+    attrib_removed = 0
+    for cont in [msp] + [b for b in doc.blocks if not b.name.startswith("*")]:
+        attrib_removed += _strip_non_grid_attribs(
+            cont, policy=policy, protected=protected)[0]
+
     # Step 3: strip MECH callout balloons
     hex_removed = _strip_marker_hexagons(msp, policy=policy, protected=protected)
 
@@ -134,12 +143,14 @@ def _clean_one(path: Path, out_path: Path, *, is_str: bool,
     )
 
     # Step 4c+d: strip triangle-shaped entities at modelspace + blocks.
-    tri_msp_removed = _strip_triangles_in(msp, protected=protected)
+    tri_msp_removed = _strip_triangles_in(
+        msp, protected=protected, container_name=msp.name, policy=policy)
     tri_blk_removed = 0
     for block in list(doc.blocks):
         if block.name.startswith("*"):
             continue
-        tri_blk_removed += _strip_triangles_in(block, protected=protected)
+        tri_blk_removed += _strip_triangles_in(
+            block, protected=protected, container_name=block.name, policy=policy)
 
     # Step 5: drop orphan blocks (now safe — text + unreferenced INSERTs gone)
     blocks_removed = _strip_orphan_blocks(
@@ -147,10 +158,10 @@ def _clean_one(path: Path, out_path: Path, *, is_str: bool,
     )
 
     # Step 6: save
-    doc.saveas(str(out_path))
+    audit_summary = _dxf_save(doc, str(out_path))
 
     # Verify
-    doc2 = ezdxf.readfile(str(out_path))
+    doc2 = _read_internal(str(out_path))
     final_types: dict[str, int] = {}
     final_text_total = 0
     for e in doc2.modelspace():
@@ -179,6 +190,9 @@ def _clean_one(path: Path, out_path: Path, *, is_str: bool,
                     pass
 
     return {
+        "audit": audit_summary,
+        "insunits": int(doc.header.get("$INSUNITS", 0) or 0),
+        "non_grid_attribs_removed": attrib_removed,
         "input": path.name,
         "output": out_path.name,
         "is_str": is_str,
@@ -242,21 +256,51 @@ def run(job_id: str) -> None:
         except Exception:
             protected_blocks_map = {}
 
+    from .roles import resolve_inputs
+    from jobs import load_job, save_job
+
+    entries = resolve_inputs(job_id)
     stats = []
-    for dxf in sorted(cleaned.glob("*.dxf")):
-        if dxf.stem.endswith("_clean"):
+    cleaned_names: dict[str, str] = {}
+    for entry in entries:
+        dxf = d / entry.converted
+        out_dxf = d / entry.cleaned
+        if not dxf.exists():
+            stats.append({"input": dxf.name, "error": f"converted DXF missing: {dxf}"})
             continue
-        out_dxf = cleaned / f"{dxf.stem}_clean.dxf"
-        is_str = "STR" in dxf.stem.upper()
+        # Role comes from the manifest — never from the filename.
+        # Role "other" is cleaned with MECH rules.
+        is_str = entry.role == "str"
         prot = protected_map.get(dxf.name) or set()
         prot_blocks = protected_blocks_map.get(dxf.name) or set()
         try:
-            stats.append(_clean_one(
+            st = _clean_one(
                 dxf, out_dxf, is_str=is_str, policy=policy,
                 protected=prot or None,
                 protected_blocks=prot_blocks or None,
-            ))
+            )
+            stats.append(st)
+            if isinstance(st, dict) and "insunits" in st:
+                from .roles import record_insunits
+                record_insunits(job_id, entry.file_id, st["insunits"])
+            if isinstance(st, dict) and st.get("audit") is not None:
+                from .dxfio import record_audit
+                record_audit(d, "clean", out_dxf.name, st["audit"])
+            cleaned_names[entry.file_id] = out_dxf.name
         except Exception as e:
             stats.append({"input": dxf.name, "error": str(e)})
+
+    # Record the cleaned filename on each FileMeta (replaces the
+    # filename-reconciliation guesswork in the router).
+    job = load_job(job_id)
+    if job is not None and cleaned_names:
+        for key, meta in job.files.items():
+            fid = meta.get("file_id", key) if isinstance(meta, dict) else meta.file_id
+            if fid in cleaned_names:
+                if isinstance(meta, dict):
+                    meta["cleaned_filename"] = cleaned_names[fid]
+                else:
+                    meta.cleaned_filename = cleaned_names[fid]
+        save_job(job)
 
     (stages / "clean_stats.json").write_text(json.dumps(stats, indent=2))

@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""pipelines.py — orchestrates the 9-stage overlay pipeline.
+"""pipelines.py — drives the overlay stages.
 
 The worker thread that runs after a job is created calls run_pipeline().
-That function walks stages 1-4 and pauses at stage 5 until the user
+That function walks stages 1-6 and then pauses at stage 7 until the user
 submits their grid convention via /axes. /axes/confirm calls
-resume_after_axes() which walks stages 6-9 to completion.
+resume_after_axes(), which walks stages 8-11 to completion.
 
 Each stage writes its output to jobs/<id>/<subdir>/ before the worker
 moves on. update_status() reflects each stage's completion in job.json.
+The UI's step rail numbers them the same way (README.md has the table).
 
 Stages:
-  1. validate   — sniff formats, ensure files are readable
-  2. inspect    — count entities + layers (no render in MVP)
-  3. convert    — DWG → DXF via ezdxf.addons.odafc (skip if DXF input)
-  4. clean      — strip annotations/markers (clean_v1 or clean_v2)
-  5. axes       — AUTO-SCAN + WAIT for user convention
-  6. fit        — least-squares affine
-  7. overlay    — apply transform per chosen strategy (A/B/C)
-  8. package    — preview PNG + report JSON
-  9. done       — final marker
+  1.  validate       — sniff formats, ensure files are readable
+  2.  inspect        — count entities + layers (no render in MVP)
+  3.  convert        — DWG → DXF via ezdxf.addons.odafc (skip if DXF input)
+                       → converted/<stem>.dxf, and writes the roles manifest
+  4.  labels         — scan both drawings for grid labels before cleaning
+  5.  clean_policy   — derive the project-specific cleaning policy
+  6.  clean          — strip annotations/markers (clean_v1 or clean_v2)
+                       → cleaned/<stem>_clean.dxf
+  7.  axes           — AUTO-SCAN + WAIT for the user's convention
+  8.  fit            — similarity transform (Umeyama + RANSAC) + quality gates
+  9.  overlay        — import STR via xref, transform, repaint per-source layers
+  9.5 spot-check     — support/clash issues; non-fatal
+  10. package        — preview PNG, preview grid PNG, report JSON
+  11. done           — final marker
 """
 
 from __future__ import annotations
@@ -33,7 +39,7 @@ from jobs import job_dir, load_job, save_job, update_status
 
 
 def run_pipeline(job_id: str) -> None:
-    """Run stages 1-4. Pause at stage 5 awaiting user convention."""
+    """Run stages 1-6. Pause at stage 7 awaiting the user's convention."""
     job = load_job(job_id)
     if job is None:
         return
@@ -79,7 +85,7 @@ def run_pipeline(job_id: str) -> None:
 def resume_after_axes(job_id: str, *, pair_id: str | None = None) -> None:
     """Called by /axes/confirm after the user submits a convention.
 
-    Walks stages 6-9 to completion. `pair_id=None` is the legacy
+    Walks stages 8-11 to completion. `pair_id=None` is the legacy
     single-pair path (writes to `jobs/<id>/` directly). When `pair_id`
     is given, the stages are scoped to that pair's root
     (`jobs/<id>/out/pairs/<pair_id>/`) via the `pair_dir` kwarg each
@@ -87,11 +93,10 @@ def resume_after_axes(job_id: str, *, pair_id: str | None = None) -> None:
     """
     started = time.time()
 
-    # Resolve the pair (if any) for strategy passthrough.
+    # Resolve the pair (if any).
     job = load_job(job_id)
     pair = None
     pair_dir_arg = None
-    strategy_arg = None
     if pair_id is not None and job is not None:
         for p in job.pairs:
             if p.pair_id == pair_id:
@@ -102,7 +107,6 @@ def resume_after_axes(job_id: str, *, pair_id: str | None = None) -> None:
             return
         from core.pair_runner import pair_root
         pair_dir_arg = pair_root(job_id, pair_id) / "cleaned"
-        strategy_arg = pair.strategy
 
     # Stage 8 — fit.
     update_status(job_id, state="running", current_step=8,
@@ -118,10 +122,9 @@ def resume_after_axes(job_id: str, *, pair_id: str | None = None) -> None:
     # Stage 9 — overlay.
     update_status(job_id, state="running", current_step=9,
                   step_name="Building overlay",
-                  message="Applying transform with strategy...")
+                  message="Applying transform...")
     try:
-        _run_stage_module("overlay", job_id,
-                          pair_dir=pair_dir_arg, strategy=strategy_arg)
+        _run_stage_module("overlay", job_id, pair_dir=pair_dir_arg)
         update_status(job_id, message="Overlay built.")
     except Exception as e:
         update_status(job_id, message=f"Overlay failed: {e}", error=str(e))

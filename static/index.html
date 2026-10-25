@@ -17,33 +17,22 @@
 
       <div class="drop-grid">
         <label class="drop" data-target="file-a">
-          <span class="drop-label">Drawing A (Mechanical)</span>
-          <span class="drop-hint">Drop .dwg or .dxf here, or click to browse</span>
+          <span class="drop-label">MECH drawing</span>
+          <span class="drop-hint">Mechanical / equipment layout · .dwg or .dxf</span>
           <input type="file" id="file-a" accept=".dwg,.dxf" hidden>
         </label>
 
         <label class="drop" data-target="file-b">
-          <span class="drop-label">Drawing B (Structural)</span>
-          <span class="drop-hint">Drop .dwg or .dxf here, or click to browse</span>
+          <span class="drop-label">STR drawing</span>
+          <span class="drop-hint">Structural framing · .dwg or .dxf</span>
           <input type="file" id="file-b" accept=".dwg,.dxf" hidden>
         </label>
       </div>
 
-      <div class="strategy-row">
-        <span class="strategy-label">Overlay strategy:</span>
-        <label class="radio">
-          <input type="radio" name="strategy" value="A" checked>
-          <span><b>A</b> per-entity <span class="muted">(preserve original colors)</span></span>
-        </label>
-        <label class="radio">
-          <input type="radio" name="strategy" value="B">
-          <span><b>B</b> 2-block <span class="muted">(force red/blue)</span></span>
-        </label>
-        <label class="radio">
-          <input type="radio" name="strategy" value="C">
-          <span><b>C</b> 1-block <span class="muted">(force red/blue)</span></span>
-        </label>
-      </div>
+      <p class="muted" style="margin: 0.4em 0 0.8em;">
+        The STR drawing is transformed onto the MECH one. The roles are explicit —
+        they are never guessed from the filenames.
+      </p>
 
       <div class="strategy-row">
         <span class="strategy-label">Cleaner version:</span>
@@ -56,6 +45,58 @@
           <span><b>v2</b> less aggressive <span class="muted">(keeps more content — for comparison)</span></span>
         </label>
       </div>
+
+      <!-- Step 9 — stage options (persisted in job.options) -->
+      <details class="checks-panel" id="options-panel" style="margin-top: 0.6em;">
+        <summary>Overlay options <span class="muted">(colour mode, fit model, QA grid)</span></summary>
+
+        <div class="checks-group">
+          <div class="checks-group-title">Colour mode</div>
+          <div class="strategy-row">
+            <label class="radio">
+              <input type="radio" name="color_mode" value="original" checked>
+              <span><b>original</b> <span class="muted">keep each drawing's own layer colours</span></span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="color_mode" value="contrast">
+              <span><b>contrast</b> <span class="muted">MECH blue / STR red, for side-by-side reading</span></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="checks-group">
+          <div class="checks-group-title">Fit</div>
+          <div class="form-row" style="margin: 6px 0 0;">
+            <label>Transform model:
+              <select id="fit-model" class="select-base">
+                <option value="similarity">similarity — scale + rotation + translation (recommended)</option>
+                <option value="affine">affine — allows shear (diagnostic only)</option>
+              </select>
+            </label>
+          </div>
+          <label class="check">
+            <input type="checkbox" name="allow_weak_fit" id="allow-weak-fit">
+            <span>Allow weak fit <span class="muted">— accept the transform even when the quality
+              gates complain (too few inliers, a bad leave-one-out residual, a scale that
+              contradicts $INSUNITS). The result is marked <code>forced</code>.</span></span>
+          </label>
+        </div>
+
+        <div class="checks-group">
+          <div class="checks-group-title">Output styling</div>
+          <div class="form-row" style="margin: 6px 0 0;">
+            <label>STR lineweight <span class="muted">(1/100 mm, blank = as drawn):</span>
+              <input type="text" id="str-lineweight" inputmode="numeric" placeholder="e.g. 50" size="6">
+            </label>
+          </div>
+          <label class="check">
+            <input type="checkbox" name="qa_grid" id="qa-grid" checked>
+            <span>Draw the QA grid <span class="muted">— both grids, an X per intersection, and
+              the residual of each correspondence on layers <code>QA|GRID</code> /
+              <code>QA|GRID_STR</code> / <code>QA|OUTLIER</code></span></span>
+          </label>
+        </div>
+      </details>
 
       <!-- Slice 2 — Multi-file upload (collapsible; legacy 2-file form stays default) -->
       <details class="checks-panel" id="multi-file-details" style="margin-top: 0.6em;">
@@ -228,11 +269,17 @@
     <section id="done-section" class="card hidden">
       <h2>4. Done</h2>
       <div id="transform-display"></div>
+      <div id="fit-quality-display"></div>
       <div class="download-row">
         <a id="download-link" href="#" download="superimposed.dxf" class="primary">⬇ Superimposed DXF</a>
         <a id="download-annotated-link" href="#" download="superimposed_annotated.dxf">⬇ Annotated DXF (with spot-check clouds)</a>
         <a id="download-docx-link" href="#" download="spotcheck.docx">⬇ Spot-check DOCX</a>
         <a id="download-spotcheck-json-link" href="#" download="spotcheck.json">⬇ Spot-check JSON</a>
+      </div>
+      <div class="download-row">
+        <a id="preview-link" href="#" target="_blank">🖼 Preview — full extents</a>
+        <a id="preview-grid-link" href="#" target="_blank">🖼 Preview — grid close-up</a>
+        <a id="report-link" href="#" target="_blank">📄 report.json</a>
       </div>
     </section>
 

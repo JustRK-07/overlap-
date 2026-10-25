@@ -73,7 +73,6 @@ def fx_job_with_cleaned_dxfs(fx_isolated_jobs, fx_tp104_dxfs, tmp_path):
     from jobs import create_job_legacy, save_job, job_dir
 
     job = create_job_legacy(
-        strategy="A",
         drawing_a_name=mech.name,
         drawing_a_size=mech.stat().st_size,
         drawing_b_name=struct.name,
@@ -95,3 +94,51 @@ def fx_job_with_cleaned_dxfs(fx_isolated_jobs, fx_tp104_dxfs, tmp_path):
     job.state = "done"
     save_job(job)
     return job.job_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Synthetic MECH/STR fixtures (tests/synth.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+sys.path.insert(0, str(HERE))
+
+
+@pytest.fixture
+def fx_synth_simple(tmp_path):
+    """SynthPair built from LEGACY_COMPATIBLE (rotation 0, mm, simple grid)."""
+    import synth
+    return synth.build_pair(tmp_path / "synth_simple", synth.LEGACY_COMPATIBLE)
+
+
+@pytest.fixture
+def fx_synth_hard(tmp_path):
+    """SynthPair built from HARD (7.5 deg, metres, rotated inserts, MTEXT/ATTRIB)."""
+    import synth
+    return synth.build_pair(tmp_path / "synth_hard", synth.HARD)
+
+
+@pytest.fixture
+def fx_synth_job(fx_isolated_jobs, tmp_path):
+    """Factory: ``fx_synth_job(opts=None, clean_version="v1") -> (job_id, SynthPair)``.
+
+    Creates a legacy job (drawing_a = MECH, drawing_b = STR) whose
+    uploads/ holds the synthetic pair. The pipeline is NOT started.
+    """
+    def _make(opts=None, *, clean_version: str = "v1"):
+        import synth
+        from jobs import create_job_legacy, job_dir
+        opts = opts or synth.LEGACY_COMPATIBLE
+        pair = synth.build_pair(tmp_path / f"synth_job_src_{uuid.uuid4().hex[:6]}", opts)
+        job = create_job_legacy(
+            drawing_a_name=pair.mech_path.name,
+            drawing_a_size=pair.mech_path.stat().st_size,
+            drawing_b_name=pair.str_path.name,
+            drawing_b_size=pair.str_path.stat().st_size,
+            clean_version=clean_version,
+        )
+        up = job_dir(job.job_id) / "uploads"
+        up.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(pair.mech_path, up / pair.mech_path.name)
+        shutil.copyfile(pair.str_path, up / pair.str_path.name)
+        return job.job_id, pair
+    return _make

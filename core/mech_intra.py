@@ -20,6 +20,8 @@ Output:
 
 from __future__ import annotations
 
+from .dxfio import read_internal as _read_internal, save as _dxf_save
+
 import json
 import math
 from dataclasses import asdict, dataclass, field
@@ -426,16 +428,12 @@ def run(job_id: str, *,
     d = job_dir(job_id)
     if pair_dir is not None:
         root = Path(pair_dir).parent
-        cleaned = sorted(Path(pair_dir).glob("*_clean.dxf"))
     else:
         root = d
-        cleaned = sorted((d / "cleaned").glob("*_clean.dxf"))
-    # MECH is alphabetically first
-    mech_path = cleaned[0] if cleaned else None
-    if mech_path is None or not mech_path.exists():
-        raise RuntimeError("MECH cleaned DXF missing")
+    from .roles import resolve_pair
+    mech_path, _ = resolve_pair(job_id, pair_dir)   # explicit roles
 
-    doc = ezdxf.readfile(str(mech_path))
+    doc = _read_internal(str(mech_path))
     footprints = _find_mech_footprints(doc)
     building = _find_building_outline(doc)
 

@@ -5,7 +5,7 @@ Usage (server must be running):
   python3 tests/smoke_test.py
 
 What it does:
-  1. POSTs two cleaned DXFs from ISGEC/dxf/ + strategy A
+  1. POSTs two cleaned DXFs from ISGEC/dxf/
   2. Polls /status until state != running/awaiting_axes
   3. At awaiting_axes, POSTs the convention (TP104-, A-D 1-3)
   4. Continues polling until state = "done"
@@ -54,7 +54,7 @@ def main() -> int:
     with open(MECH, "rb") as fa, open(STR, "rb") as fb:
         r = requests.post(
             f"{API}/api/v1/overlay",
-            data={"strategy": "A"},
+            data={},
             files={"drawing_a": (MECH.name, fa), "drawing_b": (STR.name, fb)},
             timeout=30,
         )
@@ -160,7 +160,6 @@ def main() -> int:
     print(green(f"  ✓ SMOKE TEST PASSED"))
     print(f"    elapsed: {elapsed:.1f}s")
     print(f"    output:  {dxf_out} ({size_mb:.1f} MB)")
-    print(f"    strategy: A (preserve original colors)")
     print(f"    entities: {ent_count} modelspace")
     return 0
 

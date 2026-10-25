@@ -1,310 +1,578 @@
 #!/usr/bin/env python3
-"""core/fit.py — Stage 6.
+"""core/fit.py — Stage 6: robust STR → MECH transform.
 
-Find the gridline LINE positions (not text positions) in both cleaned
-drawings, then solve a least-squares affine that maps STR coords →
-MECH coords.
+Plan: PLAN.md step 5.  The old separable 1-D least squares (one slope per
+axis, no rotation, no outlier rejection, a silent ``slope = 1`` fallback
+when the axis coordinates were degenerate) is gone.  What happens now:
 
-Inputs:
-  - cleaned/<base>_clean.dxf  (MECH — alphabetical order)
-  - cleaned/<base>_clean.dxf  (STR  — alphabetical order)
-  - axes/convention.json      (user's chosen prefix + axes)
+1. ``core.grid`` detects the gridlines of both drawings in *world*
+   coordinates (step 4) — block base points, rotation, mirroring and
+   nesting already folded in.
+2. The shared gridline **intersections** are used as correspondences.  That
+   is rotation invariant and drops the old "letters are X, digits are Y"
+   assumption.
+3. A 2-D **similarity** (uniform scale + rotation + translation) is solved
+   with Umeyama, wrapped in a deterministic **RANSAC** over every pair of
+   correspondences, and scored with **leave-one-out** residuals.
+4. Quality gates refuse to write a bad transform: too few points, too few
+   inliers, a poor LOO residual, or a scale that contradicts the two
+   ``$INSUNITS`` headers.  ``force`` turns every gate into a warning.
 
-Outputs:
-  - transform.json with scale_x, scale_y, tx, ty + per-intersection residuals
-  - persisted into jobs.stages
+Outputs (under the pair root, ``jobs/<id>/`` for the legacy single-pair
+layout):
 
-Ported from ISGEC/A/scripts/fit.py with paths parameterized and grid-label
-regex built from the user's chosen convention (no hardcoded TP104-*).
+    transform.json    the superset described below (legacy keys included)
+    grid_mech.json    MECH gridlines: point, direction, length, status
+    grid_str.json     STR gridlines, same shape
+
+``transform.json`` keys — superset, back-compatible:
+
+    model            "similarity" | "affine"
+    matrix           [[a, b, tx], [c, d, ty]]
+    a b c d tx ty    the same six numbers, flat
+    scale            uniform scale (mean column norm)
+    rotation_deg     rotation of the first column, in (-180, 180]
+    mirrored         det < 0
+    skew_deg         0 for a similarity; grows to ±90 for a shear
+    correspondences  [{label, str, mech, predicted, residual,
+                      loo_residual, inlier}]
+    rms_residual     over the inliers        max_residual   over the inliers
+    loo_max          worst leave-one-out residual (null when not computable)
+    n_inliers n_total outliers[label]
+    units            {mech, str, expected_scale}
+    quality          {status, warnings}      status: ok | forced
+    tau              the RANSAC inlier radius actually used
+    median_spacing   median adjacent-axis distance in the MECH drawing
+    convention skipped_axes warnings        (legacy)
+    scale_x scale_y tx ty x_labels y_labels intersections   (legacy, exact)
+
+``scale_x`` / ``scale_y`` are the two column norms, i.e. the matrix diagonal
+— for a similarity they are both ``scale``.  They are only meaningful as an
+axis-aligned model when ``rotation_deg`` is 0.
 """
 
 from __future__ import annotations
 
 import json
-import re
+import math
+from dataclasses import dataclass, fields
 from pathlib import Path
 
-import ezdxf
+import numpy as np
 
-from jobs import job_dir
+from . import grid
+from .dxfio import read_internal as _read_internal
+from .transform2d import (Affine2D, FitError, fit_affine, loo_residuals,
+                          ransac_similarity, rms)
+
+from jobs import job_dir, load_job
 
 
-# AutoCAD Mechanical centerline layer names (MECH centerlines)
-GRID_LAYERS_MECH = {
-    "CEN", "CENETR LINE", "CENTER", "PHANTOM", "PANTHOM",
-    "HIDDEN", "HIDDDEN", "CENTERLINE", "C-ROAD-STAN",
+# ─────────────────────────────────────────────────────────────────────────────
+# Options
+# ─────────────────────────────────────────────────────────────────────────────
+
+# `job.options` is written by the API (step 9).  Both the field name and the
+# API name are accepted for every option; anything unknown is ignored.
+_OPTION_ALIASES = {
+    "model": ("model", "fit_model"),
+    "min_inliers": ("min_inliers",),
+    "min_inlier_ratio": ("min_inlier_ratio",),
+    "loo_tol_rel": ("loo_tol_rel",),
+    "scale_prior_tol": ("scale_prior_tol",),
+    "ransac_tau_rel": ("ransac_tau_rel",),
+    "allow_mirror": ("allow_mirror",),
+    "force": ("force", "allow_weak_fit"),
 }
+_BOOL = {"model": str, "min_inliers": int, "min_inlier_ratio": float,
+         "loo_tol_rel": float, "scale_prior_tol": float,
+         "ransac_tau_rel": float, "allow_mirror": bool, "force": bool}
 
 
-def _is_vertical(e) -> bool:
-    s, e2 = e.dxf.start, e.dxf.end
-    return abs(s[0] - e2[0]) < 1.0 and abs(s[1] - e2[1]) > 100.0
+@dataclass
+class FitOptions:
+    """Tunables for the fit and its quality gates."""
 
+    model: str = "similarity"            # "similarity" (default) | "affine" (diagnostic)
+    min_inliers: int = 3
+    min_inlier_ratio: float = 0.6
+    loo_tol_rel: float = 0.005           # × median MECH grid spacing
+    scale_prior_tol: float = 0.02        # |scale/expected − 1|
+    ransac_tau_rel: float = 0.002        # × median MECH grid spacing
+    allow_mirror: bool = False
+    force: bool = False                  # every gate becomes a warning
 
-def _is_horizontal(e) -> bool:
-    s, e2 = e.dxf.start, e.dxf.end
-    return abs(s[1] - e2[1]) < 1.0 and abs(s[0] - e2[0]) > 100.0
-
-
-def _build_grid_re(prefix: str, suffixes: list[str]) -> re.Pattern:
-    """Build a regex matching prefix + suffix, case-insensitive on the suffix."""
-    # Escape prefix for regex; build alternatives for each suffix
-    prefix_esc = re.escape(prefix)
-    sfx_alt = "|".join(re.escape(s) for s in suffixes)
-    return re.compile(rf"^{prefix_esc}\s*({sfx_alt})\s*$", re.IGNORECASE)
-
-
-def _find_mech_axis(mech_path: Path, label_suffix: str, axis: str, grid_re: re.Pattern):
-    """Return (axis_coord, distance_to_label) for the MECH gridline.
-
-    For axis='X' (letter labels): returns X coord of vertical line near the TEXT.
-    For axis='Y' (number labels): returns Y coord of horizontal line near the TEXT.
-    """
-    doc = ezdxf.readfile(str(mech_path))
-    msp = doc.modelspace()
-
-    text_pos = None
-    for t in msp:
-        if t.dxftype() == "TEXT":
-            m = grid_re.match(t.dxf.text.strip())
-            if m and m.group(1).upper() == label_suffix.upper():
-                text_pos = (t.dxf.insert[0], t.dxf.insert[1])
+    @classmethod
+    def from_job(cls, job) -> "FitOptions":
+        """Defaults, overridden by ``job.options`` (absent on old jobs)."""
+        raw = getattr(job, "options", None) or {}
+        if not isinstance(raw, dict):
+            return cls()
+        kw = {}
+        for f in fields(cls):
+            for key in _OPTION_ALIASES[f.name]:
+                if key not in raw:
+                    continue
+                val = raw[key]
+                try:
+                    if _BOOL[f.name] is bool:
+                        if isinstance(val, str):
+                            val = val.strip().lower() in ("1", "true", "yes", "on")
+                        kw[f.name] = bool(val)
+                    else:
+                        kw[f.name] = _BOOL[f.name](val)
+                except (TypeError, ValueError):
+                    continue            # a bad option value never breaks the run
                 break
-    if text_pos is None:
-        return None, None
-
-    is_vert = (axis == "X")
-    best = None
-    best_dist = float("inf")
-    for e in msp:
-        if e.dxftype() != "LINE":
-            continue
-        if e.dxf.layer not in GRID_LAYERS_MECH:
-            continue
-        if is_vert and not _is_vertical(e):
-            continue
-        if not is_vert and not _is_horizontal(e):
-            continue
-        s, e2 = e.dxf.start, e.dxf.end
-        mx = (s[0] + e2[0]) / 2
-        my = (s[1] + e2[1]) / 2
-        d = ((mx - text_pos[0]) ** 2 + (my - text_pos[1]) ** 2) ** 0.5
-        if d < best_dist:
-            best_dist = d
-            best = e
-    if best is None:
-        return None, None
-    s, e2 = best.dxf.start, best.dxf.end
-    if axis == "X":
-        return (s[0] + e2[0]) / 2, best_dist
-    return (s[1] + e2[1]) / 2, best_dist
+        return cls(**kw)
 
 
-def _find_str_axis(str_path: Path, label_suffix: str, axis: str, grid_re: re.Pattern):
-    """Find the STR gridline by walking GridLine-* INSERTs.
+def options_for_job(job_id: str) -> FitOptions:
+    job = load_job(job_id)
+    return FitOptions.from_job(job) if job is not None else FitOptions()
 
-    For each candidate block:
-      - find a TEXT matching grid_re
-      - find the longest axis-aligned LINE
-      - apply INSERT's position + scale to convert to world coords
-    Returns (axis_coord, 0.0).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grid helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ok(res: grid.GridResult) -> dict:
+    return {k: a for k, a in res.axes.items() if a.status == "ok" and a.point is not None}
+
+
+def median_spacing(res: grid.GridResult) -> float:
+    """Median distance between adjacent parallel gridlines, in drawing units.
+
+    One median per family (the two grids are orthogonal, so mixing them
+    would say nothing useful), then the median of those.  The offset of a
+    line is measured *across* its family (along the normal), never along
+    the line: every gridline of a family starts at the same corner, so
+    their along-line offsets are all equal and say nothing.  Falls back to
+    the drawing extent, then to 1.0, so there is always a positive scale
+    for the relative thresholds.
     """
-    doc = ezdxf.readfile(str(str_path))
-    msp = doc.modelspace()
-
-    is_vert = (axis == "X")
-
-    for ins in msp:
-        if ins.dxftype() != "INSERT":
+    ok = _ok(res)
+    per_family = []
+    for fam in res.families:
+        axes = [ok[k] for k in fam if k in ok]
+        if len(axes) < 2:
             continue
-        nm = ins.dxf.name
-        if not (nm.startswith("GridLine-") or nm.startswith(" Line-")
-                or nm.startswith("_STR_GridLine-") or nm.startswith("_STR_Line-")):
+        d = axes[0].dir
+        nx, ny = -d.y, d.x                     # the family's normal
+        base = axes[0].point
+        ts = sorted((a.point.x - base.x) * nx + (a.point.y - base.y) * ny
+                    for a in axes)
+        gaps = [b - a for a, b in zip(ts, ts[1:]) if b - a > 0.0]
+        if gaps:
+            per_family.append(median(gaps))
+    if per_family:
+        return median(per_family)
+    if res.extent > 0.0:
+        return float(res.extent)
+    return 1.0
+
+
+def median(values) -> float:
+    v = sorted(float(x) for x in values)
+    n = len(v)
+    if n == 0:
+        raise FitError("median of an empty sequence")
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def _vertical_family(res: grid.GridResult) -> int:
+    """Index (0/1) of the family of *vertical* lines, else 0.
+
+    The legacy ``x_labels``/``y_labels`` keys describe the axis whose
+    position is given by its X coordinate (the vertical gridlines) and the
+    one given by Y.  That is a property of the line direction, not of the
+    label, so it is read from the detected directions.
+    """
+    ok = _ok(res)
+    for i, fam in enumerate(res.families):
+        axes = [ok[k] for k in fam if k in ok]
+        if not axes:
             continue
-
-        # Find block def (search by name)
-        block = None
-        for b in doc.blocks:
-            if b.name == ins.dxf.name:
-                block = b
-                break
-        if block is None:
-            continue
-
-        text_label = None
-        best_line = None
-        best_length = 0.0
-        for e in block:
-            if e.dxftype() == "TEXT":
-                m = grid_re.match(e.dxf.text.strip())
-                if m and m.group(1).upper() == label_suffix.upper():
-                    text_label = e
-            elif e.dxftype() == "LINE":
-                s, e2 = e.dxf.start, e.dxf.end
-                length = ((e2[0] - s[0]) ** 2 + (e2[1] - s[1]) ** 2) ** 0.5
-                if is_vert and _is_vertical(e) and length > best_length:
-                    best_length = length
-                    best_line = e
-                elif not is_vert and _is_horizontal(e) and length > best_length:
-                    best_length = length
-                    best_line = e
-
-        if text_label is None or best_line is None:
-            continue
-
-        s, e2 = best_line.dxf.start, best_line.dxf.end
-        px, py = ins.dxf.insert[0], ins.dxf.insert[1]
-        sx = ins.dxf.xscale or 1.0
-        sy = ins.dxf.yscale if ins.dxf.hasattr("yscale") and ins.dxf.yscale else sx
-
-        if axis == "X":
-            wx1 = px + sx * s[0]
-            wx2 = px + sx * e2[0]
-            return (wx1 + wx2) / 2, 0.0
-        wy1 = py + sy * s[1]
-        wy2 = py + sy * e2[1]
-        return (wy1 + wy2) / 2, 0.0
-
-    # Pass 2 (fallback): the cleaner may have stripped the INSERTs but
-    # the block defs + their labels usually survive. Walk every non-
-    # anonymous block def directly looking for label + axis-aligned LINE.
-    for block in doc.blocks:
-        if block.name.startswith("*"):
-            continue
-        if not (block.name.startswith("GridLine-") or block.name.startswith(" Line-")
-                or block.name.startswith("_STR_GridLine-") or block.name.startswith("_STR_Line-")):
-            continue
-        text_label = None
-        best_line = None
-        best_length = 0.0
-        for e in block:
-            if e.dxftype() == "TEXT":
-                m = grid_re.match(e.dxf.text.strip())
-                if m and m.group(1).upper() == label_suffix.upper():
-                    text_label = e
-            elif e.dxftype() == "LINE":
-                s, e2 = e.dxf.start, e.dxf.end
-                length = ((e2[0] - s[0]) ** 2 + (e2[1] - s[1]) ** 2) ** 0.5
-                if is_vert and _is_vertical(e) and length > best_length:
-                    best_length = length
-                    best_line = e
-                elif not is_vert and _is_horizontal(e) and length > best_length:
-                    best_length = length
-                    best_line = e
-        if text_label is None or best_line is None:
-            continue
-        s, e2 = best_line.dxf.start, best_line.dxf.end
-        if axis == "X":
-            return (s[0] + e2[0]) / 2, 0.0
-        return (s[1] + e2[1]) / 2, 0.0
-
-    return None, None
+        if sum(abs(a.dir.y) > abs(a.dir.x) for a in axes) * 2 > len(axes):
+            return i
+    return 0
 
 
-def _fit_axis(str_vals: list[float], mech_vals: list[float]):
-    """Least-squares fit: mech = a * str + b."""
-    n = len(str_vals)
-    sx = sum(str_vals)
-    sy = sum(mech_vals)
-    sxx = sum(v * v for v in str_vals)
-    sxy = sum(s * m for s, m in zip(str_vals, mech_vals))
-    denom = n * sxx - sx * sx
-    if abs(denom) < 1e-9:
-        return 1.0, (sy - sx) / n
-    a = (n * sxy - sx * sy) / denom
-    b = (sy - a * sx) / n
-    return a, b
+def grid_to_json(res: grid.GridResult, prefix: str) -> dict:
+    """The sidecar written as ``grid_mech.json`` / ``grid_str.json``."""
+    f0, f1 = res.families
+    return {
+        "prefix": prefix,
+        "suffixes": list(res.axes),
+        "families": [list(f0), list(f1)],
+        "extent": res.extent,
+        "axes": {
+            lbl: {
+                "label": lbl,
+                "status": ax.status,
+                "reasons": list(ax.reasons),
+                "n_occurrences": ax.n_occ,
+                "n_agree": ax.n_agree,
+                "point": None if ax.point is None else [ax.point.x, ax.point.y],
+                "dir": None if ax.dir is None else [ax.dir.x, ax.dir.y],
+                "length": ax.length,
+                "midpoint": (None if ax.point is None else
+                             [ax.point.x + ax.dir.x * ax.length / 2.0,
+                              ax.point.y + ax.dir.y * ax.length / 2.0]),
+                "angle_deg": (None if ax.dir is None else
+                              math.degrees(math.atan2(ax.dir.y, ax.dir.x)) % 180.0),
+            }
+            for lbl, ax in res.axes.items()
+        },
+        "intersections": {f"{a}-{b}": [p.x, p.y]
+                          for (a, b), p in sorted(grid.intersections(res).items())},
+    }
 
 
-def run(job_id: str, *, pair_dir = None) -> None:
+def _axis_summary(res: grid.GridResult, label: str):
+    """``((mid_x, mid_y), [start_x, start_y], angle_deg)`` for one axis.
+
+    ``None`` when the axis was not detected.  The midpoint is what the old
+    separable fit reported as an axis coordinate.
+    """
+    ax = _ok(res).get(label)
+    if ax is None:
+        return None, None, None
+    mid = ax.point + ax.dir * (ax.length / 2.0)
+    ang = math.degrees(math.atan2(ax.dir.y, ax.dir.x)) % 180.0
+    return (mid.x, mid.y), [ax.point.x, ax.point.y], ang
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Units prior
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _insunits(doc) -> int:
+    try:
+        return int(doc.header.get("$INSUNITS", 0) or 0)
+    except Exception:
+        return 0
+
+
+def expected_scale(str_units: int, mech_units: int) -> float | None:
+    """STR drawing units per MECH unit implied by the two ``$INSUNITS``.
+
+    ``None`` when either header is unitless (0) or the two are not
+    convertible (µin / mil / Å …).
+    """
+    if not str_units or not mech_units:
+        return None
+    try:
+        from ezdxf.units import conversion_factor
+        f = float(conversion_factor(str_units, mech_units))
+    except Exception:
+        return None
+    return f if math.isfinite(f) and f > 0.0 else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The solver — pure geometry + gates, no DXFs
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class FitInputs:
+    """What the solver needs: shared grid intersections and their scale."""
+
+    labels: list                 # "A-1" … in correspondence order
+    src: np.ndarray              # (N, 2) STR coordinates
+    dst: np.ndarray              # (N, 2) MECH coordinates
+    spacing: float = 1.0         # median MECH grid spacing (the tolerance unit)
+    extent: float = 0.0          # MECH drawing extent (tau's absolute floor)
+    str_units: int = 0           # $INSUNITS of the STR drawing
+    mech_units: int = 0          # $INSUNITS of the MECH drawing
+
+
+def solve(inp: FitInputs, options: FitOptions | None = None) -> dict:
+    """Fit STR → MECH from ``inp`` and return the new-style transform fields.
+
+    Raises :class:`FitError` when a quality gate rejects the fit (unless
+    ``options.force``, which downgrades every gate to a warning).  This is
+    the whole of stage 6's maths; :func:`run` only gathers the inputs from
+    the two drawings and writes the files.
+    """
+    opts = options or FitOptions()
+    src = np.asarray(inp.src, dtype=float)
+    dst = np.asarray(inp.dst, dtype=float)
+    labels = list(inp.labels)
+    if src.shape != dst.shape or src.shape[0] != len(labels):
+        raise FitError(
+            f"labels ({len(labels)}), src {src.shape} and dst {dst.shape} "
+            "must describe the same correspondences")
+
+    warnings: list[str] = []
+    status = "ok"
+
+    def gate(ok: bool, msg: str) -> None:
+        """Refuse a bad fit — unless ``force`` was asked for."""
+        nonlocal status
+        if ok:
+            return
+        if opts.force:
+            warnings.append("quality gate overridden by force: " + msg)
+            status = "forced"
+            return
+        raise FitError(msg)
+
+    # ── gate 1: enough shared intersections at all ─────────────────────────
+    # Never forceable: with fewer than two points there is nothing to fit.
+    if len(labels) < 2:
+        raise FitError(
+            f"need ≥2 shared grid intersections; found {len(labels)}: "
+            f"{', '.join(labels) or '—'}. Check the axes convention, and which "
+            "axes failed in grid_mech.json / grid_str.json.")
+
+    spacing = float(inp.spacing) or 1.0
+    tau = max(opts.ransac_tau_rel * spacing, 1e-9 * float(inp.extent), 1e-12)
+
+    # ── gate 2: exactly two points is exact but unverifiable ────────────────
+    gate(len(labels) > 2,
+         f"only {len(labels)} shared grid intersections ({', '.join(labels)}): "
+         "the fit is exact but has no redundancy, so it cannot be verified. "
+         "Re-run with force=True (allow_weak_fit) to accept it anyway.")
+
+    if opts.model == "affine":
+        # Diagnostic model.  The inlier set still comes from the similarity
+        # RANSAC — a 3-point minimal set per hypothesis is not worth the
+        # combinatorics — then the 6-parameter affine is refit on it and the
+        # inliers recomputed from that fit.
+        ransac = ransac_similarity(src, dst, tau, allow_mirror=opts.allow_mirror)
+        affine, res, mask = ransac.transform, ransac.residuals, ransac.inliers
+        if int(mask.sum()) >= 3:
+            cand = fit_affine(src[mask], dst[mask])
+            cres = np.hypot(*(cand.apply_many(src) - dst).T)
+            cmask = cres <= tau
+            if int(cmask.sum()) >= 3:
+                affine, res, mask = cand, cres, cmask
+        model = "affine"
+    elif opts.model == "similarity":
+        ransac = ransac_similarity(src, dst, tau, allow_mirror=opts.allow_mirror)
+        affine, res, mask = ransac.transform, ransac.residuals, ransac.inliers
+        model = "similarity"
+    else:
+        raise FitError(f"unknown fit model {opts.model!r}; "
+                       "expected 'similarity' or 'affine'")
+
+    n_total = int(mask.size)
+    n_inliers = int(mask.sum())
+    outliers = [labels[i] for i in range(n_total) if not mask[i]]
+
+    # ── gate 3: enough inliers ─────────────────────────────────────────────
+    ratio = n_inliers / n_total if n_total else 0.0
+    gate(n_inliers >= opts.min_inliers and ratio >= opts.min_inlier_ratio,
+         f"only {n_inliers}/{n_total} grid intersections agree with the fit "
+         f"({ratio:.0%}, need ≥{opts.min_inliers} and ≥{opts.min_inlier_ratio:.0%}). "
+         f"Outlier labels: {', '.join(outliers) or '—'}")
+
+    # ── leave-one-out ──────────────────────────────────────────────────────
+    inlier_idx = [i for i in range(n_total) if mask[i]]
+    loo_by_index: dict[int, float] = {}
+    if len(inlier_idx) >= 3:
+        loo = loo_residuals(src, dst, inlier_idx)
+        loo_by_index = {i: float(v) for i, v in zip(inlier_idx, loo)}
+        loo_max = float(max(loo_by_index.values()))
+        # ── gate 4: the fit must not depend on any single point ────────────
+        gate(loo_max <= opts.loo_tol_rel * spacing,
+             f"leave-one-out residual {loo_max:.4g} exceeds "
+             f"{opts.loo_tol_rel:g} × the median grid spacing ({spacing:.4g}). "
+             "The fit is unstable — check for a mis-paired grid label.")
+    else:
+        loo_max = None
+
+    # ── gate 5: $INSUNITS scale prior ──────────────────────────────────────
+    expected = expected_scale(inp.str_units, inp.mech_units)
+    scale, rotation_deg, mirrored, skew_deg = affine.decompose()
+    if expected is None:
+        warnings.append(
+            f"$INSUNITS prior unavailable (MECH={inp.mech_units}, "
+            f"STR={inp.str_units}) — the scale was not checked against the "
+            "unit headers")
+    else:
+        rel = abs(scale / expected - 1.0)
+        gate(rel <= opts.scale_prior_tol,
+             f"$INSUNITS mismatch: $INSUNITS says {inp.str_units} (STR) → "
+             f"{inp.mech_units} (MECH), i.e. a scale of {expected:.6g}, but the "
+             f"grid intersections give {scale:.6g} ({rel:.1%} off, tolerance "
+             f"{opts.scale_prior_tol:.1%}). Either the unit headers are wrong "
+             "or the two drawings do not share a grid origin.")
+
+    inlier_res = [res[i] for i in inlier_idx]
+    correspondences = []
+    for i, lbl in enumerate(labels):
+        pred = affine.apply((float(src[i, 0]), float(src[i, 1])))
+        correspondences.append({
+            "label": lbl,
+            "str": [float(src[i, 0]), float(src[i, 1])],
+            "mech": [float(dst[i, 0]), float(dst[i, 1])],
+            "predicted": [pred[0], pred[1]],
+            "residual": float(res[i]),
+            "loo_residual": loo_by_index.get(i),
+            "inlier": bool(mask[i]),
+        })
+
+    return {
+        "affine": affine,
+        "model": model,
+        "matrix": affine.to_matrix(),
+        "a": affine.a, "b": affine.b, "c": affine.c, "d": affine.d,
+        "tx": affine.tx, "ty": affine.ty,
+        "scale": scale,
+        "rotation_deg": rotation_deg,
+        "mirrored": bool(mirrored),
+        "skew_deg": skew_deg,
+        "correspondences": correspondences,
+        "rms_residual": rms(inlier_res) if inlier_res else 0.0,
+        "max_residual": float(max(inlier_res)) if inlier_res else 0.0,
+        "loo_max": loo_max,
+        "n_inliers": n_inliers,
+        "n_total": n_total,
+        "outliers": outliers,
+        "inlier_ratio": ratio,
+        "units": {"mech": inp.mech_units, "str": inp.str_units,
+                  "expected_scale": expected},
+        "quality": {"status": status, "warnings": list(warnings)},
+        "tau": float(tau),
+        "median_spacing": float(spacing),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The stage
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run(job_id: str, *, pair_dir=None) -> None:
     """Stage 6 entrypoint.
 
-    `pair_dir` is the per-pair `cleaned/` directory
-    (`jobs/<id>/out/pairs/<pair_id>/cleaned/`) for Slice-1 multi-pair
-    runs. When `None` (the legacy default), behaviour is bit-equivalent
-    to the original single-pair pipeline. When set, every output is
-    written under `pair_dir.parent` (the pair root) instead of `out/`.
+    ``pair_dir`` is the per-pair ``cleaned/`` directory
+    (``jobs/<id>/out/pairs/<pair_id>/cleaned/``) for Slice-1 multi-pair
+    runs.  When ``None`` (the legacy default) every output is written under
+    the job dir instead of the pair root.
     """
     d = job_dir(job_id)
-    if pair_dir is not None:
-        root = Path(pair_dir).parent
-        cleaned = sorted(Path(pair_dir).glob("*_clean.dxf"))
-    else:
-        root = d
-        cleaned = sorted((d / "cleaned").glob("*_clean.dxf"))
-    if len(cleaned) != 2:
-        raise RuntimeError(f"Need 2 cleaned DXFs; found {len(cleaned)}")
-    mech_path = cleaned[0]   # alphabetical: MECH first
-    str_path = cleaned[1]
+    root = Path(pair_dir).parent if pair_dir is not None else d
+    from .roles import resolve_pair
+    mech_path, str_path = resolve_pair(job_id, pair_dir)   # explicit roles
 
-    # Read user's convention (legacy: jobs/<id>/axes/convention.json
-    # pair-scoped: <pair_root>/axes/convention.json)
     convention_path = root / "axes" / "convention.json"
     if not convention_path.exists():
         raise RuntimeError("axes/convention.json missing — user must confirm axes first")
     convention = json.loads(convention_path.read_text())
     prefix = convention["prefix"]
-    axes = convention["axes"]
+    axes = list(convention["axes"])
+    opts = options_for_job(job_id)
 
-    # Sort axes: letters (X-axis labels) and numbers (Y-axis labels)
-    x_labels = [a for a in axes if a.isalpha()]
-    y_labels = [a for a in axes if a.isdigit()]
+    # World-coordinate grid detection (core/grid.py); MECH = drawing A, STR = B.
+    mech_doc = _read_internal(str(mech_path))
+    str_doc = _read_internal(str(str_path))
+    mech_grid = grid.detect_grid(mech_doc, prefix, axes)
+    str_grid = grid.detect_grid(str_doc, prefix, axes)
 
-    grid_re = _build_grid_re(prefix, axes)
+    # Sidecars for steps 7/8 (QA grid drawing, grid-cropped preview).
+    (root / "grid_mech.json").write_text(
+        json.dumps(grid_to_json(mech_grid, prefix), indent=2))
+    (root / "grid_str.json").write_text(
+        json.dumps(grid_to_json(str_grid, prefix), indent=2))
 
-    # Find paired axes (X for letters, Y for numbers)
-    x_pairs = []
-    for lbl in x_labels:
-        sx, _ = _find_str_axis(str_path, lbl, "X", grid_re)
-        mx, _ = _find_mech_axis(mech_path, lbl, "X", grid_re)
-        if sx is None or mx is None:
-            continue
-        x_pairs.append((lbl, sx, mx))
+    mech_ix = grid.intersections(mech_grid)
+    str_ix = grid.intersections(str_grid)
+    keys = sorted(set(mech_ix) & set(str_ix))
+    labels = [f"{a}-{b}" for a, b in keys]
 
-    y_pairs = []
-    for lbl in y_labels:
-        sy, _ = _find_str_axis(str_path, lbl, "Y", grid_re)
-        my, _ = _find_mech_axis(mech_path, lbl, "Y", grid_re)
-        if sy is None or my is None:
-            continue
-        y_pairs.append((lbl, sy, my))
+    skipped = [
+        {"label": lbl,
+         "mech": {"status": mech_grid.axes[lbl].status,
+                  "reasons": list(mech_grid.axes[lbl].reasons)},
+         "str": {"status": str_grid.axes[lbl].status,
+                 "reasons": list(str_grid.axes[lbl].reasons)}}
+        for lbl in axes
+        if lbl in mech_grid.axes and lbl in str_grid.axes
+        and (mech_grid.axes[lbl].status != "ok" or str_grid.axes[lbl].status != "ok")
+    ]
+    extra_warnings = [
+        f"axis {lbl} is detected in both drawings but the gridlines never "
+        "meet — it contributes no correspondence"
+        for lbl in axes
+        if mech_grid.axes.get(lbl) is not None and mech_grid.axes[lbl].status == "ok"
+        and str_grid.axes.get(lbl) is not None and str_grid.axes[lbl].status == "ok"
+        and lbl not in {k[0] for k in keys} and lbl not in {k[1] for k in keys}
+    ]
 
-    if len(x_pairs) < 2 or len(y_pairs) < 2:
-        raise RuntimeError(
-            f"Not enough axis pairs: x={len(x_pairs)}, y={len(y_pairs)}. "
-            "Need at least 2 of each."
-        )
+    sol = solve(
+        FitInputs(
+            labels=labels,
+            src=np.array([[str_ix[k].x, str_ix[k].y] for k in keys], dtype=float)
+            if keys else np.zeros((0, 2)),
+            dst=np.array([[mech_ix[k].x, mech_ix[k].y] for k in keys], dtype=float)
+            if keys else np.zeros((0, 2)),
+            spacing=median_spacing(mech_grid),
+            extent=float(mech_grid.extent) or 0.0,
+            str_units=_insunits(str_doc),
+            mech_units=_insunits(mech_doc),
+        ),
+        opts,
+    )
+    warnings = sol["quality"]["warnings"] + extra_warnings
+    affine: Affine2D = sol.pop("affine")
 
-    # Solve affine
-    ax, bx = _fit_axis([s for _, s, _ in x_pairs], [m for _, _, m in x_pairs])
-    ay, by = _fit_axis([s for _, s, _ in y_pairs], [m for _, _, m in y_pairs])
+    # Legacy x_labels / y_labels: the vertical and horizontal gridlines with
+    # the coordinate of each line's midpoint (what the old separable fit
+    # reported).  The extra keys are additive; old readers ignore them.
+    #
+    # The key is chosen by the line's *direction*, not by its position in
+    # `families`: x_labels are the gridlines a reader positions along X (the
+    # vertical ones, letters in the classic TP-104 convention), y_labels the
+    # horizontal ones.  Pairing family 0 with x_labels instead would silently
+    # swap the two for every drawing whose vertical family is not family 0.
+    vfam = _vertical_family(mech_grid)
+    fam_of = {lbl: fi for fi, fam in enumerate(mech_grid.families) for lbl in fam}
+    legacy_axes = {True: [], False: []}        # keyed by "is vertical"
+    for fi in (0, 1):
+        vertical = (fi == vfam)
+        rows = legacy_axes[vertical]
+        for lbl in axes:
+            if fam_of.get(lbl) != fi:
+                continue
+            if mech_grid.axes.get(lbl) is None or mech_grid.axes[lbl].status != "ok":
+                continue
+            if str_grid.axes.get(lbl) is None or str_grid.axes[lbl].status != "ok":
+                continue
+            s_mid, s_pt, s_ang = _axis_summary(str_grid, lbl)
+            m_mid, m_pt, m_ang = _axis_summary(mech_grid, lbl)
+            # Vertical lines are positioned by their X coordinate, so the
+            # legacy key is the X midpoint; horizontal ones use Y.
+            rows.append({"label": lbl,
+                         "str": s_mid[0] if vertical else s_mid[1],
+                         "mech": m_mid[0] if vertical else m_mid[1],
+                         "str_point": s_pt, "mech_point": m_pt,
+                         "str_angle_deg": s_ang, "mech_angle_deg": m_ang})
+    x_labels, y_labels = legacy_axes[True], legacy_axes[False]
 
-    # Per-intersection residuals
-    residuals = []
-    for xlbl, sx, mx in x_pairs:
-        for ylbl, sy, my in y_pairs:
-            pred = (ax * sx + bx, ay * sy + by)
-            d2d = ((pred[0] - mx) ** 2 + (pred[1] - my) ** 2) ** 0.5
-            residuals.append((f"{xlbl}-{ylbl}", sx, sy, mx, my, pred[0], pred[1], d2d))
-    rms = (sum(r ** 2 for _, _, _, _, _, _, _, r in residuals) / len(residuals)) ** 0.5
-    max_r = max(r for _, _, _, _, _, _, _, r in residuals)
-
+    sol["quality"]["warnings"] = list(warnings)
     transform = {
-        "scale_x": ax,
-        "scale_y": ay,
-        "tx": bx,
-        "ty": by,
-        "x_labels": [{"label": l, "str": s, "mech": m} for l, s, m in x_pairs],
-        "y_labels": [{"label": l, "str": s, "mech": m} for l, s, m in y_pairs],
+        **sol,
+        # ── legacy, unchanged shape ──
+        "scale_x": affine.a,
+        "scale_y": affine.d,
+        "tx": affine.tx,
+        "ty": affine.ty,
+        "x_labels": x_labels,
+        "y_labels": y_labels,
         "intersections": [
-            {"label": l, "str": [sx, sy], "mech": [mx, my],
-             "predicted_mech": [px, py], "residual": r}
-            for (l, sx, sy, mx, my, px, py, r) in residuals
+            {"label": c["label"], "str": c["str"], "mech": c["mech"],
+             "predicted_mech": c["predicted"], "residual": c["residual"],
+             "inlier": c["inlier"]}
+            for c in sol["correspondences"]
         ],
-        "rms_residual": rms,
-        "max_residual": max_r,
-        "convention": {"prefix": prefix, "axes": axes},
+        "convention": {"prefix": prefix, "axes": list(axes)},
+        "skipped_axes": skipped,
+        "warnings": list(warnings),
     }
+    (root / "transform.json").write_text(json.dumps(transform, indent=2))
 
-    transform_path = root / "transform.json"
-    transform_path.write_text(json.dumps(transform, indent=2))
+
+__all__ = ["run", "solve", "FitInputs", "FitOptions", "FitError", "Affine2D",
+           "median_spacing", "expected_scale", "grid_to_json", "options_for_job"]

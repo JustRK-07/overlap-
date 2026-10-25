@@ -41,7 +41,7 @@ def test_migrate_v1_flat_to_v2_synthesises_legacy_pair():
     """v1 shape → one Pair with pair_id='_legacy', legacy_v2=True."""
     v1 = {
         "job_id": "abc", "created_at": "2026-01-01T00:00:00",
-        "strategy": "A", "state": "done",
+        "state": "done",
         "files": {
             "drawing_a": {"name": "mech.dxf", "size": 100},
             "drawing_b": {"name": "str.dxf",  "size": 200},
@@ -106,12 +106,10 @@ def test_create_job_legacy_marks_legacy_v2(fx_isolated):
     job = create_job_legacy(
         drawing_a_name="x.dxf", drawing_a_size=1,
         drawing_b_name="y.dxf", drawing_b_size=1,
-        strategy="C",
     )
     assert job.legacy_v2 is True
     assert len(job.pairs) == 1
     assert job.pairs[0].pair_id == "_legacy"
-    assert job.pairs[0].strategy == "C"
     # Files keep the legacy flat shape — consumers reading
     # files.drawing_a.name stay bit-equivalent.
     assert job.files["drawing_a"]["name"] == "x.dxf"
@@ -159,7 +157,7 @@ def test_create_job_cross_product_auto_pair(fx_isolated):
 def test_load_v1_disk_job_synthesises_pair(fx_isolated, tmp_path):
     """Simulate a v1 on-disk job and confirm load_job() migrates it."""
     v1_job = {
-        "job_id": "v1legacy", "created_at": "2026-01-01", "strategy": "A",
+        "job_id": "v1legacy", "created_at": "2026-01-01",
         "state": "done",
         "files": {
             "drawing_a": {"name": "old_mech.dxf", "size": 1024},

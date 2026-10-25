@@ -1,755 +1,1018 @@
 #!/usr/bin/env python3
-"""core/overlay.py — Stage 7.
+"""core/overlay.py — stage 7: superimpose STR onto MECH (PLAN.md steps 6 + 7).
 
-Applies the fitted affine to the STR drawing, producing the final
-overlay DXF. Supports 3 strategies:
+The STR drawing is imported into the MECH document with
+:func:`ezdxf.xref.Loader` and ``ConflictPolicy.XREF_PREFIX``: every block
+definition STR actually references is copied under a fresh name
+(``STR$0$<name>``, or a new anonymous name) and every reference to it —
+inside block definitions included — is rewritten.  Block *definitions*
+are therefore never edited, and two INSERTs of the same block keep their
+own insertion point, rotation and scale factors.
 
-  A (per-entity)    preserve ORIGINAL colors
-  B (2-block wrap)  MECH→red, STR→blue,  _BLUE_ prefix
-  C (1-block wrap)  MECH→red, STR→blue,  _STR_  prefix
+The imported modelspace entities are then transformed in one go by
+:func:`ezdxf.transform.inplace`.  ezdxf knows how to apply a matrix to
+every DXF entity type; whatever it cannot represent (typically an INSERT
+under a skewed matrix) is *exploded* or *dropped* and logged.  An
+untransformed entity is never left behind.
 
-Reads:
-  cleaned/<base>_clean.dxf  (MECH)
-  cleaned/<base>_clean.dxf  (STR)
-  transform.json             (fitted affine)
+**Step 7 (this file, :func:`apply_source_layers` + :func:`draw_qa_grid`)
+runs after the transform**, on the merged document: every modelspace
+entity is moved onto ``MECH|<layer>`` or ``STR|<layer>`` so the two
+drawings can be toggled apart in a CAD viewer, the optional
+:class:`OverlayStyle` recolours them, and the QA grid of the two drawings
+is drawn on ``QA|GRID`` / ``QA|GRID_STR`` / ``QA|OUTLIER``.  Inside block
+definitions layer ``0`` and ``Defpoints`` are left alone so ByBlock /
+ByLayer inheritance keeps working.
 
-Writes:
-  out/superimposed.dxf       (~18 MB)
+Reads:  cleaned MECH + cleaned STR (core.roles.resolve_pair), transform.json
+Writes: out/superimposed.dxf, stages/overlay_report.json
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-import ezdxf
+from ezdxf import transform as ez_transform
+from ezdxf import xref
 from ezdxf.addons.importer import Importer
+from ezdxf.entities import Insert
+from ezdxf.tools import standards
 
 from jobs import job_dir, load_job
 
+from . import dxfio
+from .dxfio import read_internal as _read_internal, save as _dxf_save
+from .roles import resolve_pair
+from .transform2d import Affine2D
+
+__all__ = ["overlay_docs", "run", "OverlayReport", "OverlayOptions", "OverlayError",
+           "OverlayStyle", "LayerReport", "apply_source_layers", "draw_qa_grid",
+           "source_layer", "split_source_layer", "XREF_PREFIX", "REPORT_NAME",
+           "SOURCE_LAYER_SEP", "QA_GRID_LAYER", "QA_GRID_STR_LAYER",
+           "QA_OUTLIER_LAYER"]
+
+XREF_PREFIX = "STR"      # conflict policy: imported resources become STR$0$<name>
+REPORT_NAME = "overlay_report.json"
+
+
+class OverlayError(RuntimeError):
+    """The overlay could not be produced (or lost too much of the STR drawing)."""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Color policy
+# Options / report
 # ─────────────────────────────────────────────────────────────────────────────
 
-MECH_COLOR = 1   # red  (ACI 1)
-STR_COLOR = 5    # blue (ACI 5)
+@dataclass
+class OverlayOptions:
+    """``max_drop_ratio``: share of imported entities that may be dropped.
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: affine-transform an entity in place
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _transform_xy(x, y, ax, ay, bx, by):
-    return (ax * x + bx, ay * y + by)
-
-
-def _block_lookup(doc):
-    """Return a fresh {name: block} dict for `doc.blocks`.
-
-    `doc.blocks` (and `doc.blocks.__contains__` / `.get`) uses an
-    internal index that does NOT refresh after `block_record.rename()`
-    — so freshly renamed blocks are findable by iteration but not by
-    name lookup. This helper rebuilds the lookup map every call so
-    downstream code can find renamed blocks reliably.
+    A similarity (the pipeline default) is exact, so the default is 0.0 —
+    a single dropped entity fails the stage.  The diagnostic affine model
+    tolerates a little slack.
     """
-    return {b.name: b for b in doc.blocks}
+
+    max_drop_ratio: float = 0.0
+    explode_inserts: bool = True      # INSERT fallback = explode, else drop
+
+    @classmethod
+    def for_model(cls, model: str = "similarity") -> "OverlayOptions":
+        return cls(max_drop_ratio=0.01 if model == "affine" else 0.0)
 
 
-def _transform_vertex(v, ax, ay, bx, by):
-    """Transform a vertex (2- or 3-tuple) preserving the 3rd element (bulge or z)."""
-    if len(v) >= 3:
-        return (ax * v[0] + bx, ay * v[1] + by, v[2])
-    return (ax * v[0] + bx, ay * v[1] + by)
+@dataclass
+class OverlayReport:
+    """What the overlay did.  ``matrix`` is the Matrix44 actually applied.
 
-
-def _prescale_entity(entity, sx, sy, ip_x=0.0, ip_y=0.0):
-    """Bake an INSERT's pos + xscale into each entity in a block.
-
-    Converts block-local coords → STR-world coords by replicating
-    INSERT.pos + xscale * local.
+    ``str_entity_handles`` (handles of the STR-sourced modelspace entities in
+    the output) plus ``str_block_map`` / ``str_layer_map`` are what step 7
+    needs to paint the two sources on their own layers.
     """
-    if sx == 1.0 and sy == 1.0 and ip_x == 0.0 and ip_y == 0.0:
+
+    mech_entities: int = 0
+    str_entities_imported: int = 0        # STR entities present in the output
+    str_entities_total: int = 0           # STR entities handed to the transform
+    by_type_str: dict[str, int] = field(default_factory=dict)
+    renamed_resources: dict[str, dict[str, str]] = field(default_factory=dict)
+    failures: list[dict] = field(default_factory=list)
+    matrix: Any = None                                  # ezdxf Matrix44
+    affine: Affine2D | None = None
+    str_entity_handles: list[str] = field(default_factory=list)
+    str_block_map: dict[str, str] = field(default_factory=dict)
+    str_layer_map: dict[str, str] = field(default_factory=dict)
+    str_linetype_map: dict[str, str] = field(default_factory=dict)
+    str_style_map: dict[str, str] = field(default_factory=dict)
+    import_method: str = "xref"
+    warnings: list[str] = field(default_factory=list)
+    layers: "LayerReport | None" = None      # filled by apply_source_layers
+
+    @property
+    def dropped(self) -> int:
+        return sum(1 for f in self.failures if f["action"] == "dropped")
+
+    @property
+    def exploded(self) -> int:
+        return sum(1 for f in self.failures if f["action"] == "exploded")
+
+    @property
+    def drop_ratio(self) -> float:
+        return (self.dropped / self.str_entities_total) if self.str_entities_total else 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "mech_entities": self.mech_entities,
+            "str_entities_imported": self.str_entities_imported,
+            "str_entities_total": self.str_entities_total,
+            "by_type_str": self.by_type_str,
+            "renamed_resources": self.renamed_resources,
+            "failures": self.failures,
+            "matrix": self.affine.to_matrix() if self.affine else None,
+            "affine": self.affine.to_json() if self.affine else None,
+            "str_entity_handles": list(self.str_entity_handles),
+            "str_block_map": dict(self.str_block_map),
+            "str_layer_map": dict(self.str_layer_map),
+            "str_linetype_map": dict(self.str_linetype_map),
+            "str_style_map": dict(self.str_style_map),
+            "import_method": self.import_method,
+            "dropped": self.dropped,
+            "exploded": self.exploded,
+            "warnings": list(self.warnings),
+            "style": (self.layers.style if self.layers else None),
+            "source_layers": (self.layers.to_dict() if self.layers else None),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Import
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _import_str(str_doc, mech_doc, report: OverlayReport) -> None:
+    """Import the STR modelspace (and the blocks it references) into ``mech_doc``."""
+    try:
+        loader = xref.Loader(str_doc, mech_doc,
+                             conflict_policy=xref.ConflictPolicy.XREF_PREFIX)
+        loader.load_modelspace()
+        loader.execute(xref_prefix=XREF_PREFIX)
+        report.import_method = "xref"
+    except Exception as exc:            # noqa: BLE001 — retried below, then reported
+        report.warnings.append(
+            f"xref.Loader failed ({type(exc).__name__}: {exc}); "
+            "fell back to Importer.import_block(rename=True)")
+        imp = Importer(str_doc, mech_doc)
+        for name in [b.name for b in str_doc.blocks if not b.name.startswith("*")]:
+            try:
+                imp.import_block(name, rename=True)
+            except Exception as block_exc:      # noqa: BLE001
+                raise OverlayError(
+                    f"cannot import STR block {name!r}: {block_exc}") from block_exc
+        imp.import_modelspace()
+        imp.finalize()
+        report.import_method = "importer"
+
+
+def _unprefix(name: str) -> str:
+    """``STR$0$FRAME-STEEL`` -> ``FRAME-STEEL``; other names map to themselves."""
+    parts = name.split("$")
+    return "$".join(parts[2:]) if len(parts) >= 3 and parts[0] == XREF_PREFIX else name
+
+
+def _map_table(before: set[str], table) -> dict[str, str]:
+    """{source name: new name} for every entry ``table`` gained during import."""
+    out: dict[str, str] = {}
+    for entry in table:
+        name = entry.dxf.name
+        if name not in before:
+            out.setdefault(_unprefix(name), name)
+    return out
+
+
+def _map_blocks(str_doc, mech_doc, new_entities) -> dict[str, str]:
+    """{STR block name: name in mech_doc} for every block xref imported.
+
+    Imported modelspace entities keep the order of the source entities, so
+    zipping the two modelspaces pairs every source INSERT with its clone and
+    yields its (possibly renamed) block name; nested INSERTs are resolved by
+    descending into both block layouts.
+    """
+    by_name = {b.name: b for b in mech_doc.blocks}
+    src_by_name = {b.name: b for b in str_doc.blocks}
+    mapping: dict[str, str] = {}
+    src_msp = list(str_doc.modelspace())
+    queue = list(zip(src_msp, new_entities))
+    if len(queue) != len(src_msp):          # a clone was lost: names only
+        queue = []
+    while queue:
+        src, tgt = queue.pop()
+        if src.dxftype() != "INSERT" or tgt.dxftype() != "INSERT":
+            continue
+        src_name, tgt_name = src.dxf.name, tgt.dxf.name
+        if src_name in mapping:
+            continue
+        mapping[src_name] = tgt_name
+        src_blk, tgt_blk = src_by_name.get(src_name), by_name.get(tgt_name)
+        if src_blk is not None and tgt_blk is not None:
+            queue.extend(zip((e for e in src_blk if e.dxftype() == "INSERT"),
+                             (e for e in tgt_blk if e.dxftype() == "INSERT")))
+    known = set(mapping.values())
+    for name in by_name:
+        if name not in known and name.startswith(f"{XREF_PREFIX}$"):
+            mapping.setdefault(_unprefix(name), name)
+    return mapping
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Transform + fallbacks
+# ─────────────────────────────────────────────────────────────────────────────
+
+MAX_EXPLODE_DEPTH = 8
+
+
+def _resolve_failures(msp, log, m, options: OverlayOptions,
+                      report: OverlayReport, handles: set[str]) -> None:
+    """Every logged entity is exploded (INSERT) or deleted — never left alone.
+
+    ``explode()`` puts the *nested* INSERTs of a block into the layout as
+    real entities instead of exploding them, so a piece that still fails is
+    queued again: an INSERT is exploded (up to :data:`MAX_EXPLODE_DEPTH`
+    levels), anything else is deleted.
+    """
+    queue = [(entry, 0) for entry in log]
+    while queue:
+        entry, depth = queue.pop(0)
+        entity = entry.entity
+        handle = entity.dxf.handle if entity.dxf.hasattr("handle") else None
+        failure = {
+            "handle": handle,
+            "type": entity.dxftype(),
+            "error": entry.error.name,
+            "message": entry.message,
+            "action": "dropped",
+        }
+        if entity.is_alive and isinstance(entity, Insert) and options.explode_inserts:
+            try:
+                pieces = list(entity.explode(msp))      # destroys the INSERT
+                handles.discard(handle)
+                handles.update(p.dxf.handle for p in pieces if p.is_alive)
+                failure["action"] = "exploded"
+                failure["n"] = len(pieces)
+                # inplace() may replace a piece (CIRCLE -> ELLIPSE) and
+                # destroy it, so handles are collected before, not after.
+                sub_log = ez_transform.inplace(pieces, m)
+                for sub in sub_log:
+                    if (isinstance(sub.entity, Insert) and sub.entity.is_alive
+                            and options.explode_inserts and depth < MAX_EXPLODE_DEPTH):
+                        queue.append((sub, depth + 1))
+                        continue
+                    if sub.entity.is_alive:            # piece still fails: go away
+                        sub_handle = (sub.entity.dxf.handle
+                                      if sub.entity.dxf.hasattr("handle") else None)
+                        msp.delete_entity(sub.entity)
+                        handles.discard(sub_handle)
+                    failure.setdefault("sub_errors", []).append(sub.message)
+            except Exception as exc:                      # noqa: BLE001 — logged
+                failure["explode_error"] = f"{type(exc).__name__}: {exc}"
+        if entity.is_alive:
+            msp.delete_entity(entity)
+            handles.discard(handle)
+        report.failures.append(failure)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def overlay_docs(mech_doc, str_doc, affine, *, options=None, style=None) -> OverlayReport:
+    """Superimpose ``str_doc`` onto ``mech_doc`` by ``affine`` (STR → MECH).
+
+    ``mech_doc`` is modified in place.  Returns the :class:`OverlayReport`.
+
+    ``style`` (an :class:`OverlayStyle`) is optional: pass one to also run
+    :func:`apply_source_layers` on the result, i.e. to get the step-7
+    ``MECH|*`` / ``STR|*`` layers straight out of this call.  Without it the
+    document keeps the layer names of the two source drawings (step 6
+    behaviour, which is what :mod:`tests.test_overlay` asserts).
+    """
+    if not isinstance(affine, Affine2D):
+        affine = Affine2D.from_json(affine)
+    options = options or OverlayOptions()
+    msp = mech_doc.modelspace()
+    m = affine.to_matrix44()
+    report = OverlayReport(matrix=m, affine=affine)
+
+    mech_handles = {e.dxf.handle for e in msp}
+    report.mech_entities = len(mech_handles)
+    mech_blocks = {b.name for b in mech_doc.blocks}
+    layer_names = {l.dxf.name for l in mech_doc.layers}
+    ltype_names = {l.dxf.name for l in mech_doc.linetypes}
+    style_names = {l.dxf.name for l in mech_doc.styles}
+
+    _import_str(str_doc, mech_doc, report)
+
+    new = [e for e in msp if e.dxf.handle not in mech_handles]
+    report.str_block_map = _map_blocks(str_doc, mech_doc, new)
+    report.str_layer_map = _map_table(layer_names, mech_doc.layers)
+    report.str_linetype_map = _map_table(ltype_names, mech_doc.linetypes)
+    report.str_style_map = _map_table(style_names, mech_doc.styles)
+    report.renamed_resources = {
+        "blocks": {s: n for s, n in report.str_block_map.items()
+                   if s != n and n not in mech_blocks},
+        "layers": {s: n for s, n in report.str_layer_map.items() if s != n},
+        "linetypes": {s: n for s, n in report.str_linetype_map.items() if s != n},
+        "styles": {s: n for s, n in report.str_style_map.items() if s != n},
+    }
+
+    log = ez_transform.inplace(new, m)
+    handles = {e.dxf.handle for e in new}
+    report.str_entities_total = len(new)
+    _resolve_failures(msp, log, m, options, report, handles)
+
+    imported = [e for e in msp if e.dxf.handle in handles]
+    for e in imported:
+        report.by_type_str[e.dxftype()] = report.by_type_str.get(e.dxftype(), 0) + 1
+    report.str_entities_imported = len(imported)
+    report.str_entity_handles = [e.dxf.handle for e in imported]
+
+    if report.drop_ratio > options.max_drop_ratio:
+        raise OverlayError(
+            f"{report.dropped} of {len(new)} imported STR entities could not be "
+            f"transformed and were dropped ({report.drop_ratio:.1%} > "
+            f"max_drop_ratio {options.max_drop_ratio:.1%})")
+
+    if style is not None:                  # step 7 — after the transform
+        report.layers = apply_source_layers(mech_doc, report, style)
+    return report
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 7 — per-source layers
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Every entity of the merged document is moved onto a layer that says which
+# drawing it came from:  "MECH|<layer>" / "STR|<layer>".  That is what lets
+# a reviewer switch one drawing off in a CAD viewer — and what lets step 8
+# count / recolour the two sources without re-deriving ownership from
+# handles.  Inside block definitions layer "0" and "Defpoints" are left
+# alone: an entity on "0" inherits the layer of the INSERT that pulls the
+# block in, and that INSERT is itself on a "MECH|*" / "STR|*" layer.
+
+SOURCE_LAYER_SEP = "|"     # separator of the per-source layer prefix
+MECH_TAG = "MECH"
+STR_TAG = "STR"
+QA_TAG = "QA"
+KEEP_LAYERS = ("0", "Defpoints")   # never prefixed inside blocks, never deleted
+QA_GRID_LAYER = "QA|GRID"          # ACI 3 — MECH gridlines + markers + labels
+QA_GRID_STR_LAYER = "QA|GRID_STR"  # ACI 6 — transformed STR gridlines + markers
+QA_OUTLIER_LAYER = "QA|OUTLIER"    # ACI 1 — rejected correspondences
+
+BYLAYER, BYBLOCK = 256, 0
+_QA_CIRCLE_REL = 0.01      # circle radius / marker half-size, × median spacing
+_QA_TEXT_REL = 0.005       # label text height, × median spacing
+_LAYER_COPY = ("color", "true_color", "linetype", "lineweight", "plot")
+
+
+def source_layer(source: str, name: str) -> str:
+    """``("MECH", "FRAME-STEEL") -> "MECH|FRAME-STEEL"``."""
+    return f"{source}{SOURCE_LAYER_SEP}{name}"
+
+
+def split_source_layer(name: str) -> tuple[str, str] | None:
+    """``"MECH|CENTER" -> ("MECH", "CENTER")``; ``None`` for any other layer."""
+    head, sep, tail = name.partition(SOURCE_LAYER_SEP)
+    if sep and tail and head in (MECH_TAG, STR_TAG, QA_TAG):
+        return head, tail
+    return None
+
+
+def _is_layout_block(name: str) -> bool:
+    return name.startswith("*Model_Space") or name.startswith("*Paper_Space")
+
+
+def _with_attribs(layout) -> list:
+    """Layout entities + the ATTRIBs of their INSERTs (not yielded by layout
+    iteration, but they have a layer of their own)."""
+    out = []
+    for e in layout:
+        out.append(e)
+        if e.dxftype() == "INSERT":
+            out.extend(e.attribs)
+    return out
+
+
+def _all_layout_entities(doc) -> list:
+    """Every entity in modelspace, the paperspaces and every block layout."""
+    out = []
+    for layout in doc.layouts:
+        out.extend(_with_attribs(layout))
+    for block in doc.blocks:
+        if _is_layout_block(block.name):
+            continue
+        out.extend(_with_attribs(block))
+    return out
+
+
+def _referenced_layers(doc) -> set[str]:
+    """Layer names still referenced by *anything* in the document.
+
+    A layer entry that nothing references can go (that is how the original
+    ``FRAME-STEEL`` disappears once everything sits on ``STR|FRAME-STEEL``),
+    but deleting one that *is* referenced would leave a dangling reference,
+    so the walk also covers paperspaces, block definitions, INSERT attribs
+    and the layer lists of saved views / viewports.
+    """
+    used: set[str] = set()
+
+    def take(e):
+        try:
+            used.add(e.dxf.layer)
+        except Exception:                       # noqa: BLE001 — not every entity has a layer
+            return
+
+    for entity in _all_layout_entities(doc):
+        take(entity)
+    for view in getattr(doc, "views", ()):
+        for attr in ("frozen_layers", "plot_frozen_layers"):
+            try:
+                used.update(getattr(view, attr) or ())
+            except Exception:                   # noqa: BLE001
+                continue
+    for vp in getattr(doc, "viewports", ()):
+        if vp.dxf.hasattr("layer"):
+            used.add(vp.dxf.layer)
+    return used
+
+
+def _get_layer(doc, name: str):
+    """The layer table entry ``name``, or ``None`` (ezdxf's ``get`` raises)."""
+    return doc.layers.get(name) if doc.layers.has_entry(name) else None
+
+
+def _ensure_layer(doc, name: str, *, template=None, color=None,
+                  lineweight=None, linetype=None, clear_true_color=False):
+    """Create ``name`` if needed and apply the requested properties.
+
+    ``template`` is the source layer entry whose color / true_color /
+    linetype / lineweight / plot flag and on-off / freeze / lock state are
+    copied (see :data:`_LAYER_COPY`).
+    """
+    layer = _get_layer(doc, name) or doc.layers.new(name)
+    if template is not None:
+        for attr in _LAYER_COPY:
+            if not template.dxf.hasattr(attr):
+                continue
+            value = template.dxf.get(attr)
+            if value is None:
+                continue
+            if attr == "linetype" and value not in doc.linetypes:
+                value = _ensure_linetype(doc, value)     # never dangle a name
+            layer.dxf.set(attr, value)
+        if template.is_off():
+            layer.off()
+        if template.is_frozen():
+            layer.freeze()
+        if template.is_locked():
+            layer.lock()
+    if color is not None:
+        layer.dxf.color = int(color)
+        if clear_true_color and layer.dxf.hasattr("true_color"):
+            del layer.dxf.true_color
+    if lineweight is not None:
+        layer.dxf.lineweight = int(lineweight)
+    if linetype is not None:
+        layer.dxf.linetype = linetype
+    return layer
+
+
+def _ensure_linetype(doc, name: str) -> tuple[str, bool]:
+    """Make sure ``name`` exists in ``doc.linetypes``.
+
+    Returns ``(name, known)``.  ezdxf ships the ISO linetype set
+    (:func:`ezdxf.tools.standards.linetypes`); a name from that set is
+    imported with its real pattern.  Anything else becomes a plain dashed
+    pattern — better a linetype that is not the one asked for than a layer
+    referencing a missing table entry.
+    """
+    if name in doc.linetypes:
+        return name, True
+    for std_name, description, pattern in standards.linetypes():
+        if std_name.lower() == name.lower():
+            doc.linetypes.add(std_name, pattern=pattern, description=description)
+            return std_name, True
+    doc.linetypes.add(name, pattern=[0.5, -0.25],
+                      description=f"{name} (added by the overlay stage)")
+    return name, False
+
+
+def _to_bylayer(e) -> None:
+    """Entity colour → BYLAYER (BYBLOCK entities are left alone)."""
+    if not e.is_supported_dxf_attrib("color"):
         return
-    t = entity.dxftype()
-    try:
-        if t in ("LINE", "RAY", "XLINE"):
-            entity.dxf.start = (ip_x + sx * entity.dxf.start[0],
-                                ip_y + sy * entity.dxf.start[1], 0.0)
-            entity.dxf.end = (ip_x + sx * entity.dxf.end[0],
-                              ip_y + sy * entity.dxf.end[1], 0.0)
-        elif t == "LWPOLYLINE":
-            entity.vertices = [
-                (ip_x + sx * v[0], ip_y + sy * v[1], v[2] if len(v) > 2 else 0.0)
-                for v in entity.vertices()
-            ]
-        elif t in ("CIRCLE", "ARC"):
-            entity.dxf.center = (ip_x + sx * entity.dxf.center[0],
-                                 ip_y + sy * entity.dxf.center[1], 0.0)
-            entity.dxf.radius = entity.dxf.radius * max(abs(sx), abs(sy))
-        elif t == "ELLIPSE":
-            entity.dxf.center = (ip_x + sx * entity.dxf.center[0],
-                                 ip_y + sy * entity.dxf.center[1], 0.0)
-        elif t == "POINT":
-            entity.dxf.location = (ip_x + sx * entity.dxf.location[0],
-                                   ip_y + sy * entity.dxf.location[1], 0.0)
-        elif t in ("TEXT", "MTEXT"):
-            entity.dxf.insert = (ip_x + sx * entity.dxf.insert[0],
-                                 ip_y + sy * entity.dxf.insert[1], 0.0)
-        elif t == "INSERT":
-            entity.dxf.insert = (ip_x + sx * entity.dxf.insert[0],
-                                 ip_y + sy * entity.dxf.insert[1], 0.0)
-        elif t == "SPLINE":
-            try:
-                entity.control_points = [
-                    (ip_x + sx * p[0], ip_y + sy * p[1], p[2] if len(p) > 2 else 0.0)
-                    for p in entity.control_points
-                ]
-            except Exception:
-                pass
-        elif t == "HATCH":
-            for path in entity.paths:
-                try:
-                    path.vertices = [
-                        (ip_x + sx * v[0], ip_y + sy * v[1], v[2] if len(v) > 2 else 0.0)
-                        for v in path.vertices
-                    ]
-                except Exception:
-                    pass
-        elif t == "DIMENSION":
-            entity.dxf.insert = (ip_x + sx * entity.dxf.insert[0],
-                                 ip_y + sy * entity.dxf.insert[1], 0.0)
-        elif t in ("SOLID", "TRACE", "3DFACE"):
-            for attr in ("vtx0", "vtx1", "vtx2", "vtx3",
-                         "first_corner", "second_corner",
-                         "third_corner", "fourth_corner"):
-                try:
-                    v = getattr(entity.dxf, attr)
-                    if len(v) >= 3:
-                        setattr(entity.dxf, attr,
-                                (ip_x + sx * v[0], ip_y + sy * v[1], v[2]))
-                    else:
-                        setattr(entity.dxf, attr,
-                                (ip_x + sx * v[0], ip_y + sy * v[1]))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-
-def _transform_entity_inplace(entity, ax, ay, bx, by):
-    """Apply the affine (a, b) to an entity's geometry in place."""
-    t = entity.dxftype()
-    try:
-        if t in ("LINE", "RAY", "XLINE"):
-            entity.dxf.start = _transform_xy(entity.dxf.start[0], entity.dxf.start[1], ax, ay, bx, by)
-            entity.dxf.end = _transform_xy(entity.dxf.end[0], entity.dxf.end[1], ax, ay, bx, by)
-        elif t == "LWPOLYLINE":
-            new_pts = [_transform_vertex(v, ax, ay, bx, by) for v in entity.vertices()]
-            entity.clear()
-            for p in new_pts:
-                entity.append_vertices(p)
-        elif t in ("CIRCLE", "ARC"):
-            entity.dxf.center = _transform_xy(entity.dxf.center[0], entity.dxf.center[1], ax, ay, bx, by)
-            entity.dxf.radius = entity.dxf.radius * max(abs(ax), abs(ay))
-        elif t == "ELLIPSE":
-            entity.dxf.center = _transform_xy(entity.dxf.center[0], entity.dxf.center[1], ax, ay, bx, by)
-        elif t == "POINT":
-            entity.dxf.location = _transform_xy(entity.dxf.location[0], entity.dxf.location[1], ax, ay, bx, by)
-        elif t in ("TEXT", "MTEXT"):
-            entity.dxf.insert = _transform_xy(entity.dxf.insert[0], entity.dxf.insert[1], ax, ay, bx, by)
-        elif t == "INSERT":
-            pass  # handled elsewhere
-        elif t == "SPLINE":
-            try:
-                entity.control_points = [
-                    _transform_vertex(p, ax, ay, bx, by)
-                    for p in entity.control_points
-                ]
-            except Exception:
-                pass
-        elif t == "HATCH":
-            for path in entity.paths:
-                try:
-                    path.vertices = [
-                        _transform_vertex(v, ax, ay, bx, by)
-                        for v in path.vertices
-                    ]
-                except Exception:
-                    pass
-        elif t == "DIMENSION":
-            entity.dxf.insert = _transform_xy(entity.dxf.insert[0], entity.dxf.insert[1], ax, ay, bx, by)
-    except Exception:
-        pass
+    if e.dxf.hasattr("color") and e.dxf.color == BYBLOCK:
+        return
+    e.dxf.color = BYLAYER
+    if e.dxf.hasattr("true_color"):
+        del e.dxf.true_color
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Strategy A — per-entity, preserve original colors
+# OverlayStyle
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _strategy_A(mech_doc, str_doc_obj, ax, ay, bx, by):
-    """Imports every STR entity into MECH's modelspace, applies the affine.
-    Original colors preserved."""
-    STR_PREFIX = "_STR_"
+def _as_bool(value, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
+        if v in ("0", "false", "no", "off", ""):
+            return False
+    return default
 
-    # Step 1: import all STR blocks (renamed with _STR_ prefix)
-    imp = Importer(str_doc_obj, mech_doc)
-    block_map = {}
-    for str_block in list(str_doc_obj.blocks):
-        if str_block.name.startswith("*"):
+
+def _as_int(value):
+    try:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class OverlayStyle:
+    """How the two drawings are painted in the superimposed file.
+
+    ``color_mode``
+        ``"original"`` keeps every layer's own colour / linetype /
+        lineweight (the prefixed copy of the source layer entry);
+        ``"contrast"`` forces ``MECH|*`` to ``mech_color`` and ``STR|*`` to
+        ``str_color`` and sets every entity of that drawing to BYLAYER so
+        the layer colour wins.
+    ``str_lineweight`` / ``str_linetype``
+        Applied to the ``STR|*`` layers in **both** modes — they are an
+        explicit request, not part of the colour mode.  ``str_linetype`` is
+        added to the LTYPE table when the drawing does not have it.
+    ``qa_grid``
+        Draw the QA grid (see :func:`draw_qa_grid`).
+    """
+
+    color_mode: str = "original"
+    mech_color: int = 5
+    str_color: int = 1
+    str_lineweight: int | None = None
+    str_linetype: str | None = None
+    qa_grid: bool = True
+
+    COLOR_MODES = ("original", "contrast")
+
+    def to_dict(self) -> dict:
+        return {
+            "color_mode": self.color_mode,
+            "mech_color": self.mech_color,
+            "str_color": self.str_color,
+            "str_lineweight": self.str_lineweight,
+            "str_linetype": self.str_linetype,
+            "qa_grid": self.qa_grid,
+        }
+
+    @classmethod
+    def from_options(cls, raw) -> "OverlayStyle":
+        """Build from a ``job.options`` dict (or just its ``overlay`` part).
+
+        Options may live under ``options["overlay"]`` (what the API writes)
+        or flat in ``options`` itself; unknown keys and unusable values are
+        ignored rather than failing the stage.
+        """
+        style = cls()
+        if not isinstance(raw, dict):
+            return style
+        opts = dict(raw)
+        sub = opts.get("overlay")
+        if isinstance(sub, dict):
+            opts = {k: v for k, v in opts.items() if k != "overlay"} | sub
+
+        mode = opts.get("color_mode", opts.get("overlay_color_mode"))
+        if isinstance(mode, str) and mode.strip().lower() in cls.COLOR_MODES:
+            style.color_mode = mode.strip().lower()
+        for key, attr in (("mech_color", "mech_color"), ("str_color", "str_color")):
+            val = _as_int(opts.get(key))
+            if val is not None:
+                setattr(style, attr, val)
+        lw = _as_int(opts.get("str_lineweight", opts.get("str_line_weight")))
+        if lw is not None and 0 <= lw <= 211:      # DXF lineweights are 1/100 mm
+            style.str_lineweight = lw
+        lt = opts.get("str_linetype", opts.get("str_line_type"))
+        if isinstance(lt, str) and lt.strip():
+            style.str_linetype = lt.strip()
+        if "qa_grid" in opts:
+            style.qa_grid = _as_bool(opts.get("qa_grid"), style.qa_grid)
+        return style
+
+    @classmethod
+    def from_job(cls, job) -> "OverlayStyle":
+        return cls.from_options(getattr(job, "options", None))
+
+
+@dataclass
+class LayerReport:
+    """What :func:`apply_source_layers` did.
+
+    ``mech_layers`` / ``str_layers`` map the layer name in the merged
+    document *before* the call to its ``MECH|*`` / ``STR|*`` counterpart,
+    ``deleted_layers`` are the original entries nothing referenced any more.
+    """
+
+    mech_layers: dict = field(default_factory=dict)
+    str_layers: dict = field(default_factory=dict)
+    deleted_layers: list = field(default_factory=list)
+    kept_layers: list = field(default_factory=list)
+    entities: dict = field(default_factory=dict)
+    clayer: str = "0"
+    style: dict = field(default_factory=dict)
+    warnings: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "mech_layers": dict(self.mech_layers),
+            "str_layers": dict(self.str_layers),
+            "deleted_layers": list(self.deleted_layers),
+            "kept_layers": list(self.kept_layers),
+            "entities": dict(self.entities),
+            "clayer": self.clayer,
+            "style": dict(self.style),
+            "warnings": list(self.warnings),
+        }
+
+
+def _str_block_names(doc, report: OverlayReport) -> set[str]:
+    """Block definitions that belong to the STR drawing in the output.
+
+    ``report.str_block_map`` (source name → name in the merged doc) is the
+    primary source; walking the STR-sourced INSERTs covers a block whose
+    clone kept its original name, which the map may not have caught.
+    """
+    names = set(report.str_block_map.values())
+    seen = set()
+    queue = [e for e in doc.modelspace()
+             if e.dxf.handle in set(report.str_entity_handles)
+             and e.dxftype() == "INSERT"]
+    while queue:
+        ins = queue.pop()
+        name = ins.dxf.name
+        names.add(name)
+        if name in seen or name not in doc.blocks:
             continue
-        target = STR_PREFIX + str_block.name
-        if target in _block_lookup(mech_doc):
-            try:
-                mech_doc.blocks.delete_block(target, safe=False)
-            except Exception:
-                pass
-        try:
-            new_name = imp.import_block(str_block.name, rename=False)
-            if new_name != target:
-                # BlockLayout.rename doesn't exist in ezdxf 1.4.x — must
-                # rename the underlying block_record, which propagates to
-                # the layout. The except: keep the original name and let
-                # the importer's collision suffix do its job.
-                name_to_block = _block_lookup(mech_doc)
-                blk = name_to_block.get(new_name)
-                if blk is not None:
-                    blk.block_record.rename(target)
-                    new_name = target
-        except Exception:
-            new_name = str_block.name
-        block_map[str_block.name] = new_name
-    try:
-        imp.finalize()
-    except Exception:
-        pass
+        seen.add(name)
+        queue.extend(e for e in doc.blocks.get(name) if e.dxftype() == "INSERT")
+    return names
 
-    # Step 2: import STR non-INSERT entities via the Importer, then
-    # clone+rename INSERTs manually. The Importer copies INSERTs but
-    # leaves their block references pointing at the original (un-
-    # prefixed) STR block names, so every STR INSERT ends up dangling.
-    # We import everything via the Importer first, then strip the
-    # un-rewritten INSERTs and re-add them with the renamed names.
-    mech_handles = {e.dxf.handle for e in mech_doc.modelspace()
-                    if e.dxf.hasattr("handle")}
-    for entity in list(str_doc_obj.modelspace()):
-        try:
-            imp.import_entity(entity, target_layout=mech_doc.modelspace())
-        except Exception:
-            pass
-    try:
-        imp.finalize()
-    except Exception:
-        pass
 
-    # Rewrite INSERT names IN-PLACE: the Importer copied the STR INSERTs
-    # with their original (un-prefixed) block names, leaving dangling
-    # references in modelspace. Rather than drop+clone (which is fragile
-    # for INSERTs whose block names contain spaces / dashes, common in
-    # `GridLine-...` blocks), we just rewrite `dxf.name` on each
-    # Importer-imported INSERT. This preserves every attribute of the
-    # INSERT (handle, xscale, yscale, layers, transforms) and keeps it
-    # properly linked to the renamed _STR_* block.
-    #
-    # Critically, this must also walk INTO every block def — when
-    # STR's geometry included nested INSERTs (e.g., a block that
-    # contains INSERTs referencing other blocks), the Importer copied
-    # them as-is too. Without rewrites here, those nested INSERTs
-    # remain dangling in the block defs, and ezdxf's Frontend raises
-    # DXFStructureError on the first one it encounters, aborting the
-    # whole preview render.
-    #
-    # We rebuild `known_blocks` and `block_map` lookups fresh each call
-    # because `block_record.rename()` updates the block_record without
-    # refreshing the `doc.blocks` index.
-    name_to_block = _block_lookup(mech_doc)
-    known_blocks = set(name_to_block.keys())
+def apply_source_layers(doc, report: OverlayReport, style: OverlayStyle | None = None
+                        ) -> LayerReport:
+    """Move every entity of the merged ``doc`` onto ``MECH|*`` / ``STR|*``.
 
-    def _rewrite_insert_names_in(layout):
-        for e in list(layout):
-            try:
-                if e.dxftype() != "INSERT":
-                    continue
-                cur = e.dxf.name
-                if cur in known_blocks:
-                    continue
-                new_name = block_map.get(cur)
-                if not new_name or new_name not in known_blocks:
-                    continue
-                e.dxf.name = new_name
-            except Exception:
+    Ownership comes from :class:`OverlayReport` — the handles of the STR
+    modelspace entities and the block names xref copied in.  Layer ``0`` and
+    ``Defpoints`` keep their name inside a block definition so ByLayer /
+    ByBlock inheritance still resolves to the INSERT's own ``MECH|*`` /
+    ``STR|*`` layer; in modelspace (and therefore also for the blocks pulled
+    in from there) layer ``0`` *is* renamed to ``MECH|0`` / ``STR|0``.
+
+    The original layer entries are deleted once nothing references them any
+    more (never ``0`` or ``Defpoints``), and ``$CLAYER`` is reset to ``0``.
+
+    Runs **after** the transform — the layer names are the ones the merged
+    document has then, and ``draw_qa_grid`` (which owns the ``QA|*`` layers)
+    runs after this.
+    """
+    style = style or OverlayStyle()
+    out = LayerReport(style=style.to_dict())
+    msp = doc.modelspace()
+    str_handles = set(report.str_entity_handles)
+    str_blocks = _str_block_names(doc, report)
+
+    # ── 1. sort every entity into a source ────────────────────────────────
+    mech_msp: list = []
+    str_msp: list = []
+    for e in msp:
+        bucket = str_msp if e.dxf.handle in str_handles else mech_msp
+        bucket.append(e)
+        if e.dxftype() == "INSERT":
+            bucket.extend(e.attribs)          # an ATTRIB belongs to its INSERT
+
+    shared = str_blocks & {e.dxf.name for e in mech_msp if e.dxftype() == "INSERT"}
+    if shared:
+        out.warnings.append(
+            f"{len(shared)} block definition(s) are INSERTed by both drawings "
+            f"({', '.join(sorted(shared))}); their inner layers are left alone "
+            "because prefixing them would recolour the MECH usage as well")
+
+    mech_block: list = []
+    str_block: list = []
+    for block in doc.blocks:
+        if _is_layout_block(block.name):
+            continue
+        ents = _with_attribs(block)
+        if block.name in str_blocks and block.name not in shared:
+            str_block.extend(ents)
+        else:
+            mech_block.extend(ents)
+
+    # ── 2. plan the renames ───────────────────────────────────────────────
+    mapping: dict[tuple[str, str], str] = {}
+    plan: list[tuple[Any, str]] = []
+
+    def add(entities, source: str, *, in_block: bool) -> None:
+        for e in entities:
+            layer = e.dxf.layer
+            if in_block and layer in KEEP_LAYERS:
+                continue                     # ByBlock / ByLayer inheritance
+            key = (source, layer)
+            if key not in mapping:
+                shown = _unprefix(layer) if source == STR_TAG else layer
+                mapping[key] = source_layer(source, shown)
+            plan.append((e, mapping[key]))
+
+    add(mech_msp, MECH_TAG, in_block=False)
+    add(str_msp, STR_TAG, in_block=False)
+    add(mech_block, MECH_TAG, in_block=True)
+    add(str_block, STR_TAG, in_block=True)
+
+    # ── 3. create the prefixed layers, copying the source layer's look ────
+    for (source, original), new_name in sorted(mapping.items()):
+        template = _get_layer(doc, original)
+        _ensure_layer(doc, new_name, template=template)
+        (out.mech_layers if source == MECH_TAG else out.str_layers)[original] = new_name
+    for e, new_name in plan:
+        e.dxf.layer = new_name
+
+    # ── 4. styling ───────────────────────────────────────────────────────
+    if style.color_mode == "contrast":
+        for original, new_name in out.mech_layers.items():
+            _ensure_layer(doc, new_name, color=style.mech_color,
+                          clear_true_color=True)
+        for original, new_name in out.str_layers.items():
+            _ensure_layer(doc, new_name, color=style.str_color,
+                          clear_true_color=True)
+        for e in list(mech_msp) + mech_block:
+            _to_bylayer(e)
+        for e in list(str_msp) + str_block:
+            _to_bylayer(e)
+
+    if style.str_lineweight is not None:
+        for new_name in out.str_layers.values():
+            _ensure_layer(doc, new_name, lineweight=style.str_lineweight)
+    if style.str_linetype:
+        ltype, known = _ensure_linetype(doc, style.str_linetype)
+        for new_name in out.str_layers.values():
+            _ensure_layer(doc, new_name, linetype=ltype)
+        if not known:
+            out.warnings.append(
+                f"{style.str_linetype!r} is not one of the standard linetypes; "
+                "a plain dashed pattern was added for it")
+
+    # ── 5. drop the original layer entries nothing points at any more ────
+    used = _referenced_layers(doc)
+    for layer in list(doc.layers):
+        name = layer.dxf.name
+        if name in used or name in KEEP_LAYERS or split_source_layer(name):
+            continue
+        doc.layers.remove(name)
+        out.deleted_layers.append(name)
+    out.kept_layers = [l.dxf.name for l in doc.layers if l.dxf.name in KEEP_LAYERS]
+
+    # ── 6. the file opens on layer 0 ─────────────────────────────────────
+    doc.header["$CLAYER"] = "0"
+    out.clayer = "0"
+    out.entities = {"mech": len(mech_msp), "str": len(str_msp),
+                    "mech_block": len(mech_block), "str_block": len(str_block)}
+    report.warnings.extend(out.warnings)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 7 — the QA grid
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_json(obj):
+    """Accept a parsed dict or a path to a JSON file."""
+    if isinstance(obj, (str, Path)):
+        return json.loads(Path(obj).read_text())
+    return obj
+
+
+def _median(values) -> float:
+    v = sorted(float(x) for x in values)
+    n = len(v)
+    if not n:
+        return 0.0
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def _median_spacing(grid_json: dict) -> float:
+    """Median distance between adjacent parallel gridlines, in the units of
+    the grid — the same number ``fit`` uses for its tolerances."""
+    axes = {k: v for k, v in (grid_json.get("axes") or {}).items()
+            if (v or {}).get("status") == "ok" and v.get("point") and v.get("dir")}
+    per_family = []
+    for fam in grid_json.get("families") or []:
+        members = [axes[k] for k in fam if k in axes]
+        if len(members) < 2:
+            continue
+        dx, dy = members[0]["dir"]
+        bx, by = members[0]["point"]
+        nx, ny = -dy, dx                       # offset along the family's normal
+        ts = sorted((a["point"][0] - bx) * nx + (a["point"][1] - by) * ny
+                    for a in members)
+        gaps = [b - a for a, b in zip(ts, ts[1:]) if b - a > 0.0]
+        if gaps:
+            per_family.append(_median(gaps))
+    if per_family:
+        return _median(per_family)
+    return float(grid_json.get("extent") or 0.0)
+
+
+def _x_marker(msp, layer, x, y, size) -> int:
+    """Two crossing LINEs centred on (x, y) — the STR intersection mark."""
+    msp.add_line((x - size, y - size), (x + size, y + size), dxfattribs={"layer": layer})
+    msp.add_line((x - size, y + size), (x + size, y - size), dxfattribs={"layer": layer})
+    return 2
+
+
+def draw_qa_grid(doc, transform_json, grid_mech, grid_str, *, spacing=None) -> dict:
+    """Draw the QA grid of both drawings into ``doc``.
+
+    ``transform_json`` is ``transform.json`` (its ``matrix``,
+    ``correspondences`` and ``outliers`` are used), ``grid_mech`` /
+    ``grid_str`` are the ``grid_mech.json`` / ``grid_str.json`` sidecars
+    written by :mod:`core.fit`.  Dicts or paths are both accepted.
+
+    What lands where:
+
+    * the MECH gridlines as LINEs on ``QA|GRID`` (ACI 3),
+    * the STR gridlines, mapped through the fitted transform, on
+      ``QA|GRID_STR`` (ACI 6) — they should land exactly on the MECH ones,
+    * a CIRCLE at every MECH intersection and an X at every transformed STR
+      intersection, radius / half-size ``0.01 × median grid spacing``,
+    * ``"{label} r={residual:.3g}"`` TEXT at every correspondence,
+      height ``0.005 × median spacing``,
+    * an X on ``QA|OUTLIER`` (ACI 1) at every intersection the fit rejected.
+
+    Only ``QA|*`` layers are touched, so it never disturbs the
+    ``MECH|*`` / ``STR|*`` prefixing.  Returns a small summary dict.
+    """
+    transform_json = _load_json(transform_json) or {}
+    grid_mech = _load_json(grid_mech) or {}
+    grid_str = _load_json(grid_str) or {}
+    if not transform_json:
+        raise OverlayError("draw_qa_grid needs the fit output (transform.json)")
+
+    msp = doc.modelspace()
+    _ensure_layer(doc, QA_GRID_LAYER, color=3)
+    _ensure_layer(doc, QA_GRID_STR_LAYER, color=6)
+    _ensure_layer(doc, QA_OUTLIER_LAYER, color=1)
+
+    affine = Affine2D.from_json(transform_json)
+    sp = float(spacing or transform_json.get("median_spacing")
+               or _median_spacing(grid_mech) or 0.0)
+    if not sp > 0.0:
+        raise OverlayError(
+            "cannot size the QA grid: no median grid spacing in transform.json "
+            "or grid_mech.json")
+    r = _QA_CIRCLE_REL * sp
+    h = _QA_TEXT_REL * sp
+
+    def axis_lines(grid_json, layer, to_world):
+        n = 0
+        for label, ax in (grid_json.get("axes") or {}).items():
+            ax = ax or {}
+            if ax.get("status") != "ok" or not ax.get("point") or not ax.get("dir"):
                 continue
-
-    # Walk modelspace.
-    _rewrite_insert_names_in(mech_doc.modelspace())
-    # Walk every imported _STR_* block (recursively, in case of nested
-    # INSERT → INSERT chains).
-    def _rewrite_recursively(block):
-        for be in list(block):
-            try:
-                if be.dxftype() != "INSERT":
-                    continue
-                cur = be.dxf.name
-                if cur in known_blocks:
-                    # Already in known — but recurse into the target
-                    # block in case its contents have nested INSERTs.
-                    nested = name_to_block.get(cur)
-                    if nested is not None and nested is not block:
-                        _rewrite_recursively(nested)
-                    continue
-                new_name = block_map.get(cur)
-                if not new_name or new_name not in known_blocks:
-                    continue
-                be.dxf.name = new_name
-                nested = name_to_block.get(new_name)
-                if nested is not None and nested is not block:
-                    _rewrite_recursively(nested)
-            except Exception:
+            p = ax["point"]
+            length = float(ax.get("length") or 0.0)
+            if length <= 0.0:
                 continue
+            d = ax["dir"]
+            a = to_world((float(p[0]), float(p[1])))
+            b = to_world((float(p[0]) + float(d[0]) * length,
+                          float(p[1]) + float(d[1]) * length))
+            msp.add_line(a, b, dxfattribs={"layer": layer})
+            n += 1
+        return n
 
-    # Start recursion from every _STR_* block (since their blocks
-    # contain nested INSERTs).
-    for blk_name in block_map.values():
-        blk = name_to_block.get(blk_name)
-        if blk is not None:
-            _rewrite_recursively(blk)
+    def marks(intersections, layer, to_world, *, circle):
+        n = 0
+        for label, pt in (intersections or {}).items():
+            if not pt or len(pt) < 2:
+                continue
+            x, y = to_world((float(pt[0]), float(pt[1])))
+            if circle:
+                msp.add_circle((x, y), r, dxfattribs={"layer": layer})
+                n += 1
+            else:
+                n += _x_marker(msp, layer, x, y, r)
+        return n
 
-    # imported_handles must include EVERY entity we added (clones +
-    # Importer-imported non-INSERT entities) so Step 3 transforms them.
-    # The clones have new handles assigned by add_entity(), so they're
-    # not in `mech_handles`; the Importer-imported non-INSERT entities
-    # retain their original STR handles (also not in `mech_handles`).
-    # Both are present in mech_doc.modelspace now.
-    imported_handles = {
-        e.dxf.handle for e in mech_doc.modelspace()
-        if e.dxf.hasattr("handle") and e.dxf.handle not in mech_handles
+    mech_axes = axis_lines(grid_mech, QA_GRID_LAYER, lambda p: p)
+    str_axes = axis_lines(grid_str, QA_GRID_STR_LAYER, affine.apply)
+    mech_marks = marks(grid_mech.get("intersections"), QA_GRID_LAYER,
+                       lambda p: p, circle=True)
+    str_marks = marks(grid_str.get("intersections"), QA_GRID_STR_LAYER,
+                      affine.apply, circle=False)
+
+    correspondences = transform_json.get("correspondences") or []
+    n_labels = 0
+    for c in correspondences:
+        pt = c.get("mech") or c.get("predicted")
+        if not pt or len(pt) < 2:
+            continue
+        residual = float(c.get("residual") or 0.0)
+        msp.add_text(
+            f"{c.get('label', '?')} r={residual:.3g}",
+            dxfattribs={"insert": (float(pt[0]) + r, float(pt[1]) + r),
+                        "height": h, "layer": QA_GRID_LAYER})
+        n_labels += 1
+
+    mech_ix = grid_mech.get("intersections") or {}
+    by_label = {c.get("label"): c for c in correspondences}
+    outliers = list(transform_json.get("outliers") or [])
+    if not outliers:
+        outliers = [c.get("label") for c in correspondences if not c.get("inlier", True)]
+    n_outliers = 0
+    for label in outliers:
+        pt = None
+        if label in mech_ix:
+            pt = mech_ix[label]
+        elif label in by_label:
+            pt = by_label[label].get("mech")
+        if not pt or len(pt) < 2:
+            continue
+        _x_marker(msp, QA_OUTLIER_LAYER, float(pt[0]), float(pt[1]), r)
+        n_outliers += 1
+
+    return {
+        "median_spacing": sp,
+        "mech_axes": mech_axes,
+        "str_axes": str_axes,
+        "mech_intersections": mech_marks,
+        "str_intersections": str_marks,
+        "labels": n_labels,
+        "outliers": n_outliers,
+        "layers": [QA_GRID_LAYER, QA_GRID_STR_LAYER, QA_OUTLIER_LAYER],
     }
 
-    # Step 3: pre-scale (bake INSERT pos+xscale) once per block, then
-    # transform STR entities.
-    #
-    # CRITICAL: each `_STR_*` block can be referenced by multiple
-    # INSERTs in modelspace. If we pre-scale the block on every
-    # INSERT iteration, the second INSERT's pre-scaling accumulates on
-    # top of the first one's already-baked coords — yielding wildly
-    # offset block content (test-a-2 case, where 11 INSERTs referenced
-    # the same `A$C*` block, and pre-scaling ran 11× → block content
-    # at `(2.4M, -1.7M)` instead of normal world coords).
-    #
-    # Fix: track which blocks have already been pre-baked, and only
-    # reset the INSERT position to `(0,0,0)` on subsequent iterations.
-    prescaled_blocks: set[int] = set()
-    for e in list(mech_doc.modelspace()):
-        try:
-            if e.dxf.hasattr("handle") and e.dxf.handle in imported_handles:
-                if e.dxftype() == "INSERT":
-                    src_block = e.dxf.name
-                    name_to_block = _block_lookup(mech_doc)
-                    block = name_to_block.get(src_block)
-                    if block is not None:
-                        block_id = id(block)
-                        if block_id not in prescaled_blocks:
-                            prescaled_blocks.add(block_id)
-                            sx = e.dxf.xscale or 1.0
-                            sy = e.dxf.yscale if e.dxf.hasattr("yscale") and e.dxf.yscale else sx
-                            ip_x, ip_y = e.dxf.insert[0], e.dxf.insert[1]
-                            for be in list(block):
-                                _prescale_entity(be, sx, sy, ip_x, ip_y)
-                    # Always reset the INSERT position to origin so
-                    # the (already-pre-baked) block content lives at
-                    # world coords while the INSERT itself sits at (0,0).
-                    e.dxf.insert = (0.0, 0.0, 0.0)
-                    e.dxf.xscale = 1.0
-                    e.dxf.yscale = 1.0
-        except Exception:
-            pass
-
-    for e in list(mech_doc.modelspace()):
-        try:
-            if e.dxf.hasattr("handle") and e.dxf.handle in imported_handles:
-                _transform_entity_inplace(e, ax, ay, bx, by)
-        except Exception:
-            pass
-
-    # Build name → block lookup by iteration (NOT via `mech_doc.blocks`
-    # `in` check, which is stale for renamed blocks — `block_record.rename`
-    # updates the block_record but doesn't refresh the `Blocks.__contains__`
-    # index).
-    name_to_block = _block_lookup(mech_doc)
-
-    for block_name in block_map.values():
-        block = name_to_block.get(block_name)
-        if block is None:
-            continue
-        for e in list(block):
-            try:
-                _transform_entity_inplace(e, ax, ay, bx, by)
-            except Exception:
-                pass
-
-    # Step 4: rename STR layers to preserve color/avoid collisions.
-    # Look up source-layer color and use it on the new _STR_* layer.
-    str_layers_in_use = set()
-    for e in list(mech_doc.modelspace()):
-        try:
-            if e.dxf.hasattr("handle") and e.dxf.handle in imported_handles:
-                layer = e.dxf.layer
-                if not layer.startswith(STR_PREFIX):
-                    str_layers_in_use.add(layer)
-        except Exception:
-            pass
-    name_to_block = _block_lookup(mech_doc)
-    for block_name in block_map.values():
-        block = name_to_block.get(block_name)
-        if block is None:
-            continue
-        for e in list(block):
-            try:
-                layer = e.dxf.layer
-                if not layer.startswith(STR_PREFIX):
-                    str_layers_in_use.add(layer)
-            except Exception:
-                pass
-
-    existing_layers = {l.dxf.name for l in mech_doc.layers}
-    for layer in str_layers_in_use:
-        new_name = STR_PREFIX + layer
-        if new_name not in existing_layers:
-            try:
-                src_layer = str_doc_obj.layers.get(name=layer)
-                layer_color = src_layer.dxf.color if (src_layer is not None
-                                                      and src_layer.dxf.hasattr("color")) else 7
-            except Exception:
-                layer_color = 7
-            mech_doc.layers.add(name=new_name, color=layer_color)
-            existing_layers.add(new_name)
-
-    layer_renames = {old: STR_PREFIX + old for old in str_layers_in_use}
-    for e in list(mech_doc.modelspace()):
-        try:
-            if e.dxf.hasattr("handle") and e.dxf.handle in imported_handles:
-                if e.dxf.layer in layer_renames:
-                    e.dxf.layer = layer_renames[e.dxf.layer]
-        except Exception:
-            pass
-    name_to_block = _block_lookup(mech_doc)
-    for block_name in block_map.values():
-        block = name_to_block.get(block_name)
-        if block is None:
-            continue
-        for e in list(block):
-            try:
-                if e.dxf.layer in layer_renames:
-                    e.dxf.layer = layer_renames[e.dxf.layer]
-            except Exception:
-                pass
-
-    # MECH layers: untouched (preserve original colors per A's policy)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Strategy B — 2-block wrap, force red/blue
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _strategy_B(mech_doc, str_doc_obj, scale_x, scale_y, tx, ty):
-    """Wrap MECH in MECH_DRAWING block, STR in STR_DRAWING block.
-    STR block INSERTed at (tx, ty) with xscale=scale_x.
-    Force MECH layers→red, STR layers→blue.
-
-    Uses Importer (same as strategy A) to copy STR content into
-    mech_doc — this preserves block-table dependencies so no entities
-    are dropped. Then we move just the imported STR entities from
-    modelspace into STR_DRAWING, and the original MECH entities into
-    MECH_DRAWING. Modelspace ends up with exactly 2 INSERTs."""
-    BLUE_PREFIX = "_BLUE_"
-    MECH_BLOCK = "MECH_DRAWING"
-    STR_BLOCK = "STR_DRAWING"
-
-    # 0) Snapshot the original MECH modelspace entity handles so we can
-    #    identify them later (the rest after Importer finishes are STR).
-    mech_handles = {e.dxf.handle for e in mech_doc.modelspace()
-                    if e.dxf.hasattr("handle")}
-
-    # 1) Import STR blocks (with _BLUE_ prefix to avoid name collisions).
-    imp = Importer(str_doc_obj, mech_doc)
-    for str_block in list(str_doc_obj.blocks):
-        if str_block.name.startswith("*"):
-            continue
-        target = BLUE_PREFIX + str_block.name
-        if target in mech_doc.blocks:
-            try:
-                mech_doc.blocks.delete_block(target, safe=False)
-            except Exception:
-                pass
-        try:
-            new_name = imp.import_block(str_block.name)
-            # Force rename to _BLUE_ prefix even if no collision (Importer
-            # doesn't add a prefix by default — it only renames on collision).
-            if new_name != target:
-                try:
-                    blk = mech_doc.blocks.get(name=new_name)
-                    if blk is not None:
-                        blk.block_record.rename(target)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    try:
-        imp.finalize()
-    except Exception:
-        pass
-
-    # 2) Import STR modelspace entities into mech_doc.modelspace().
-    imp2 = Importer(str_doc_obj, mech_doc)
-    for ent in list(str_doc_obj.modelspace()):
-        try:
-            imp2.import_entity(ent, target_layout=mech_doc.modelspace())
-        except Exception:
-            pass
-    try:
-        imp2.finalize()
-    except Exception:
-        pass
-
-    # 3) Identify the just-imported STR entities (handles NOT in mech_handles).
-    imported_str_handles = {
-        e.dxf.handle for e in mech_doc.modelspace()
-        if e.dxf.hasattr("handle") and e.dxf.handle not in mech_handles
-    }
-
-    # 4) Build STR_DRAWING block: move imported STR entities there.
-    #    CRITICAL: unlink from current layout BEFORE add_entity — otherwise
-    #    ezdxf raises DXFStructureError because the entity is still owned
-    #    by modelspace.
-    str_drawing = mech_doc.blocks.new(name=STR_BLOCK)
-    for ent in list(mech_doc.modelspace()):
-        try:
-            if ent.dxf.hasattr("handle") and ent.dxf.handle in imported_str_handles:
-                mech_doc.modelspace().unlink_entity(ent)
-                str_drawing.add_entity(ent)
-        except Exception:
-            pass
-
-    # 5) Build MECH_DRAWING block: move MECH's original entities there.
-    #    Also clear explicit color overrides on MECH entities so they pick
-    #    up the red layer color (without this, source entities with
-    #    color=7 stay white even on a red layer).
-    mech_drawing = mech_doc.blocks.new(name=MECH_BLOCK)
-    for ent in list(mech_doc.modelspace()):
-        try:
-            mech_doc.modelspace().unlink_entity(ent)
-            mech_drawing.add_entity(ent)
-        except Exception:
-            pass
-    # Clear explicit colors recursively on MECH entities (everything not in
-    # _BLUE_* sub-blocks).
-    def _clear_mech_colors(block):
-        for ent in list(block):
-            try:
-                if ent.dxf.hasattr("color"):
-                    ent.dxf.color = 256
-            except Exception:
-                pass
-            if ent.dxftype() == "INSERT":
-                sub = mech_doc.blocks.get(name=ent.dxf.name)
-                if sub is not None and not ent.dxf.name.startswith(BLUE_PREFIX):
-                    _clear_mech_colors(sub)
-    _clear_mech_colors(mech_drawing)
-
-    # 6) Layer renames for STR (prefix all layers used by imported STR).
-    #    Must walk into every _BLUE_* sub-block too — strategy A's layer
-    #    logic only looked at str_drawing and missed layers referenced
-    #    inside GridLine-*, Unknown-*, etc. The entities inside those
-    #    blocks reference source layers (1, 2, 4, 10) which exist in
-    #    mech_doc with their original colors — so without rewriting
-    #    them, the STR content renders in MECH's colors.
-    str_layers_in_use = set()
-    # Walk the wrapper block
-    for ent in list(str_drawing):
-        try:
-            str_layers_in_use.add(ent.dxf.layer)
-        except Exception:
-            pass
-    # Walk every imported _BLUE_* sub-block (recursively, in case of nested)
-    def _collect_layers(block):
-        for ent in list(block):
-            try:
-                str_layers_in_use.add(ent.dxf.layer)
-            except Exception:
-                pass
-            if ent.dxftype() == "INSERT":
-                sub = mech_doc.blocks.get(name=ent.dxf.name)
-                if sub is not None:
-                    _collect_layers(sub)
-
-    blue_blocks = [b for b in mech_doc.blocks if b.name.startswith(BLUE_PREFIX)]
-    for blk in blue_blocks:
-        _collect_layers(blk)
-
-    existing_layers = {l.dxf.name for l in mech_doc.layers}
-    for layer in str_layers_in_use:
-        if layer.startswith(BLUE_PREFIX):
-            continue
-        new_name = BLUE_PREFIX + layer
-        if new_name not in existing_layers:
-            try:
-                src_layer = str_doc_obj.layers.get(name=layer)
-                layer_color = src_layer.dxf.color if (src_layer is not None
-                                                      and src_layer.dxf.hasattr("color")) else 7
-            except Exception:
-                layer_color = 7
-            mech_doc.layers.add(name=new_name, color=layer_color)
-            existing_layers.add(new_name)
-
-    renames = {old: BLUE_PREFIX + old for old in str_layers_in_use
-               if not old.startswith(BLUE_PREFIX)}
-    # Apply renames to entities in wrapper AND every _BLUE_* sub-block.
-    # Also clear explicit color overrides (color=7, etc.) so entities pick
-    # up the layer's color (which is now blue). Without this, source
-    # entities with color=7 stay white even though they're on a blue layer.
-    def _apply_renames(block):
-        for ent in list(block):
-            try:
-                if ent.dxf.hasattr("layer") and ent.dxf.layer in renames:
-                    ent.dxf.layer = renames[ent.dxf.layer]
-                # Reset explicit color to BYLAYER (256) so the entity
-                # inherits the layer color.
-                if ent.dxf.hasattr("color"):
-                    ent.dxf.color = 256
-            except Exception:
-                pass
-            if ent.dxftype() == "INSERT":
-                sub = mech_doc.blocks.get(name=ent.dxf.name)
-                if sub is not None:
-                    _apply_renames(sub)
-
-    _apply_renames(str_drawing)
-    for blk in blue_blocks:
-        _apply_renames(blk)
-
-    # 7) Force colors: every non-_BLUE_ layer → red; every _BLUE_ layer → blue.
-    for L in mech_doc.layers:
-        try:
-            if L.dxf.name.startswith(BLUE_PREFIX):
-                L.dxf.color = STR_COLOR
-            else:
-                L.dxf.color = MECH_COLOR
-        except Exception:
-            pass
-
-    # 8) Place the two INSERTs.
-    mech_doc.modelspace().add_blockref(MECH_BLOCK, (0, 0))
-    mech_doc.modelspace().add_blockref(
-        STR_BLOCK, (tx, ty),
-        dxfattribs={"xscale": scale_x, "yscale": scale_y},
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Strategy C — 1-block wrap, force red/blue
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _strategy_C(mech_doc, str_doc_obj, ax, ay, bx, by):
-    """Wrap everything in OVERLAY_DRAWING block, 1 INSERT at origin.
-    Forces red/blue like B."""
-    OVERLAY_BLOCK = "OVERLAY_DRAWING"
-
-    # Run strategy A first — this imports STR into mech_doc.modelspace()
-    # with the affine baked into each entity.
-    _strategy_A(mech_doc, str_doc_obj, ax, ay, bx, by)
-
-    # Now move every entity from modelspace into OVERLAY_DRAWING.
-    # Use unlink+add_entity pattern (same fix as strategy B) so INSERTs
-    # transfer cleanly without DXFStructureError.
-    overlay_block = mech_doc.blocks.new(name=OVERLAY_BLOCK)
-    for ent in list(mech_doc.modelspace()):
-        try:
-            mech_doc.modelspace().unlink_entity(ent)
-            overlay_block.add_entity(ent)
-        except Exception:
-            pass
-
-    # Force colors: red for MECH, blue for STR (prefixed _STR_ by A).
-    for L in mech_doc.layers:
-        try:
-            if L.dxf.name.startswith("_STR_"):
-                L.dxf.color = STR_COLOR
-            else:
-                L.dxf.color = MECH_COLOR
-        except Exception:
-            pass
-
-    # Clear explicit color overrides so entities pick up the layer color.
-    # Source entities often have color=7 (white) or other values set as
-    # explicit overrides, which would override our layer color force.
-    def _clear_explicit_colors(block):
-        for ent in list(block):
-            try:
-                if ent.dxf.hasattr("color"):
-                    ent.dxf.color = 256
-            except Exception:
-                pass
-            if ent.dxftype() == "INSERT":
-                sub = mech_doc.blocks.get(name=ent.dxf.name)
-                if sub is not None:
-                    _clear_explicit_colors(sub)
-    _clear_explicit_colors(overlay_block)
-
-    # Place the single INSERT at origin.
-    mech_doc.modelspace().add_blockref(OVERLAY_BLOCK, (0, 0))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage entrypoint
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run(job_id: str, *, pair_dir: Path | None = None,
-        strategy: str | None = None) -> None:
-    """Apply the fitted transform with the chosen strategy.
+        options: OverlayOptions | None = None,
+        style: OverlayStyle | None = None) -> None:
+    """Stage 7 entrypoint — writes ``out/superimposed.dxf`` and the report.
 
-    `strategy` is per-pair when supplied (Slice 2 multi-pair flow);
-    otherwise we fall back to `JobState.strategy` so the legacy single-
-    pair pipeline behaves bit-equivalently.
+    ``pair_dir`` is the per-pair ``cleaned/`` directory of a multi-pair run;
+    every output then goes to the pair root instead of the job dir.
+
+    After the transform the document is put on per-source layers and the QA
+    grid is drawn (both configurable through ``job.options["overlay"]``).
     """
     d = job_dir(job_id)
-    if pair_dir is not None:
-        root = Path(pair_dir).parent
-        cleaned = sorted(Path(pair_dir).glob("*_clean.dxf"))
-    else:
-        root = d
-        cleaned = sorted((d / "cleaned").glob("*_clean.dxf"))
-    if len(cleaned) != 2:
-        raise RuntimeError(f"Need 2 cleaned DXFs; found {len(cleaned)}")
-    mech_path = cleaned[0]
-    str_path = cleaned[1]
+    root = Path(pair_dir).parent if pair_dir is not None else d
+    mech_path, str_path = resolve_pair(job_id, pair_dir)   # explicit roles
 
-    # Read transform
     transform_path = root / "transform.json"
     if not transform_path.exists():
         raise RuntimeError("transform.json missing — run fit first")
-    t = json.loads(transform_path.read_text())
-    ax, ay, bx, by = t["scale_x"], t["scale_y"], t["tx"], t["ty"]
+    transform_json = json.loads(transform_path.read_text())
+    affine = Affine2D.from_json(transform_json)
 
-    # Resolve strategy: per-pair arg wins (Slice 2); legacy single-pair
-    # flows leave it None and we read from JobState.
-    if strategy is None:
-        job = load_job(job_id)
-        if job is None:
-            raise RuntimeError(f"Job {job_id} disappeared")
-        strategy = job.strategy
+    mech_doc = _read_internal(str(mech_path))
+    report = overlay_docs(mech_doc, _read_internal(str(str_path)), affine,
+                          options=options)
 
-    mech_doc = ezdxf.readfile(str(mech_path))
-    str_doc = ezdxf.readfile(str(str_path))
+    style = style or OverlayStyle.from_job(load_job(job_id))
+    report.layers = apply_source_layers(mech_doc, report, style)
 
-    if strategy == "A":
-        _strategy_A(mech_doc, str_doc, ax, ay, bx, by)
-    elif strategy == "B":
-        _strategy_B(mech_doc, str_doc, scale_x=ax, scale_y=ay, tx=bx, ty=by)
-    elif strategy == "C":
-        _strategy_C(mech_doc, str_doc, ax, ay, bx, by)
-    else:
-        raise RuntimeError(f"Unknown strategy: {strategy!r}")
+    qa = None
+    if style.qa_grid:
+        grid_mech, grid_str = root / "grid_mech.json", root / "grid_str.json"
+        if grid_mech.exists() and grid_str.exists():
+            qa = draw_qa_grid(mech_doc, transform_json, grid_mech, grid_str)
+        else:
+            report.warnings.append(
+                "qa_grid was requested but grid_mech.json / grid_str.json are "
+                "missing (no fit stage output for this pair) — no QA geometry "
+                "was drawn")
 
-    # Save output
     out_dir = root / "out"
     out_dir.mkdir(exist_ok=True)
-    out_dxf = out_dir / "superimposed.dxf"
-    mech_doc.saveas(str(out_dxf))
+    summary = _dxf_save(mech_doc, str(out_dir / "superimposed.dxf"))
+
+    stages = root / "stages"
+    stages.mkdir(exist_ok=True)
+    payload = report.to_dict()
+    payload["qa_grid"] = qa
+    (stages / REPORT_NAME).write_text(json.dumps(payload, indent=2))
+    dxfio.record_audit(root, "overlay", Path(mech_path).name, summary)

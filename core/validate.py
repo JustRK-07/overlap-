@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """core/validate.py — Stage 1 (real).
 
-Reads each uploaded file with ezdxf.recover.readfile(). For DWG files
+Reads each uploaded file with core.dxfio.read_input(). For DWG files
 falls back to listing existence only (full DWG read needs ODA Converter).
 
 Writes jobs/<id>/stages/validate.json with:
@@ -16,8 +16,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import ezdxf
-from ezdxf import recover
+from . import dxfio
 
 from jobs import job_dir
 
@@ -26,12 +25,8 @@ def _validate_dxf(path: Path) -> dict:
     """Use ezdxf.recover to read the DXF, gather basic metadata."""
     try:
         # Use ezdxf.recover for forgiving parse — tolerates corrupt entities
-        doc, auditor = recover.readfile(str(path))
-        if auditor.has_errors:
-            # Recovered with errors — still usable; just note it
-            recoverable = True
-        else:
-            recoverable = False
+        doc, audit = dxfio.read_input(path)
+        recoverable = bool(audit["fixes"])
 
         msp = doc.modelspace()
         ent_count = sum(1 for _ in msp)
