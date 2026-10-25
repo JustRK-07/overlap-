@@ -76,6 +76,7 @@
     downloadFindingsJsonLink: $("download-findings-json-link"),
     downloadFindingsCsvLink: $("download-findings-csv-link"),
     downloadFindingsDocxLink: $("download-findings-docx-link"),
+    downloadDwgLink: $("download-dwg-link"),
     // Section 5 — depth analysis + findings panel
     analyzeSection: $("analyze-section"),
     analyzePairSelect: $("analyze-pair-select"),
@@ -548,6 +549,9 @@
       els.downloadAnnotatedLink.href = `${API}/${jobId}/annotated.dxf`;
       els.downloadDocxLink.href = `${API}/${jobId}/spotcheck.docx`;
       els.downloadSpotcheckJsonLink.href = `${API}/${jobId}/spotcheck.json`;
+    if (els.downloadDwgLink) {
+      els.downloadDwgLink.href = `${API}/${jobId}/download.dwg?variant=superimposed&version=R2018`;
+    }
     if (els.downloadFindingsJsonLink) {
       els.downloadFindingsJsonLink.href = `${API}/${jobId}/findings.json`;
       els.downloadFindingsCsvLink.href = `${API}/${jobId}/findings.csv`;
@@ -919,6 +923,27 @@
     const strCount  = mfRows.filter((r) => r.role === "str").length;
     els.multiStartBtn.disabled = !(allHaveFile && mechCount >= 1 && strCount >= 1);
   }
+
+  // ── the capabilities probe (PLAN_MISMATCH step 8c) ─────────────────
+  // The DWG export needs the ODA File Converter; when it is missing the
+  // button is disabled and says why, rather than failing on click.
+  (async () => {
+    try {
+      const r = await fetch("/api/v1/capabilities");
+      if (!r.ok) return;
+      const caps = await r.json();
+      if (els.downloadDwgLink && !caps.dwg_export) {
+        els.downloadDwgLink.classList.add("disabled");
+        els.downloadDwgLink.removeAttribute("href");
+        els.downloadDwgLink.title =
+          "DWG export needs the ODA File Converter — the DXF download is unaffected";
+        els.downloadDwgLink.style.opacity = "0.5";
+        els.downloadDwgLink.style.cursor = "not-allowed";
+      }
+    } catch (e) {
+      /* the probe is optional */
+    }
+  })();
 
   // ── the findings panel controls ──────────────────────────────────
   if (els.findingsKindSelect) {

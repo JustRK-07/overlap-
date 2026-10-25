@@ -30,6 +30,11 @@ import pipelines
 
 router = APIRouter(prefix="/api/v1/overlay", tags=["overlay"])
 
+#: The capabilities probe lives at ``/api/v1/capabilities`` — outside the
+#: overlay prefix — so the UI can ask what the server can do before a job
+#: exists.
+capabilities_router = APIRouter(prefix="/api/v1", tags=["overlay"])
+
 ALLOWED_EXTS = {".dwg", ".dxf"}
 MAX_UPLOAD_MB = 200
 
@@ -864,6 +869,66 @@ def _serve(job_id: str, name: str, media_type: str):
     if not path.exists():
         raise HTTPException(404, f"No {name} yet: {path}")
     return FileResponse(str(path), media_type=media_type)
+
+
+# ── the DWG export (PLAN_MISMATCH step 8c) ────────────────────────────────
+
+@capabilities_router.get("/capabilities")
+async def capabilities():
+    """What this server can do.  Never returns a path."""
+    from core import export_dwg
+
+    return {
+        "dwg_export": export_dwg.available(),
+        "dwg_versions": export_dwg.versions(),
+    }
+
+
+@router.get("/{job_id}/download.dwg")
+async def download_dwg(job_id: str, variant: str = "superimposed",
+                       version: str = "R2018",
+                       pair_id: str | None = None):
+    """The superimposed (or annotated) drawing as a DWG.
+
+    Needs the ODA File Converter.  The DXF download is unaffected when it
+    is missing — this endpoint answers 501 with the reason.
+    """
+    from core import export_dwg
+
+    if variant not in ("superimposed", "annotated"):
+        raise HTTPException(
+            400,
+            f"variant must be superimposed or annotated; got {variant!r}",
+        )
+    known = export_dwg.versions()
+    if version not in known:
+        raise HTTPException(
+            400, f"version must be one of {known}; got {version!r}")
+
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+
+    root = _findings_root(job_id, pair_id)
+    name = "superimposed_annotated.dxf" if variant == "annotated" \
+        else "superimposed.dxf"
+    src = root / name
+    if not src.exists():
+        raise HTTPException(404, f"No {variant} DXF yet: {src}")
+
+    if not export_dwg.available():
+        return JSONResponse(status_code=501,
+                            content={"detail": export_dwg.UNAVAILABLE_MESSAGE,
+                                     "available": False})
+
+    out = root / f"{variant}_{version}.dwg"
+    if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+        result = export_dwg.export(src, out, version=version)
+        if not result.ok:
+            raise HTTPException(502, result.message)
+
+    return FileResponse(str(out), filename=f"{variant}_{version}.dwg",
+                        media_type="image/vnd.dwg")
 
 
 # ── the findings (PLAN_MISMATCH §4) ───────────────────────────────────────

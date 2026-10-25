@@ -237,18 +237,33 @@ preview driven by ``preview_meta.world_to_px``.
 
 | # | Deliverable | State |
 |---|---|---|
-| 1 | `tests/synth_perf.py` — ~170k entities, 10 seeded defects | OPEN |
-| 2 | `tests/test_mismatch_perf.py` — exactly 10 PATTERN_OFFSET, < 90 s | OPEN |
+| 1 | `tests/synth_perf.py` — ~170k entities, 10 seeded defects | VERIFIED |
+| 2 | `tests/test_mismatch_perf.py` — exactly 10 PATTERN_OFFSET, < 90 s | VERIFIED |
+
+**The perf test found a real O(n²) bug.**  The first run took **81.9 s**
+of the 90 s budget, with the bolt check alone at **74.5 s**.  The cause
+was `core/mismatch/checks/bolts.py::group_patterns`, which compared
+*every* bolt with *every* other bolt — 200 million comparisons for the
+20 000 bolts of the fixture.  It now uses the spatial index
+(`core/spatial.py::GridIndex`) to look up only the neighbours within
+``eps_units``: **81.9 s → 9.9 s**, and the bolt check **74.5 s → 2.4 s**
+(31×).  The same 10 findings, and the existing bolt tests still pass.
 
 ### C-8c — DWG export
 
 | # | Deliverable | State |
 |---|---|---|
-| 1 | `core/export_dwg.py` | OPEN |
-| 2 | `GET /{job_id}/download.dwg` | OPEN |
-| 3 | `GET /api/v1/capabilities` | OPEN |
-| 4 | UI "Download DWG" button | OPEN |
-| 5 | `tests/test_export_dwg.py` | OPEN |
+| 1 | `core/export_dwg.py` | VERIFIED |
+| 2 | `GET /{job_id}/download.dwg` | VERIFIED |
+| 3 | `GET /api/v1/capabilities` | VERIFIED |
+| 4 | UI "Download DWG" button | VERIFIED |
+| 5 | `tests/test_export_dwg.py` | VERIFIED |
+
+The export renames ``MECH|0`` → ``MECH$0`` (AutoCAD reserves ``|`` for
+xref symbols) and never overwrites a name that already exists.  Without
+the ODA File Converter the endpoint answers **501** with the reason — the
+DXF download is unaffected — and the UI's button is disabled with a
+tooltip that says why.
 
 ### C — missing test files
 
@@ -292,6 +307,7 @@ preview driven by ``preview_meta.world_to_px``.
 |---|---|---|
 | 2026-10-25 | Analysis | 7 review agents + 3 fix-mapping agents; 84 files; defects independently reproduced |
 | 2026-10-25 | Phase 1 (Tier 1) | **A1–A10 all VERIFIED.** 16 new regression tests; suite 389 → **405 passed**, 24 skipped, 0 failed. Every new test proven to FAIL on the original code (A1/A3/A5–A8 by temporary revert; A2/A4/A9/A10 by construction). |
+| 2026-10-25 | Phase 5 (8b.7 + 8c) | **C-8b.7 and C-8c VERIFIED.** `tests/synth_perf.py` (190 328 entities), `tests/test_mismatch_perf.py` (4 tests), `core/export_dwg.py`, `tests/test_export_dwg.py` (10 tests).  Suite 453 → **467 passed**, 24 skipped, 0 failed.  The perf test found an O(n²) bug in the pattern grouping — 81.9 s → 9.9 s. |
 | 2026-10-25 | Phase 4 (8b.6) | **C-8b.6 all VERIFIED.** 23 new tests (`tests/test_findings_api.py` + `tests/test_static_assets.py`); suite 428 → **453 passed**, 24 skipped, 0 failed.  The UI work also fixed the XSS the review flagged and the 9-column step rail. |
 | 2026-10-25 | Phase 3 (8b.5) | **C-8b.5 all 13 VERIFIED.** 12 new tests in `tests/test_mismatch_stage.py`; suite 418 → **428 passed**, 24 skipped, 0 failed. The engine is reachable end to end: the stage runs, the QA markers are drawn, the findings are merged, and the pipeline runs them. |
 | 2026-10-25 | Phase 2 (PLAN.md criteria) | **B1–B4 VERIFIED.** 13 new tests in `tests/test_plan_acceptance.py`; suite 405 → **418 passed**, 24 skipped, 0 failed. 11 of the 13 proven to FAIL on the original code by temporary revert of all 9 touched modules. |
