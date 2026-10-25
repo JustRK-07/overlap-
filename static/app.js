@@ -73,19 +73,38 @@
     downloadAnnotatedLink: $("download-annotated-link"),
     downloadDocxLink: $("download-docx-link"),
     downloadSpotcheckJsonLink: $("download-spotcheck-json-link"),
-    // Section 5 — depth analysis + issues panel
+    downloadFindingsJsonLink: $("download-findings-json-link"),
+    downloadFindingsCsvLink: $("download-findings-csv-link"),
+    downloadFindingsDocxLink: $("download-findings-docx-link"),
+    // Section 5 — depth analysis + findings panel
     analyzeSection: $("analyze-section"),
     analyzePairSelect: $("analyze-pair-select"),
     analyzeSummary: $("analyze-summary"),
     analyzeTbody: $("analyze-tbody"),
-    analyzeIssuesCount: $("analyze-issues-count"),
-    issuesTbody: $("issues-tbody"),
-    issuesShowMore: $("issues-show-more"),
+    // the findings panel (PLAN_MISMATCH §4)
+    findingsCount: $("findings-count"),
+    findingsSummary: $("findings-summary"),
+    findingsKindSelect: $("findings-kind-select"),
+    findingsIncludeInfo: $("findings-include-info"),
+    findingsIncludeSystematic: $("findings-include-systematic"),
+    findingsCoverage: $("findings-coverage"),
+    findingsTbody: $("findings-tbody"),
+    findingsShowMore: $("findings-show-more"),
+    findingsPreviewWrap: $("findings-preview-wrap"),
+    findingsPreview: $("findings-preview"),
+    findingsOverlay: $("findings-overlay"),
+    findingsResetZoom: $("findings-reset-zoom"),
+    findingsCopyCoords: $("findings-copy-coords"),
   };
 
   // ─── Analyze panel state ────────────────────────────────────────────
-  let analyzeIssuesCache = null;  // sorted issues for the active pair
-  const ISSUES_PAGE = 100;        // rows per "show more" click
+
+  // ─── Findings panel state ───────────────────────────────────────────
+  let findingsCache = null;       // the findings for the active pair
+  let findingsMeta = null;        // {png_w, png_h, world_to_px}
+  let findingsOffset = 0;         // how many rows are already rendered
+  const FINDINGS_PAGE = 100;      // rows per "show more" click
+  const FINDINGS_LIMIT = 5000;    // the API's maximum
 
   // Current selections
   let fileA = null;
@@ -279,7 +298,7 @@
         renderPolicyPanel(j.clean_policy);
       }
     } catch (e) {
-      els.suggestions.innerHTML = `<p class="muted">Could not load suggestions: ${e.message}</p>`;
+      els.suggestions.innerHTML = `<p class="muted">Could not load suggestions: ${_esc(e.message)}</p>`;
     }
   }
 
@@ -336,8 +355,8 @@
     }
     els.suggestions.innerHTML = sugs.map((s, i) => `
       <button class="suggestion" data-idx="${i}">
-        <strong>"${s.prefix || '(no prefix)'}"</strong>
-        <span class="samples">${s.count} found: ${s.samples.slice(0, 5).join(", ")}${s.count > 5 ? "..." : ""}</span>
+        <strong>"${_esc(s.prefix || '(no prefix)')}"</strong>
+        <span class="samples">${_esc(String(s.count))} found: ${_esc(s.samples.slice(0, 5).join(", "))}${s.count > 5 ? "..." : ""}</span>
       </button>`).join("");
     els.suggestions.querySelectorAll(".suggestion").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -375,7 +394,7 @@
       const j = await r.json();
       renderAxesResult(j);
     } catch (e) {
-      els.axesSummary.innerHTML = `<p class="error">Scan failed: ${e.message}</p>`;
+      els.axesSummary.innerHTML = `<p class="error">Scan failed: ${_esc(e.message)}</p>`;
     }
   }
 
@@ -405,7 +424,7 @@
         <div class="pair"><span>All paired?</span><span>${j.all_matched ? "✓ yes" : "✗ no — missing some"}</span></div>
         ${(j.pairs || []).map(p => `
           <div class="pair">
-            <span><code>${p.suffix}</code>  ${p.type}</span>
+            <span><code>${_esc(p.suffix)}</code>  ${_esc(p.type)}</span>
             <span class="muted">Δ ${p.delta.toFixed(2)}</span>
           </div>
         `).join("")}
@@ -529,6 +548,11 @@
       els.downloadAnnotatedLink.href = `${API}/${jobId}/annotated.dxf`;
       els.downloadDocxLink.href = `${API}/${jobId}/spotcheck.docx`;
       els.downloadSpotcheckJsonLink.href = `${API}/${jobId}/spotcheck.json`;
+    if (els.downloadFindingsJsonLink) {
+      els.downloadFindingsJsonLink.href = `${API}/${jobId}/findings.json`;
+      els.downloadFindingsCsvLink.href = `${API}/${jobId}/findings.csv`;
+      els.downloadFindingsDocxLink.href = `${API}/${jobId}/findings.docx`;
+    }
       els.previewLink.href = `${API}/${jobId}/preview.png`;
       els.previewGridLink.href = `${API}/${jobId}/preview_grid.png`;
       els.reportLink.href = `${API}/${jobId}/report.json`;
@@ -638,61 +662,187 @@
     els.analyzeTbody.innerHTML = ixRows ||
       `<tr><td colspan="6" class="muted">No intersections in this pair.</td></tr>`;
 
-    // ── issues sub-table ──────────────────────────────────────────
-    // Fetch /spotcheck.json — that file is always present for completed
-    // jobs (legacy layout at out/spotcheck.json, pair layout at
-    // out/<pair>/out/spotcheck.json). We point at the legacy URL
-    // because that endpoint reads the active pair's spotcheck.json
-    // via the smoke-test convention.
+    // ── the findings panel ─────────────────────────────────────────
+    // The canonical findings (native mismatch findings + the remaining
+    // spot-check issues) replace the old per-pair issues table.
+    await loadFindings();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Section 5b — the findings panel (PLAN_MISMATCH §4)
+  // ─────────────────────────────────────────────────────────────────────
+
+  async function loadFindings() {
     try {
-      const r = await fetch(`${API}/${jobId}/spotcheck.json`);
-      if (r.ok) {
-        const j = await r.json();
-        analyzeIssuesCache = (j.issues || []).slice();
-        // Sort by severity (CRITICAL first), then by id for stability.
-        const sevRank = { CRITICAL: 0, WARNING: 1, INFO: 2, "": 3 };
-        analyzeIssuesCache.sort((a, b) => {
-          const ra = sevRank[a.severity] ?? 9;
-          const rb = sevRank[b.severity] ?? 9;
-          return ra - rb || String(a.id).localeCompare(String(b.id));
-        });
-        els.analyzeIssuesCount.textContent = analyzeIssuesCache.length;
-        renderIssuesPage(0);
+      const r = await fetch(
+        `${API}/${jobId}/findings?limit=${FINDINGS_LIMIT}`);
+      if (!r.ok) {
+        // The mismatch stage did not run (or was disabled) — say so
+        // instead of showing an empty table that reads like "no defects".
+        findingsCache = null;
+        els.findingsCount.textContent = "—";
+        els.findingsSummary.textContent =
+          r.status === 404 ? "no findings were produced for this job"
+                           : "the findings could not be loaded";
+        els.findingsTbody.innerHTML = "";
+        els.findingsCoverage.innerHTML = "";
+        return;
       }
+      const body = await r.json();
+      findingsCache = body.items || [];
+      findingsOffset = 0;
+
+      // the coverage banner — a family with 0 items was NOT checked
+      const cov = body.coverage || {};
+      const zeros = Object.entries(cov)
+        .filter(([, c]) => (c.items || 0) === 0)
+        .map(([name]) => name);
+      const parts = Object.entries(cov).map(
+        ([name, c]) => `${name} ${c.matched || 0}/${c.items || 0}`);
+      els.findingsCoverage.innerHTML =
+        (parts.length ? `<span class="muted">checked: ${_esc(parts.join(" · "))}</span>` : "") +
+        (zeros.length
+          ? `<span class="findings-warn"> ⚠ ${_esc(zeros.join(", "))} matched no items — not checked</span>`
+          : "");
+      if (body.status !== "ok") {
+        els.findingsCoverage.innerHTML +=
+          `<span class="findings-warn"> ⚠ the mismatch check was ${_esc(body.status)}</span>`;
+      }
+
+      // the kind filter
+      const kinds = [...new Set(findingsCache.map((f) => f.kind))].sort();
+      els.findingsKindSelect.innerHTML =
+        `<option value="">All kinds</option>` +
+        kinds.map((k) => `<option value="${_esc(k)}">${_esc(k)}</option>`).join("");
+
+      const bySev = body.summary?.by_severity || {};
+      els.findingsSummary.textContent =
+        `${body.total} finding(s)` +
+        (bySev.CRITICAL ? ` · ${bySev.CRITICAL} critical` : "") +
+        (bySev.WARNING ? ` · ${bySev.WARNING} warning` : "") +
+        (bySev.INFO ? ` · ${bySev.INFO} info` : "");
+
+      // the preview + the world → pixel map (for the click-to-locate ring)
+      await loadFindingsPreview();
+
+      renderFindings();
     } catch (e) {
-      console.warn("issues fetch failed:", e);
+      console.warn("findings fetch failed:", e);
     }
   }
 
-  function renderIssuesPage(start) {
-    const issues = analyzeIssuesCache || [];
-    const slice = issues.slice(start, start + ISSUES_PAGE);
-    if (start === 0) {
-      els.issuesTbody.innerHTML = "";
+  async function loadFindingsPreview() {
+    try {
+      const r = await fetch(`${API}/${jobId}/preview_meta.json`);
+      if (r.ok) {
+        findingsMeta = await r.json();
+        els.findingsPreview.src = `${API}/${jobId}/preview.png`;
+        els.findingsPreviewWrap.classList.remove("hidden");
+        const w = findingsMeta.png_w || 1000;
+        const h = findingsMeta.png_h || 600;
+        els.findingsOverlay.setAttribute("viewBox", `0 0 ${w} ${h}`);
+      }
+    } catch (e) {
+      console.warn("preview_meta fetch failed:", e);
     }
-    const html = slice.map((i) => `
-      <tr>
-        <td><code>${_esc(i.id)}</code></td>
-        <td>${_esc(i.type)}</td>
-        <td><span class="severity sev-${_esc(i.severity)}">${_esc(i.severity)}</span></td>
-        <td>${_fmtF(i.mech_x)}</td>
-        <td>${_fmtF(i.mech_y)}</td>
-        <td>${_fmtF(i.distance)}</td>
-        <td>${_esc(i.note || "")}</td>
-      </tr>
-    `).join("");
-    els.issuesTbody.insertAdjacentHTML("beforeend", html);
+  }
 
-    // Show "Show more" only if there's another page.
-    const nextStart = start + ISSUES_PAGE;
-    if (nextStart < issues.length) {
-      els.issuesShowMore.classList.remove("hidden");
-      els.issuesShowMore.onclick = () => {
-        renderIssuesPage(nextStart);
-      };
+  function _visibleFindings() {
+    const all = findingsCache || [];
+    const kind = els.findingsKindSelect.value;
+    const includeInfo = els.findingsIncludeInfo.checked;
+    const includeSystematic = els.findingsIncludeSystematic.checked;
+    return all.filter((f) => {
+      if (kind && f.kind !== kind) return false;
+      if (!includeInfo && f.severity === "INFO") return false;
+      if (!includeSystematic && f.systematic) return false;
+      return true;
+    });
+  }
+
+  function renderFindings() {
+    const items = _visibleFindings();
+    els.findingsCount.textContent = items.length;
+    els.findingsTbody.innerHTML = "";
+    findingsOffset = 0;
+    renderFindingsPage(0);
+  }
+
+  function renderFindingsPage(start) {
+    const items = _visibleFindings();
+    const slice = items.slice(start, start + FINDINGS_PAGE);
+    const html = slice.map((f) => {
+      const loc = f.location || [0, 0];
+      const off = f.offset_mm;
+      const mech = f.mech_ref;
+      const strc = f.str_ref;
+      return `<tr data-idx="${findingsCache.indexOf(f)}" title="click to locate on the preview">
+        <td><code>${_esc(f.id)}</code></td>
+        <td>${_esc(f.kind)}</td>
+        <td><span class="severity sev-${_esc(f.severity)}">${_esc(f.severity)}</span></td>
+        <td>${_fmtF(loc[0])}</td>
+        <td>${_fmtF(loc[1])}</td>
+        <td>${off ? `${_fmtF(off[0])}, ${_fmtF(off[1])}` : "—"}</td>
+        <td>${f.local_magnitude_mm != null ? _fmtF(f.local_magnitude_mm) : "—"}</td>
+        <td>${_fmtF(f.tolerance_mm)}</td>
+        <td>${f.ratio != null ? _fmtF(f.ratio) : "—"}</td>
+        <td>${mech ? `${_esc(mech.block || mech.handle || "?")}<br><span class="muted">${_esc(mech.layer || "")}</span>` : "—"}</td>
+        <td>${strc ? `${_esc(strc.block || strc.handle || "?")}<br><span class="muted">${_esc(strc.layer || "")}</span>` : "—"}</td>
+        <td>${_esc(f.message || "")}</td>
+      </tr>`;
+    }).join("");
+    els.findingsTbody.insertAdjacentHTML("beforeend", html);
+
+    // row click → the ring on the preview
+    els.findingsTbody.querySelectorAll("tr[data-idx]").forEach((tr) => {
+      tr.addEventListener("click", () => {
+        const f = findingsCache[Number(tr.dataset.idx)];
+        if (f) focusFinding(f);
+      });
+    });
+
+    const nextStart = start + FINDINGS_PAGE;
+    if (nextStart < items.length) {
+      els.findingsShowMore.classList.remove("hidden");
+      els.findingsShowMore.onclick = () => renderFindingsPage(nextStart);
     } else {
-      els.issuesShowMore.classList.add("hidden");
+      els.findingsShowMore.classList.add("hidden");
     }
+  }
+
+  function focusFinding(f) {
+    if (!findingsMeta || !findingsMeta.world_to_px) return;
+    const loc = f.location || [0, 0];
+    const m = findingsMeta.world_to_px;
+    const px = m[0][0] * loc[0] + m[0][2];
+    const py = m[1][1] * loc[1] + m[1][2];
+    const r = 18;
+    els.findingsOverlay.innerHTML =
+      `<circle cx="${px}" cy="${py}" r="${r}" fill="none" stroke="#dc2626" stroke-width="3"/>` +
+      `<circle cx="${px}" cy="${py}" r="3" fill="#dc2626"/>`;
+    // zoom the preview onto the finding
+    const wrap = els.findingsPreviewWrap;
+    const scale = 4;
+    const rect = els.findingsPreview.getBoundingClientRect();
+    const pw = findingsMeta.png_w || rect.width;
+    const ph = findingsMeta.png_h || rect.height;
+    const cx = (px / pw) * 100;
+    const cy = (py / ph) * 100;
+    els.findingsPreview.style.transformOrigin = `${cx}% ${cy}%`;
+    els.findingsPreview.style.transform = `scale(${scale})`;
+    els.findingsResetZoom.classList.remove("hidden");
+    els.findingsCopyCoords.classList.remove("hidden");
+    els.findingsCopyCoords.onclick = () => {
+      const text = `${loc[0].toFixed(1)}, ${loc[1].toFixed(1)}`;
+      if (navigator.clipboard) navigator.clipboard.writeText(text);
+    };
+  }
+
+  function resetFindingsZoom() {
+    els.findingsPreview.style.transform = "";
+    els.findingsOverlay.innerHTML = "";
+    els.findingsResetZoom.classList.add("hidden");
+    els.findingsCopyCoords.classList.add("hidden");
   }
 
   // ─────────────────────────────────────────────────────────────────────
@@ -768,6 +918,14 @@
     const mechCount = mfRows.filter((r) => r.role === "mech").length;
     const strCount  = mfRows.filter((r) => r.role === "str").length;
     els.multiStartBtn.disabled = !(allHaveFile && mechCount >= 1 && strCount >= 1);
+  }
+
+  // ── the findings panel controls ──────────────────────────────────
+  if (els.findingsKindSelect) {
+    els.findingsKindSelect.onchange = () => renderFindings();
+    els.findingsIncludeInfo.onchange = () => renderFindings();
+    els.findingsIncludeSystematic.onchange = () => renderFindings();
+    els.findingsResetZoom.onclick = () => resetFindingsZoom();
   }
 
   els.addFileBtn.addEventListener("click", () => addMultiFileRow(null, "other"));

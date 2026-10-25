@@ -321,6 +321,11 @@ dropped on load, as before.
 | `GET` | `/api/v1/overlay/{id}/preview_meta.json` | world → pixel map of `preview.png` |
 | `GET` | `/api/v1/overlay/{id}/report.json` | counts, fit quality, overlay failures, outliers, audit |
 | `GET`/`POST` | `/api/v1/overlay/{id}/pairs` | list / run a pair in the multi-pair layout |
+| `GET` | `/api/v1/overlay/{id}/findings` | the findings, filtered (`severity`, `kind`, `origin`, `min_magnitude_mm`, `bbox`, `limit`, `offset`) |
+| `GET` | `/api/v1/overlay/{id}/findings/{fid}` | one finding, by id (`MM-0001`) or uid |
+| `GET` | `/api/v1/overlay/{id}/findings.csv`, `/findings.docx` | the findings as a file |
+| `GET`/`PUT` | `/api/v1/overlay/{id}/mismatch/policy` | the resolved mismatch policy / replace it (a bad policy is a 400) |
+| `POST` | `/api/v1/overlay/{id}/mismatch/rerun` | re-run the mismatch check — no refit |
 | `GET` | `/api/v1/overlay/{id}/pairs/{pair_id}/{artifact}` | one pair artifact (whitelisted; `..` is rejected) |
 | `GET` | `/api/v1/overlay/{id}/analyze` | grid-intersection depth analysis + issues |
 | `GET` | `/api/v1/overlay/{id}/spotcheck.json`, `/spotcheck.docx`, `/annotated.dxf` | spot-check outputs |

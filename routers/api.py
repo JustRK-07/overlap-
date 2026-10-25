@@ -866,6 +866,276 @@ def _serve(job_id: str, name: str, media_type: str):
     return FileResponse(str(path), media_type=media_type)
 
 
+# ── the findings (PLAN_MISMATCH §4) ───────────────────────────────────────
+
+def _findings_root(job_id: str, pair_id: str | None = None) -> Path:
+    """The directory the findings artefacts live in.
+
+    The legacy single-pair layout is ``jobs/<id>/out/``; a multi-pair job
+    puts them under ``jobs/<id>/out/pairs/<pair_id>/out/``.  With no
+    ``pair_id`` the *active* pair wins, exactly as :func:`download` does.
+    """
+    if pair_id is not None:
+        from core.pair_runner import pair_root
+        return pair_root(job_id, _safe_pair_id(pair_id)) / "out"
+    legacy = job_dir(job_id) / "out"
+    pairs_root = job_dir(job_id) / "out" / "pairs"
+    job = load_job(job_id)
+    if pairs_root.exists() and job is not None:
+        active = job.active_pair_id or (job.pairs[0].pair_id if job.pairs else None)
+        if active and (pairs_root / active / "out" / "findings.json").exists():
+            return pairs_root / active / "out"
+    return legacy
+
+
+def _load_findings(job_id: str, pair_id: str | None = None) -> tuple[Path, dict]:
+    """``(path, payload)`` — 404 when the findings have not been written."""
+    path = _findings_root(job_id, pair_id) / "findings.json"
+    if not path.exists():
+        raise HTTPException(404, f"No findings yet: {path}")
+    try:
+        payload = json.loads(path.read_text())
+    except Exception as e:
+        raise HTTPException(500, f"findings.json is unreadable: {e}")
+    return path, payload
+
+
+@router.get("/{job_id}/findings")
+async def list_findings(
+    job_id: str,
+    pair_id: str | None = None,
+    severity: str | None = None,
+    kind: str | None = None,
+    origin: str | None = None,
+    min_magnitude_mm: float | None = None,
+    bbox: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+):
+    """The findings, filtered.
+
+    ``severity`` is a comma-separated list (``CRITICAL,WARNING``),
+    ``kind`` a single kind, ``origin`` one of ``mismatch`` / ``spotcheck``
+    / ``all``.  ``bbox`` is ``x0,y0,x1,y1`` in MECH world units.
+    """
+    from core.mismatch.model import KINDS, ORIGINS, SEVERITIES
+
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+
+    _path, payload = _load_findings(job_id, pair_id)
+
+    # ── validate the filters ──────────────────────────────────────────
+    severities = None
+    if severity:
+        severities = [s.strip().upper() for s in severity.split(",") if s.strip()]
+        bad = [s for s in severities if s not in SEVERITIES]
+        if bad:
+            raise HTTPException(
+                400,
+                f"severity must be one of {' | '.join(SEVERITIES)}; "
+                f"got {bad!r}",
+            )
+    if kind and kind not in KINDS and not kind.startswith("SPOT_"):
+        raise HTTPException(
+            400,
+            f"kind must be one of {' | '.join(KINDS)}; got {kind!r}",
+        )
+    origin_filter = None
+    if origin:
+        origin_filter = origin.strip().lower()
+        if origin_filter not in tuple(ORIGINS) + ("all",):
+            raise HTTPException(
+                400,
+                f"origin must be one of {' | '.join(ORIGINS)} | all; "
+                f"got {origin!r}",
+            )
+    if limit < 1 or limit > 5000:
+        raise HTTPException(400, f"limit must be between 1 and 5000; got {limit}")
+    if offset < 0:
+        raise HTTPException(400, f"offset must not be negative; got {offset}")
+
+    box = None
+    if bbox:
+        parts = [p.strip() for p in bbox.split(",")]
+        if len(parts) != 4:
+            raise HTTPException(
+                400, f"bbox must be x0,y0,x1,y1; got {bbox!r}")
+        try:
+            box = tuple(float(p) for p in parts)
+        except ValueError:
+            raise HTTPException(
+                400, f"bbox must be four numbers; got {bbox!r}")
+
+    # ── filter ────────────────────────────────────────────────────────
+    items = list(payload.get("findings") or [])
+    if severities:
+        items = [f for f in items if f.get("severity") in severities]
+    if kind:
+        items = [f for f in items if f.get("kind") == kind]
+    if origin_filter and origin_filter != "all":
+        items = [f for f in items if f.get("origin") == origin_filter]
+    if min_magnitude_mm is not None:
+        items = [f for f in items
+                 if (f.get("magnitude_mm") or 0.0) >= float(min_magnitude_mm)]
+    if box:
+        x0, y0, x1, y1 = box
+        def _inside(f):
+            loc = f.get("location") or []
+            if len(loc) != 2:
+                return False
+            return (min(x0, x1) <= loc[0] <= max(x0, x1)
+                    and min(y0, y1) <= loc[1] <= max(y0, y1))
+        items = [f for f in items if _inside(f)]
+
+    total = len(items)
+    page = items[offset:offset + limit]
+
+    return {
+        "job_id": job_id,
+        "pair_id": pair_id,
+        "status": payload.get("status", "unknown"),
+        "units": payload.get("units") or {},
+        # the summary is UNFILTERED — it describes the whole run
+        "summary": payload.get("summary") or {},
+        "coverage": payload.get("coverage") or {},
+        "warnings": list(payload.get("warnings") or []),
+        "total": total,
+        "returned": len(page),
+        "items": page,
+    }
+
+
+@router.get("/{job_id}/findings.csv")
+async def findings_csv(job_id: str, pair_id: str | None = None):
+    """The findings as CSV."""
+    root = _findings_root(job_id, pair_id)
+    path = root / "findings.csv"
+    if not path.exists():
+        raise HTTPException(404, f"No findings.csv yet: {path}")
+    return FileResponse(str(path), filename="findings.csv",
+                        media_type="text/csv")
+
+
+@router.get("/{job_id}/findings.docx")
+async def findings_docx(job_id: str, pair_id: str | None = None):
+    """The findings report as DOCX."""
+    root = _findings_root(job_id, pair_id)
+    path = root / "findings.docx"
+    if not path.exists():
+        raise HTTPException(404, f"No findings.docx yet: {path}")
+    return FileResponse(
+        str(path), filename="findings.docx",
+        media_type=("application/vnd.openxmlformats-officedocument"
+                    ".wordprocessingml.document"),
+    )
+
+
+@router.get("/{job_id}/findings/{fid}")
+async def get_finding(job_id: str, fid: str):
+    """One finding, by its id (``MM-0001``) or its content hash (uid)."""
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+    _path, payload = _load_findings(job_id)
+    for f in payload.get("findings") or []:
+        if f.get("id") == fid or f.get("uid") == fid:
+            return f
+    raise HTTPException(404, f"No such finding: {fid}")
+
+
+@router.get("/{job_id}/mismatch/policy")
+async def get_mismatch_policy(job_id: str, pair_id: str | None = None):
+    """The resolved mismatch policy and its hash."""
+    from core.mismatch.policy import load_policy
+
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+    root = _findings_root(job_id, pair_id).parent
+    try:
+        pol = load_policy(job_id, pair_root=root)
+    except Exception as e:
+        raise HTTPException(400, f"mismatch policy is invalid: {e}")
+    return {"policy": pol.to_dict(), "policy_hash": pol.policy_hash}
+
+
+@router.put("/{job_id}/mismatch/policy")
+async def put_mismatch_policy(job_id: str, body: dict):
+    """Replace the mismatch policy.  An invalid policy is a 400.
+
+    A **partial** document is merged over the currently resolved policy, so
+    ``{"enabled": false}`` turns the check off without having to restate
+    every family and tolerance.
+    """
+    from core.mismatch.policy import (MismatchPolicy, PolicyError,
+                                      load_policy, policy_hash)
+
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "the request body must be a JSON object")
+    payload = body.get("policy") if isinstance(body.get("policy"), dict) else body
+
+    try:
+        current = load_policy(job_id, pair_root=job_dir(job_id))
+    except Exception as e:
+        raise HTTPException(400, f"the current mismatch policy is invalid: {e}")
+
+    merged = {**current.to_dict(), **payload}
+    try:
+        pol = MismatchPolicy.from_dict(merged)
+    except PolicyError as e:
+        raise HTTPException(400, f"mismatch policy is invalid: {e}")
+    except Exception as e:
+        raise HTTPException(400, f"mismatch policy is invalid: {e}")
+
+    path = job_dir(job_id) / "mismatch_policy.json"
+    path.write_text(json.dumps(pol.to_dict(), indent=2))
+    return {"ok": True, "policy": pol.to_dict(),
+            "policy_hash": policy_hash(pol.to_dict()),
+            "path": str(path)}
+
+
+@router.post("/{job_id}/mismatch/rerun")
+async def rerun_mismatch(job_id: str, pair_id: str | None = None):
+    """Re-run the mismatch check (and the findings merge) for one pair.
+
+    No refit: the grid transform is reused.  The whole chain runs in a
+    threadpool — mismatch → spotcheck dedupe → findings → re-render → the
+    report refresh.
+    """
+    from starlette.concurrency import run_in_threadpool
+
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+    if pair_id is not None:
+        _safe_pair_id(pair_id)
+
+    def _work() -> dict:
+        import core.findings as findings_mod
+        import core.mismatch as mismatch_mod
+        import core.package as package_mod
+        import core.spotcheck as spotcheck_mod
+
+        pair_dir = None
+        if pair_id is not None:
+            from core.pair_runner import pair_root
+            pair_dir = pair_root(job_id, _safe_pair_id(pair_id)) / "cleaned"
+
+        mismatch_mod.run(job_id, pair_dir=pair_dir)
+        spotcheck_mod.run(job_id, pair_dir=pair_dir)
+        findings_mod.run(job_id, pair_dir=pair_dir)
+        package_mod.run(job_id, pair_dir=pair_dir)
+        return {"status": "rerun"}
+
+    await run_in_threadpool(_work)
+    return {"status": "rerun", "job_id": job_id, "pair_id": pair_id}
+
+
 @router.get("/{job_id}/preview.png")
 async def preview(job_id: str):
     """Preview PNG on the FULL extents (stage 8 output) — nothing is cropped."""

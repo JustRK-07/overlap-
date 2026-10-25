@@ -202,13 +202,36 @@ replaces them), and the superimposed DXF still audits clean.
 
 | # | Deliverable | State |
 |---|---|---|
-| 1 | `GET /{job_id}/findings` (filters, paging) | OPEN |
-| 2 | `GET /{job_id}/findings/{fid}` | OPEN |
-| 3 | `GET /{job_id}/findings.csv`, `/findings.docx` | OPEN |
-| 4 | `GET`/`PUT /{job_id}/mismatch/policy` | OPEN |
-| 5 | `POST /{job_id}/mismatch/rerun` | OPEN |
-| 6 | pair artifact allowlist += findings.{json,csv,docx}, mismatch.json | OPEN |
-| 7 | UI Findings panel | OPEN |
+| 1 | `GET /{job_id}/findings` (filters, paging) | VERIFIED |
+| 2 | `GET /{job_id}/findings/{fid}` | VERIFIED |
+| 3 | `GET /{job_id}/findings.csv`, `/findings.docx` | VERIFIED |
+| 4 | `GET`/`PUT /{job_id}/mismatch/policy` | VERIFIED |
+| 5 | `POST /{job_id}/mismatch/rerun` | VERIFIED |
+| 6 | pair artifact allowlist += findings.{json,csv,docx}, mismatch.json | VERIFIED |
+| 7 | UI Findings panel | VERIFIED |
+
+**Verification:** `tests/test_findings_api.py` — 17 tests over the five
+endpoints (filters, the 400s, the 404s, the CSV, the DOCX, the policy
+round-trip and the rerun), and `tests/test_static_assets.py` — 6 tests
+that the front end and the markup agree.
+
+**The UI work turned up two real defects**, both now fixed:
+
+* the **XSS** the review flagged: the axis-suggestion buttons
+  interpolated the *drawing's own label text* into ``innerHTML`` without
+  ``_esc()``.  A DXF label of ``<img src=x onerror=…>`` would have run in
+  the reviewer's browser.  ``tests/test_static_assets.py`` now walks every
+  ``innerHTML`` assignment and fails on an unescaped drawing-derived value.
+* the **step rail** was a fixed 9-column grid for 11 steps, so steps 10
+  and 11 wrapped under steps 1 and 2.  It is now
+  ``repeat(auto-fit, minmax(72px, 1fr))``.
+
+The findings panel replaces the old per-pair issues table and carries the
+plan's columns (id, kind, severity, x, y, offset, |local|, tol, ratio,
+MECH ref, STR ref, message), a coverage banner that **warns in red when a
+family matched no items** (0 items means *not checked*, not *OK*), a kind
+filter, INFO / systematic toggles, and a click-to-locate ring on the
+preview driven by ``preview_meta.world_to_px``.
 
 ### C-8b.7 — performance
 
@@ -269,5 +292,6 @@ replaces them), and the superimposed DXF still audits clean.
 |---|---|---|
 | 2026-10-25 | Analysis | 7 review agents + 3 fix-mapping agents; 84 files; defects independently reproduced |
 | 2026-10-25 | Phase 1 (Tier 1) | **A1–A10 all VERIFIED.** 16 new regression tests; suite 389 → **405 passed**, 24 skipped, 0 failed. Every new test proven to FAIL on the original code (A1/A3/A5–A8 by temporary revert; A2/A4/A9/A10 by construction). |
+| 2026-10-25 | Phase 4 (8b.6) | **C-8b.6 all VERIFIED.** 23 new tests (`tests/test_findings_api.py` + `tests/test_static_assets.py`); suite 428 → **453 passed**, 24 skipped, 0 failed.  The UI work also fixed the XSS the review flagged and the 9-column step rail. |
 | 2026-10-25 | Phase 3 (8b.5) | **C-8b.5 all 13 VERIFIED.** 12 new tests in `tests/test_mismatch_stage.py`; suite 418 → **428 passed**, 24 skipped, 0 failed. The engine is reachable end to end: the stage runs, the QA markers are drawn, the findings are merged, and the pipeline runs them. |
 | 2026-10-25 | Phase 2 (PLAN.md criteria) | **B1–B4 VERIFIED.** 13 new tests in `tests/test_plan_acceptance.py`; suite 405 → **418 passed**, 24 skipped, 0 failed. 11 of the 13 proven to FAIL on the original code by temporary revert of all 9 touched modules. |
