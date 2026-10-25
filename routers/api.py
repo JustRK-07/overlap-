@@ -1196,6 +1196,13 @@ async def get_pair_artifact(job_id: str, pair_id: str, artifact: str):
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "out",
         ),
+        "findings.json":               ("application/json", "out"),
+        "findings.csv":                ("text/csv", "out"),
+        "findings.docx":               (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "out",
+        ),
+        "mismatch.json":               ("application/json", "stages"),
     }
     if artifact not in valid:
         raise HTTPException(

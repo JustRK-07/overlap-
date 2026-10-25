@@ -200,12 +200,14 @@ def _ezdxf_can_draw_text() -> bool:
 def _quiet_ezdxf_font_warnings():
     """Silence ezdxf's "no default font found" chatter during a render.
 
-    ezdxf logs one such line per TEXT/MTEXT it draws.  The preview handles
-    the missing-font case deliberately (a stub ``FontFace`` — see
-    :func:`_patch_font_cache`), so the warning is expected noise, but it
-    would otherwise print one line per entity.
+    ezdxf logs one such line per TEXT/MTEXT it draws, under the ``ezdxf``
+    logger.  The preview handles the missing-font case deliberately (a stub
+    ``FontFace`` — see :func:`_patch_font_cache`), so the warning is
+    expected noise, but it would otherwise print one line per entity.
     """
-    loggers = [logging.getLogger("ezdxf.fonts"), logging.getLogger("ezdxf.properties")]
+    loggers = [logging.getLogger("ezdxf"),
+               logging.getLogger("ezdxf.fonts"),
+               logging.getLogger("ezdxf.properties")]
     old = [lg.level for lg in loggers]
     for lg in loggers:
         lg.setLevel(logging.ERROR)
@@ -922,6 +924,38 @@ def _overlay_section(payload: dict | None) -> dict:
     return {k: payload[k] for k in keep if k in payload}
 
 
+def _mismatch_section(payload: dict | None) -> dict:
+    """The MECH⇄STR mismatch result, as ``report.json["mismatch"]`` (§4)."""
+    if not payload:
+        return {}
+    findings = payload.get("findings") or []
+    systematic = [f for f in findings if f.get("kind") == "SYSTEMATIC_OFFSET"]
+    policy = payload.get("policy") or {}
+    summary = payload.get("summary") or {}
+    if not summary and findings:
+        try:
+            from core.mismatch.model import summarize
+            summary = summarize(findings)
+        except Exception:
+            summary = {}
+    return {
+        "enabled": bool(payload.get("enabled", policy.get("enabled", True))),
+        "status": payload.get("status", "unknown"),
+        "policy_hash": payload.get("policy_hash"),
+        "units": payload.get("units") or {},
+        "source_docs": payload.get("source_docs"),
+        "features": payload.get("features") or {},
+        "coverage": payload.get("coverage") or {},
+        "summary": summary,
+        "systematic": systematic,
+        "fit_context": payload.get("fit_context") or {},
+        "top": findings[:10],
+        "warnings": list(payload.get("warnings") or []),
+        "timings_s": payload.get("timings_s") or {},
+        "truncated": bool(payload.get("truncated", False)),
+    }
+
+
 def _build_report(job_id: str, dxf_path: Path, *, root: Path | None = None,
                   preview: dict | None = None, counts: dict | None = None,
                   pair_dir=None) -> dict:
@@ -982,6 +1016,10 @@ def _build_report(job_id: str, dxf_path: Path, *, root: Path | None = None,
     overlay_report = _load_json(d / "stages" / overlay.REPORT_NAME)
     if overlay_report is not None:
         report["overlay"] = _overlay_section(overlay_report)
+
+    mismatch_report = _load_json(d / "stages" / "mismatch.json")
+    if mismatch_report is not None:
+        report["mismatch"] = _mismatch_section(mismatch_report)
 
     report["roles"] = _manifest_section(job_id)
     report["counts"] = counts if counts is not None else _empty_counts()

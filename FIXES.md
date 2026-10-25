@@ -177,19 +177,26 @@ and to keep a retry-without-MTEXT path for a font-specific crash (reported as
 
 | # | Deliverable | File | State |
 |---|---|---|---|
-| 1 | `run(job_id, *, pair_dir=None)` stage entry point | `core/mismatch/__init__.py` | OPEN |
-| 2 | `resolve_pair(..., stage="converted"\|"cleaned")` | `core/roles.py:208` | OPEN |
-| 3 | `pair.json` gains `mech_converted`/`str_converted` | `core/pair_runner.py` | OPEN |
-| 4 | `pipelines.resume_after_axes` stage sequence | `pipelines.py:133-184` | OPEN |
-| 5 | `pair_runner.run_pair` stage sequence | `core/pair_runner.py:204-231` | OPEN |
-| 6 | `spotcheck.run(dedupe_against=…)` + `superseded` in the JSON | `core/spotcheck.py:539,751` | OPEN |
-| 7 | `core/findings.py` — the merger | new | OPEN |
-| 8 | `core/mismatch/render.py` — the QA layers | new | OPEN |
-| 9 | `report["mismatch"]` section | `core/package.py:833-919` | OPEN |
-| 10 | `to_dict()` gains `status` + `source_docs`; flat `features` | `core/mismatch/__init__.py:119` | OPEN |
-| 11 | `policy.enabled` short-circuit | stage | OPEN |
-| 12 | `policy.source_docs` resolution + fallback warning | stage | OPEN |
-| 13 | non-fatal → `findings.json` `status:"error"` | stage | OPEN |
+| 1 | `run(job_id, *, pair_dir=None)` stage entry point | `core/mismatch/__init__.py` | VERIFIED |
+| 2 | `resolve_pair(..., stage="converted"\|"cleaned")` | `core/roles.py:208` | VERIFIED |
+| 3 | `pair.json` gains `mech_converted`/`str_converted` | `core/pair_runner.py` | VERIFIED |
+| 4 | `pipelines.resume_after_axes` stage sequence | `pipelines.py:133-184` | VERIFIED |
+| 5 | `pair_runner.run_pair` stage sequence | `core/pair_runner.py:204-231` | VERIFIED |
+| 6 | `spotcheck.run(dedupe_against=…)` + `superseded` in the JSON | `core/spotcheck.py` | VERIFIED |
+| 7 | `core/findings.py` — the merger | new | VERIFIED |
+| 8 | `core/mismatch/render.py` — the QA layers | new | VERIFIED |
+| 9 | `report["mismatch"]` section | `core/package.py` | VERIFIED |
+| 10 | `to_dict()` gains `status` + `source_docs`; `summary` | `core/mismatch/__init__.py:119` | VERIFIED |
+| 11 | `policy.enabled` short-circuit | stage | VERIFIED |
+| 12 | `policy.source_docs` resolution + fallback warning | stage | VERIFIED |
+| 13 | non-fatal → `findings.json` `status:"error"` | stage | VERIFIED |
+
+**Verification:** `tests/test_mismatch_stage.py` — 12 tests.  The engine now
+runs on the synthetic mismatch scene and reports **13 findings (12 CRITICAL,
+1 WARNING)** — exactly the 13 defects PLAN_MISMATCH §6.1 defines.  The
+markers land on the four ``QA|MISMATCH_*`` layers (96 entities), carry
+their id / uid / kind in ``OVERLAPQA`` XDATA, are **idempotent** (a re-run
+replaces them), and the superimposed DXF still audits clean.
 
 ### C-8b.6 — API + UI
 
@@ -262,4 +269,5 @@ and to keep a retry-without-MTEXT path for a font-specific crash (reported as
 |---|---|---|
 | 2026-10-25 | Analysis | 7 review agents + 3 fix-mapping agents; 84 files; defects independently reproduced |
 | 2026-10-25 | Phase 1 (Tier 1) | **A1–A10 all VERIFIED.** 16 new regression tests; suite 389 → **405 passed**, 24 skipped, 0 failed. Every new test proven to FAIL on the original code (A1/A3/A5–A8 by temporary revert; A2/A4/A9/A10 by construction). |
+| 2026-10-25 | Phase 3 (8b.5) | **C-8b.5 all 13 VERIFIED.** 12 new tests in `tests/test_mismatch_stage.py`; suite 418 → **428 passed**, 24 skipped, 0 failed. The engine is reachable end to end: the stage runs, the QA markers are drawn, the findings are merged, and the pipeline runs them. |
 | 2026-10-25 | Phase 2 (PLAN.md criteria) | **B1–B4 VERIFIED.** 13 new tests in `tests/test_plan_acceptance.py`; suite 405 → **418 passed**, 24 skipped, 0 failed. 11 of the 13 proven to FAIL on the original code by temporary revert of all 9 touched modules. |

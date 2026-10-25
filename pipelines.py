@@ -22,7 +22,11 @@ Stages:
   7.  axes           — AUTO-SCAN + WAIT for the user's convention
   8.  fit            — similarity transform (Umeyama + RANSAC) + quality gates
   9.  overlay        — import STR via xref, transform, repaint per-source layers
+  9.4 mismatch       — MECH⇄STR item-level misalignment (bolts, supports,
+                       containment, clash); non-fatal
   9.5 spot-check     — support/clash issues; non-fatal
+  9.6 findings       — merge the native findings with the remaining
+                       spot-check issues into out/findings.{json,csv,docx}
   10. package        — preview PNG, preview grid PNG, report JSON
   11. done           — final marker
 """
@@ -130,6 +134,19 @@ def resume_after_axes(job_id: str, *, pair_id: str | None = None) -> None:
         update_status(job_id, message=f"Overlay failed: {e}", error=str(e))
         return
 
+    # Stage 9.4 — mismatch (MECH⇄STR item-level misalignment).
+    # NON-FATAL: the stage writes findings.json status="error" itself, so
+    # this is only a backstop — the UI must never show "0 findings" for a
+    # check that did not run.
+    update_status(job_id, state="running", current_step=9,
+                  step_name="Checking MECH/STR alignment",
+                  message="Detecting MECH/STR mismatches...")
+    try:
+        _run_stage_module("mismatch", job_id, pair_dir=pair_dir_arg)
+        update_status(job_id, message="Mismatch check complete.")
+    except Exception as e:
+        update_status(job_id, message=f"Mismatch check failed: {e}")
+
     # Stage 9.5 — spotcheck (auto-detect MECH↔STR support issues + intra clashes).
     update_status(job_id, state="running", current_step=9,
                   step_name="Spot-checking support",
@@ -167,9 +184,15 @@ def resume_after_axes(job_id: str, *, pair_id: str | None = None) -> None:
             except Exception as e:
                 update_status(job_id, message=f"STR-intra skipped: {e}")
 
-        # 7.5c — cross-drawing (merges everything into spotcheck.json)
+        # 7.5c — cross-drawing (merges everything into spotcheck.json).
+        # Its `dedupe_against` defaults to stages/mismatch.json, so a
+        # cross-drawing issue the mismatch engine already reported is
+        # moved to `superseded` instead of being reported twice.
         _run_stage_module("spotcheck", job_id,
                           enabled_checks=enabled_checks, pair_dir=pair_dir_arg)
+        # 7.5d — merge the native findings with the remaining spot-check
+        # issues into the canonical out/findings.{json,csv,docx}.
+        _run_stage_module("findings", job_id, pair_dir=pair_dir_arg)
         _run_stage_module("spotcheck_annotate", job_id, pair_dir=pair_dir_arg)
         update_status(job_id, message="Spot-check complete.")
     except Exception as e:

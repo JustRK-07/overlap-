@@ -106,11 +106,16 @@ for you, and 8–11 run after you confirm.
 | 7 | **Grid axes** | `core/axes.py`, `core/grid.py` | ⏸ **waits for you.** Auto-suggest a prefix, then match the axes you confirm |
 | 8 | Fit | `core/fit.py` | shared grid intersections → similarity transform (Umeyama + RANSAC) with quality gates → `transform.json`, `grid_mech.json`, `grid_str.json` |
 | 9 | Overlay | `core/overlay.py` | import STR via `xref.Loader`, transform in one `ezdxf.transform.inplace`, then paint `MECH\|`/`STR\|` layers and draw the QA grid |
+| 9.4 | Mismatch | `core/mismatch/` | MECH⇄STR item-level misalignment (bolts, supports, containment, clash) → `stages/mismatch.json` + `QA|MISMATCH_*` markers |
 | 9.5 | Spot-check | `core/spotcheck.py`, `core/{mech,str}_intra.py`, `core/spotcheck_annotate.py` | support / clash issues + an annotated DXF |
+| 9.6 | Findings | `core/findings.py` | the native findings + the remaining spot-check issues → `out/findings.{json,csv,docx}` |
 | 10 | Package | `core/package.py` | `preview.png` (full extents), `preview_grid.png` (grid close-up), `preview_meta.json`, `report.json` |
 | 11 | Done | — | download links |
 
 Spot-check is non-fatal: if it raises, the job still finishes and says so.
+The mismatch stage is non-fatal too, and it distinguishes three states —
+`ok`, `disabled` (the policy turned it off) and `error`. A check that did
+not run is **never** reported as "0 findings".
 
 ---
 
@@ -126,6 +131,10 @@ came from, so you can switch one drawing off in any CAD viewer:
 | `QA\|GRID` (ACI 3) | the MECH gridlines, a CIRCLE per intersection, and a `"{label} r={residual}"` TEXT per correspondence |
 | `QA\|GRID_STR` (ACI 6) | the STR gridlines mapped through the fitted transform, with an X per intersection |
 | `QA\|OUTLIER` (ACI 1) | an X at every intersection the fit rejected |
+| `QA\|MISMATCH_CRITICAL` (ACI 1) | a mismatch marker: circle + offset arrow + label |
+| `QA\|MISMATCH_WARNING` (ACI 30) | the same, for a warning |
+| `QA\|MISMATCH_INFO` (ACI 8) | the same, for an informational finding |
+| `QA\|MISMATCH_REF` (ACI 4) | ghost outlines of the two items involved |
 
 The separator `|` is the constant `core.overlay.SOURCE_LAYER_SEP`.
 
@@ -348,7 +357,8 @@ jobs/<job_id>/
 │   ├── files.json            the roles manifest
 │   ├── clean_policy.json     the derived (and editable) cleaning policy
 │   ├── audit.json            per-stage recover/audit summaries
-│   └── overlay_report.json   what stage 9 imported, renamed and failed on
+│   ├── overlay_report.json   what stage 9 imported, renamed and failed on
+│   └── mismatch.json         the MECH⇄STR mismatch result (diagnostic)
 ├── transform.json            the fit (see above)
 ├── grid_mech.json, grid_str.json
 └── out/
@@ -358,7 +368,8 @@ jobs/<job_id>/
     ├── preview_grid.png              grid box + 10%
     ├── preview_meta.json             world → pixel map
     ├── report.json                   the audit trail
-    └── spotcheck.{json,docx}
+    ├── spotcheck.{json,docx}
+    └── findings.{json,csv,docx}   the merged findings
 ```
 
 A multi-pair job instead nests each pair under `out/pairs/<pair_id>/` with the

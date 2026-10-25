@@ -36,6 +36,7 @@ from pathlib import Path
 
 __all__ = [
     "detect",
+    "run",
     "MismatchResult",
     "DEFAULT_POLICY",
     "MismatchPolicy",
@@ -103,6 +104,8 @@ class MismatchResult:
     truncated: bool = False
     out_dir: object = None
     affine: object = None
+    status: str = "ok"
+    source_docs: str = "converted"
 
     # ── convenience ────────────────────────────────────────────────
     def __len__(self) -> int:
@@ -120,6 +123,8 @@ class MismatchResult:
         """A JSON-safe dump — the shape of ``stages/mismatch.json``."""
         from .model import finding_to_dict
         return {
+            "status": self.status,
+            "source_docs": self.source_docs,
             "policy": self.policy.to_dict() if self.policy is not None else None,
             "policy_hash": self.policy_hash,
             "units": {"mech_insunits": self.mech_insunits,
@@ -128,6 +133,7 @@ class MismatchResult:
             "features": self.feature_counts,
             "skipped": self.skipped,
             "coverage": self.coverage,
+            "summary": self.summary(),
             "fit_context": self.fit_context,
             "timings_s": {k: round(float(v), 6) for k, v in self.timings_s.items()},
             "warnings": list(self.warnings),
@@ -248,7 +254,112 @@ def detect(mech_doc, str_doc, affine=None, *, policy=None, fit_ctx=None,
         units_assumed=bool(assumed),
         feature_counts={"MECH": mech_fs.counts(), "STR": str_fs.counts()},
         fit_context=fit.to_dict(), warnings=warnings, truncated=bool(truncated),
-        out_dir=out_dir, affine=affine)
+        out_dir=out_dir, affine=affine, status="ok")
+
+
+# ── the stage entry point ───────────────────────────────────────────────────
+
+def run(job_id: str, *, pair_dir: Path | None = None) -> None:
+    """Stage 8b.5: detect the MECH⇄STR mismatches for one pair.
+
+    Writes ``<root>/stages/mismatch.json`` and draws the QA markers into
+    ``<root>/out/superimposed.dxf``.  **Non-fatal**: on any error it writes
+    ``<root>/out/findings.json`` with ``status="error"`` and a message, and
+    returns normally — the UI must never show "0 findings" for a check that
+    did not run.
+    """
+    import json
+
+    from jobs import job_dir
+
+    from core import dxfio
+    from core.roles import resolve_pair
+
+    from .policy import load_policy
+
+    root = Path(pair_dir).parent if pair_dir is not None else job_dir(job_id)
+    stages = root / "stages"
+    out_dir = root / "out"
+    stages.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    mismatch_path = stages / "mismatch.json"
+    findings_path = out_dir / "findings.json"
+
+    def _write_error(message: str) -> None:
+        payload = {"status": "error", "message": message,
+                   "findings": [], "warnings": [message]}
+        try:
+            findings_path.write_text(json.dumps(payload, indent=2))
+            mismatch_path.write_text(json.dumps(payload, indent=2))
+        except Exception:
+            pass
+
+    try:
+        pol = load_policy(job_id, pair_root=root)
+
+        # `policy.enabled` — a disabled check is not "zero findings".
+        if not pol.enabled:
+            payload = {"status": "disabled", "source_docs": pol.source_docs,
+                       "policy": pol.to_dict(), "policy_hash": pol.policy_hash,
+                       "warnings": ["mismatch detection is disabled by policy"],
+                       "findings": []}
+            mismatch_path.write_text(json.dumps(payload, indent=2))
+            findings_path.write_text(json.dumps(
+                {"status": "disabled", "generated_at": _now_iso(),
+                 "units": {}, "summary": {}, "coverage": {},
+                 "warnings": ["mismatch detection is disabled by policy"],
+                 "truncated": False, "findings": []}, indent=2))
+            return
+
+        # ── the source drawings ───────────────────────────────────────────
+        warnings: list[str] = []
+        source_docs = pol.source_docs
+        try:
+            mech_path, str_path = resolve_pair(job_id, pair_dir,
+                                               stage=source_docs)
+        except Exception:
+            if source_docs != "cleaned":
+                source_docs = "cleaned"
+                mech_path, str_path = resolve_pair(job_id, pair_dir,
+                                                   stage="cleaned")
+                warnings.append(
+                    "source_docs_fallback_cleaned: the converted MECH/STR DXF "
+                    "was not found; the cleaned files were used instead")
+            else:
+                raise
+
+        # ── the fit ───────────────────────────────────────────────────────
+        transform_path = root / "transform.json"
+        transform = json.loads(transform_path.read_text())
+
+        result = detect(mech_path, str_path, affine=transform, policy=pol,
+                        fit_ctx=transform, out_dir=out_dir)
+        result.status = "ok"
+        result.source_docs = source_docs
+        for w in warnings:
+            result.warnings.append(w)
+
+        payload = result.to_dict()
+        mismatch_path.write_text(json.dumps(payload, indent=2, default=str))
+
+        # ── the QA markers in the superimposed DXF ─────────────────────────
+        try:
+            from .render import draw_into
+            draw_into(root, result, policy=pol)
+        except Exception as exc:            # noqa: BLE001 — non-fatal
+            result.warnings.append(f"mismatch markers not drawn: {exc}")
+
+    except Exception as exc:                # noqa: BLE001 — non-fatal by contract
+        _write_error(f"{type(exc).__name__}: {exc}")
+        print(f"  mismatch check failed (non-fatal): {exc}")
+        return
+
+
+def _now_iso() -> str:
+    """The current UTC time as an ISO-8601 string (second resolution)."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 # ── input plumbing ──────────────────────────────────────────────────────────

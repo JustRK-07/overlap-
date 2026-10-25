@@ -464,6 +464,81 @@ CROSS_DRAWING_TYPES = (
     "GRID_MISALIGN",
 )
 
+#: PLAN_MISMATCH §5 — a spot-check issue is superseded by a native mismatch
+#: finding of an equivalent kind.  GRID_MISALIGN has no native equivalent
+#: (the mismatch engine reports the *cause*, not a grid offset) and is
+#: therefore never superseded.
+DEDUPE_EQUIVALENTS = {
+    "NO_BEAM_SUPPORT": ("SUPPORT_OFF_MEMBER", "SUPPORT_POINT_OFF_MEMBER",
+                        "MISSING_COUNTERPART"),
+    "COLUMN_CLASH": ("CLASH",),
+    "BAY_OVERHANG": ("OUTSIDE_OUTLINE",),
+}
+
+#: The proximity below which a spot-check issue is considered the *same*
+#: defect as a native finding.  PLAN_MISMATCH §5: "max(500 mm, half the
+#: footprint diagonal)" — the footprint diagonal is not carried on an
+#: ``Issue``, so the 500 mm floor is used and converted to drawing units.
+DEDUPE_RADIUS_MM = 500.0
+
+
+def _dedupe_against_findings(issues: list, payload: dict | None,
+                             *, mm_per_unit: float | None) -> tuple[list, list]:
+    """``(kept, superseded)`` — the issues a native finding already covers.
+
+    ``payload`` is ``stages/mismatch.json``.  An issue is superseded when a
+    native finding of an equivalent kind refers to the same MECH entity, or
+    sits within :data:`DEDUPE_RADIUS_MM` of it.
+    """
+    kept: list = []
+    superseded: list = []
+    if not payload:
+        return kept, superseded
+
+    findings = payload.get("findings") or []
+    by_kind: dict[str, list] = {}
+    for f in findings:
+        by_kind.setdefault(str(f.get("kind", "")), []).append(f)
+    if not by_kind:
+        return kept, superseded
+
+    mm = float(mm_per_unit) if mm_per_unit else None
+    radius_units = (DEDUPE_RADIUS_MM / mm) if mm else DEDUPE_RADIUS_MM
+
+    for issue in issues:
+        equivalents = DEDUPE_EQUIVALENTS.get(issue.type)
+        if not equivalents:
+            kept.append(issue)
+            continue
+        candidates = []
+        for kind in equivalents:
+            candidates.extend(by_kind.get(kind, ()))
+        if not candidates:
+            kept.append(issue)
+            continue
+
+        uid = None
+        for f in candidates:
+            ref = f.get("mech_ref") or {}
+            if ref.get("handle") and ref.get("handle") == issue.mech_entity:
+                uid = f.get("uid") or f.get("id")
+                break
+            loc = f.get("location")
+            if loc and len(loc) == 2:
+                try:
+                    d = math.hypot(float(loc[0]) - float(issue.mech_x),
+                                   float(loc[1]) - float(issue.mech_y))
+                except (TypeError, ValueError):
+                    continue
+                if d <= radius_units:
+                    uid = f.get("uid") or f.get("id")
+                    break
+        if uid:
+            superseded.append({**asdict(issue), "by": uid})
+        else:
+            kept.append(issue)
+    return kept, superseded
+
 
 def _cluster_intra(issues: list, *, radius: float) -> list:
     """Group issues of the same type within `radius` of each other.
@@ -543,7 +618,8 @@ def run(job_id: str, *,
         column_tolerance: float = 100.0,
         max_issues: int = 500,
         cluster_radius: float = 5000.0,
-        pair_dir: Path | None = None) -> SpotCheckResult:
+        pair_dir: Path | None = None,
+        dedupe_against: Path | None = None) -> SpotCheckResult:
     """Stage 7.5: detect support issues. Returns SpotCheckResult.
 
     Merges 3 sources into a single issues list:
@@ -555,6 +631,11 @@ def run(job_id: str, *,
     (`jobs/<id>/out/pairs/<pair_id>/cleaned/`) for Slice-1 multi-pair
     runs. When None, the legacy single-pair path is taken — bit-equivalent
     behaviour.
+
+    `dedupe_against` is the native-findings JSON (PLAN_MISMATCH §5).  It
+    defaults to `<root>/stages/mismatch.json` when that file exists: a
+    cross-drawing issue that a native finding already covers is moved to
+    `superseded` instead of being reported twice.
 
     Default tolerances (industry-researched):
       beam_tolerance=500mm     — beam flange width (~300mm) + erection ±10mm
@@ -583,6 +664,11 @@ def run(job_id: str, *,
         root = Path(pair_dir).parent
     else:
         root = d
+    if dedupe_against is None:
+        # PLAN_MISMATCH §5: the native findings supersede the equivalent
+        # spot-check issues by default.
+        candidate = root / "stages" / "mismatch.json"
+        dedupe_against = candidate if candidate.exists() else None
     from .roles import resolve_pair
     mech_path, str_path = resolve_pair(job_id, pair_dir)   # explicit roles
 
@@ -723,6 +809,22 @@ def run(job_id: str, *,
     for idx, iss in enumerate(result.issues, start=1):
         iss.id = f"ISSUE-{idx:03d}"
 
+    # ── Supersede what the mismatch check already reported ──────────────
+    # A cross-drawing issue that a native finding already covers must not
+    # be reported twice (PLAN_MISMATCH §5).  It moves to `superseded`.
+    superseded: list = []
+    if dedupe_against is not None and Path(dedupe_against).exists():
+        try:
+            native = json.loads(Path(dedupe_against).read_text())
+        except Exception as e:
+            native = None
+            print(f"  spotcheck: failed to read {dedupe_against}: {e}")
+        if native:
+            mm_per_unit = ((native.get("units") or {}).get("mm_per_unit"))
+            kept, superseded = _dedupe_against_findings(
+                result.issues, native, mm_per_unit=mm_per_unit)
+            result.issues = kept
+
     # Final ordering: severity (CRITICAL > WARNING > INFO), then id
     sev_rank = {"CRITICAL": 0, "WARNING": 1, "INFO": 2, "": 3}
 
@@ -758,6 +860,7 @@ def run(job_id: str, *,
         "truncated": truncated,
         "enabled_checks": list(enabled_checks),
         "issues": [asdict(i) for i in result.issues],
+        "superseded": superseded,
     }, indent=2))
 
     return result
