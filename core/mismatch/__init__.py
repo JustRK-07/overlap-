@@ -213,8 +213,11 @@ def detect(mech_doc, str_doc, affine=None, *, policy=None, fit_ctx=None,
         FitContext.from_transform_json(fit_ctx, mm_per_unit=mm,
                                        k_fit=float(pol.context.k_fit))
     env = Env(policy=pol, mm=mm, mech=mech_fs, str=str_fs, clf=clf, fit=fit,
-              grid_spacing_mm=(None if fit.median_spacing_mm is None
-                               else fit.median_spacing_mm * mm))
+              # `FitContext.median_spacing_mm` is ALREADY in millimetres
+              # (context.py converts transform.json's MECH-unit spacing).
+              # Multiplying by `mm` again made the §1.4 search cap 1000×
+              # too loose on a metre drawing.
+              grid_spacing_mm=fit.median_spacing_mm)
     if fit.weak:
         warnings.append(f"fit_quality_{fit.status}: the grid fit did not pass its "
                         f"quality gate; every finding is marked low confidence")

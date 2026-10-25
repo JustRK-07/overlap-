@@ -806,9 +806,13 @@ def _build_bands(feats: list, ctx: _Ctx) -> tuple[list, list, set]:
         along = max(f.w, f.h)
         across = min(f.w, f.h)
         u = (f.ux, f.uy) if f.w >= f.h else (-f.uy, f.ux)
+        # The band spans the LONG axis `u`, and `along` is that axis' length.
+        # `f.w` is the length of the *first drawn edge*, which is the short
+        # side whenever the polyline was drawn short-edge-first — projecting
+        # that onto `u` collapsed the band to a point.
         p0, p1 = geom.segment_axis_params(
-            (f.cx - f.ux * f.w / 2.0, f.cy - f.uy * f.w / 2.0),
-            (f.cx + f.ux * f.w / 2.0, f.cy + f.uy * f.w / 2.0),
+            (f.cx - u[0] * along / 2.0, f.cy - u[1] * along / 2.0),
+            (f.cx + u[0] * along / 2.0, f.cy + u[1] * along / 2.0),
             (f.cx, f.cy), u)
         band = _make_band(f,
                           (f.cx + u[0] * p0, f.cy + u[1] * p0),

@@ -356,6 +356,7 @@ def _ensure_dirs(d: Path) -> None:
     (d / "converted").mkdir(parents=True, exist_ok=True)
     (d / "cleaned").mkdir(parents=True, exist_ok=True)
     (d / "axes").mkdir(parents=True, exist_ok=True)
+    (d / "stages").mkdir(parents=True, exist_ok=True)
     (d / "out").mkdir(parents=True, exist_ok=True)
 
 

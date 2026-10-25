@@ -263,6 +263,12 @@ def run(job_id: str) -> None:
     cleaned = d / "cleaned"
     stages = d / "stages"
     stages.mkdir(exist_ok=True)
+    # `doc.saveas()` raises FileNotFoundError when the parent is missing, and
+    # the per-file handler swallows that into clean_stats.json — the job then
+    # dies at stage 8 with "cleaned DXF missing".  Legacy job dirs have no
+    # `cleaned/` at all, so create it here rather than relying on
+    # `jobs._ensure_dirs` (which only runs at job creation).
+    cleaned.mkdir(parents=True, exist_ok=True)
 
     # Load the policy derived by stage 3.5b (clean_policy). If missing
     # (legacy job / no stage 3.5b yet), fall back to DEFAULT_POLICY.

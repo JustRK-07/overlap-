@@ -11,6 +11,7 @@ Two flavours of test:
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import sys
 import uuid
@@ -358,6 +359,34 @@ def test_transform_json_legacy_keys_present(fit_job):
     assert Affine2D.from_json(t) == Affine2D(t["a"], t["b"], t["c"], t["d"], t["tx"], t["ty"])
     assert len(t["matrix"]) == 2 and len(t["matrix"][0]) == 3
     assert t["n_total"] == len(t["correspondences"]) == len(t["intersections"])
+
+
+def test_transform_json_exposes_the_true_column_scales(fit_job):
+    """A10: `scale_x`/`scale_y` are the matrix diagonal; `column_scales` is
+    the real scale.
+
+    The docstring and the README both called the legacy keys "the column
+    norms", but the code writes ``affine.a`` / ``affine.d`` — the diagonal.
+    For a rotated similarity those differ by ``cos(rotation_deg)``, so the
+    legacy keys under-report the scale by 0.86 % at 7.5 degrees.  The code
+    keeps the old contract (the diagonal) and adds the true column norms.
+    """
+    from core import fit as fit_mod
+    job_id, pair, d = fit_job(synth.HARD)
+    fit_mod.run(job_id)
+    t = json.loads((d / "transform.json").read_text())
+
+    # the legacy keys stay the diagonal — the old contract
+    assert t["scale_x"] == t["a"] and t["scale_y"] == t["d"]
+
+    # the new key is the true column norm
+    assert t["column_scales"] == pytest.approx([t["scale"], t["scale"]])
+
+    # and for a rotated fit the diagonal is demonstrably NOT the scale
+    assert t["rotation_deg"] == pytest.approx(7.5, abs=1e-9)
+    assert t["scale_x"] == pytest.approx(
+        t["scale"] * math.cos(math.radians(7.5)))
+    assert t["scale_x"] != pytest.approx(t["scale"])
     assert t["n_inliers"] + len(t["outliers"]) == t["n_total"]
     assert set(t["quality"]) == {"status", "warnings"}
 

@@ -38,13 +38,14 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .. import geom
 from ..classify import Classifier
 from ..features import Feature, FeatureSet
 from ..model import EntityRef, Finding
 from ..policy import MismatchPolicy
 
-__all__ = ["Env", "CHECKS", "polygon_of", "ref_of", "describe", "extent_along",
-           "unit_of", "overlap", "TOL_EFF_FLOOR_MM"]
+__all__ = ["Env", "CHECKS", "polygon_of", "footprint_bbox", "ref_of", "describe",
+           "extent_along", "unit_of", "overlap", "TOL_EFF_FLOOR_MM"]
 
 #: The four checks, in the order §1.3 lists them and in the order they run.
 CHECKS = ("bolts", "support", "containment", "clash")
@@ -69,14 +70,30 @@ def polygon_of(f: Feature) -> np.ndarray:
     """The ``(N, 2)`` ring a footprint-ish feature actually occupies.
 
     A rect is its four corners (in the world-mapped order, so the winding is
-    counter-clockwise), a polygon its flattened ring.  Anything else is
-    empty.
+    counter-clockwise), a polygon its flattened ring, a **band** its rectangle
+    (centreline length × 2·half-width).  Anything else is empty.
     """
     if f.kind == "rect":
         return np.asarray(f.corners(), dtype=float)
     if f.kind == "polygon":
         return np.asarray(f.ring(), dtype=float)
+    if f.kind == "band":
+        return geom.rect_corners(f.centre(), (f.ux, f.uy), f.length(), 2.0 * f.hw)
     return np.zeros((0, 2), dtype=float)
+
+
+def footprint_bbox(f: Feature) -> tuple:
+    """The bbox of a feature's **body**.
+
+    :meth:`Feature.bbox` reports a band's *centreline* — the support check
+    measures the distance to the centreline, so it needs that.  The clash
+    check needs the band's actual rectangle.
+    """
+    if f.kind == "band":
+        ring = geom.rect_corners(f.centre(), (f.ux, f.uy), f.length(), 2.0 * f.hw)
+        return (float(ring[:, 0].min()), float(ring[:, 1].min()),
+                float(ring[:, 0].max()), float(ring[:, 1].max()))
+    return f.bbox()
 
 
 def ref_of(f: Feature, family: str) -> EntityRef:

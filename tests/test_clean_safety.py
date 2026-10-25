@@ -2,6 +2,8 @@
 """test_clean_safety.py — step 3: cleaning never deletes structure by shape/prefix alone."""
 from __future__ import annotations
 
+import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -15,7 +17,13 @@ sys.path.insert(0, str(HERE.parent))
 
 import synth  # noqa: E402
 from core import clean_v1, clean_v2  # noqa: E402
-from core.clean_common import layer_matches, reachable_blocks  # noqa: E402
+from core.clean_common import (  # noqa: E402
+    _compile_label_re,
+    _strip_triangles_in,
+    layer_matches,
+    reachable_blocks,
+)
+from core.clean_policy import CleaningPolicy  # noqa: E402
 
 PREFIX = "TP104-"
 
@@ -168,3 +176,113 @@ def test_insunits_recorded(cleaner, fx_synth_hard, tmp_path):
     _, sstats = _clean(cleaner, fx_synth_hard.str_path, tmp_path, is_str=True)
     assert mstats["insunits"] == 4
     assert sstats["insunits"] == 6
+
+
+# ── A6/A7/A8 — regressions found in the 2026-10-25 review ──────────────────
+
+def test_hatch_triangle_path_is_removed_from_a_marker_layer():
+    """A6: a 3-vertex HATCH path on a marker layer must be REMOVED.
+
+    ``BoundaryPaths`` has no ``remove()`` in ezdxf 1.4.4, so the old code
+    fell back to ``path.vertices = []`` — which emptied a polyline path
+    without removing it, and was impossible for an ``EdgePath`` (no
+    ``.vertices`` at all).  The delivered file carried a degenerate
+    zero-vertex boundary path, and ``doc.audit()`` reported no error.
+    """
+    doc = ezdxf.new("R2018")
+    doc.layers.add("REV-A")
+    msp = doc.modelspace()
+
+    # a HATCH whose single boundary path is a 3-vertex triangle
+    h = msp.add_hatch(color=1, dxfattribs={"layer": "REV-A"})
+    h.paths.add_polyline_path([(0.0, 0.0, 0.0), (100.0, 0.0, 0.0),
+                               (50.0, 80.0, 0.0)], is_closed=True)
+    assert len(h.paths) == 1
+
+    # a second HATCH with a 4-vertex path — it must survive
+    h2 = msp.add_hatch(color=1, dxfattribs={"layer": "REV-A"})
+    h2.paths.add_polyline_path([(0.0, 0.0, 0.0), (100.0, 0.0, 0.0),
+                                (100.0, 80.0, 0.0), (0.0, 80.0, 0.0)],
+                               is_closed=True)
+    assert len(h2.paths) == 1
+
+    removed = _strip_triangles_in(msp, container_name="")
+    assert removed == 1, "exactly the triangular HATCH must be reported"
+    assert len(h.paths) == 0, "the triangular path must be REMOVED, not emptied"
+    assert len(h2.paths) == 1, "the 4-vertex path must survive"
+
+    # the surviving HATCH must still be a valid, auditable entity
+    auditor = doc.audit()
+    assert auditor.has_errors is False, [e.message for e in auditor.errors]
+
+
+def test_hatch_edge_path_triangle_is_removed_from_a_marker_layer():
+    """A6: an ``EdgePath`` triangle (3 line edges) counts too."""
+    doc = ezdxf.new("R2018")
+    doc.layers.add("REV-A")
+    msp = doc.modelspace()
+    h = msp.add_hatch(color=1, dxfattribs={"layer": "REV-A"})
+    p = h.paths.add_edge_path()
+    p.add_line((0.0, 0.0), (100.0, 0.0))
+    p.add_line((100.0, 0.0), (50.0, 80.0))
+    p.add_line((50.0, 80.0), (0.0, 0.0))
+    assert len(h.paths) == 1
+
+    removed = _strip_triangles_in(msp, container_name="")
+    assert removed == 1
+    assert len(h.paths) == 0
+
+
+def test_clean_creates_its_output_directory(cleaner, fx_isolated_jobs,
+                                            fx_synth_hard, tmp_path):
+    """A7: the cleaner must create ``cleaned/`` itself.
+
+    ``doc.saveas()`` raises ``FileNotFoundError`` when the parent directory
+    is missing.  The per-file handler swallowed that into
+    ``clean_stats.json``, so the job continued and died at stage 8 with
+    "cleaned DXF missing".  Legacy job directories have no ``cleaned/`` at
+    all.
+    """
+    from jobs import job_dir
+    job_id = "nocleaneddir"
+    d = job_dir(job_id)
+    (d / "stages").mkdir(parents=True, exist_ok=True)
+    assert not (d / "cleaned").exists()
+
+    # stage the converted input the cleaner reads
+    import shutil
+    (d / "converted").mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(fx_synth_hard.mech_path, d / "converted" / "zz_plant.dxf")
+    shutil.copyfile(fx_synth_hard.str_path, d / "converted" / "aa_frame.dxf")
+
+    from core.roles import write_manifest, FileEntry
+    write_manifest(job_id, [
+        FileEntry(file_id="m1", upload="uploads/zz_plant.dxf", role="mech",
+                  converted="converted/zz_plant.dxf",
+                  cleaned="cleaned/zz_plant_clean.dxf"),
+        FileEntry(file_id="s1", upload="uploads/aa_frame.dxf", role="str",
+                  converted="converted/aa_frame.dxf",
+                  cleaned="cleaned/aa_frame_clean.dxf"),
+    ])
+
+    cleaner.run(job_id)
+
+    assert (d / "cleaned").exists(), "the cleaner must create cleaned/"
+    assert (d / "cleaned" / "zz_plant_clean.dxf").exists()
+    stats = json.loads((d / "stages" / "clean_stats.json").read_text())
+    assert not any("error" in s for s in stats), \
+        f"no file may fail to clean: {stats}"
+
+
+def test_label_regex_cache_follows_the_pattern_not_the_policy_object():
+    """A8: the compiled regex must follow the pattern, not the policy object.
+
+    The old cache was keyed on the policy's *identity* and updated in two
+    separate attribute writes, so two concurrent jobs could use each
+    other's regex — and a policy mutated in place served a stale pattern.
+    """
+    p1 = CleaningPolicy(label_regex=r"^AAA$")
+    p2 = CleaningPolicy(label_regex=r"^AAA$")
+    p1.label_regex = r"^BBB$"
+    assert _compile_label_re(p1.label_regex).pattern == r"^BBB$"
+    assert _compile_label_re(p2.label_regex).pattern == r"^AAA$"

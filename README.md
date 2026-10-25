@@ -197,8 +197,10 @@ Written by stage 8 next to the DXF (`jobs/<id>/transform.json`, or
 }
 ```
 
-`scale_x` / `scale_y` are the two **column norms** (the matrix diagonal), not an
-independent x/y scale. They only mean something when `rotation_deg == 0`.
+`scale_x` / `scale_y` are the **matrix diagonal** (`a` and `d`), *not* the
+column norms — for a rotated fit they are `scale·cos(rotation_deg)`. They only
+mean something when `rotation_deg == 0`; use `scale` and `rotation_deg`
+otherwise. `column_scales` carries the true column norms.
 
 `grid_mech.json` / `grid_str.json` sit next to it: every detected axis with its
 world `point`, `dir`, `length`, `n_occurrences`, `status`

@@ -54,13 +54,15 @@ def _inspect_dxf(path: Path) -> dict:
         except Exception:
             continue
 
-    # Extents
+    # Extents — `msp.bbox()` does not exist in ezdxf 1.4.4, so use the
+    # module-level helper and report null for an empty modelspace.
     try:
-        ext = msp.bbox()
-        extents = {
-            "min": [float(ext.extmin[0]), float(ext.extmin[1])],
-            "max": [float(ext.extmax[0]), float(ext.extmax[1])],
-        }
+        from ezdxf import bbox as ez_bbox
+        box = ez_bbox.extents(msp, fast=False)
+        extents = ({
+            "min": [float(box.extmin[0]), float(box.extmin[1])],
+            "max": [float(box.extmax[0]), float(box.extmax[1])],
+        } if box.has_data else None)
     except Exception:
         extents = None
 

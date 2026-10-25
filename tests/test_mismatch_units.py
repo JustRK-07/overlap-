@@ -419,6 +419,7 @@ import ezdxf                                                   # noqa: E402
 from core.grid import walk_world                                # noqa: E402
 from core.mismatch import geom                                  # noqa: E402
 from core.mismatch import features as FT                        # noqa: E402
+from core.mismatch.checks import Env                            # noqa: E402
 from core.mismatch.classify import Classifier, normalize_layer  # noqa: E402
 from ezdxf.math import Matrix44                                 # noqa: E402
 
@@ -767,6 +768,161 @@ def test_unpaired_segment_assumed_width():
     longer["band"]["min_member_len_mm"] = 2500.0
     fs3 = _extract(doc, source="STR", policy=MismatchPolicy.from_dict(longer))
     assert not [f for f in fs3.features if f.kind == "band"]
+
+
+# ── A2/A3/A4 — regressions found in the 2026-10-25 review ──────────────────
+
+def test_member_rect_drawn_short_edge_first_yields_a_full_length_band():
+    """A2: a member rectangle's band must span its LONG side.
+
+    ``rect_from_corners`` takes ``u`` from the *first drawn edge*, so a rect
+    whose polyline starts on its short side comes back with ``w < h``.  The
+    band conversion then projected a segment built along the rect's own axis
+    onto the *long* axis, which collapses it to a point: a zero-length band
+    whose normal is the zero vector, so ``SUPPORT_OFF_MEMBER`` could never
+    fire on it and it won band selection, masking real defects nearby.
+    """
+    doc = _new_doc()
+    msp = doc.modelspace()
+    # 5000 x 200, drawn SHORT edge first — the first edge is the 200 mm side.
+    _poly(msp, [(-100.0, -2500.0), (100.0, -2500.0),
+                (100.0, 2500.0), (-100.0, 2500.0)],
+         layer="FRAME-STEEL", closed=True)
+
+    fs = _extract(doc, source="STR")
+    bands = [f for f in fs.features if f.kind == "band"]
+    assert len(bands) == 1, [(f.kind, f.a, f.b) for f in fs.features]
+
+    b = bands[0]
+    assert b.length() == pytest.approx(5000.0), (
+        "the band must span the long side of the member rectangle")
+    assert b.size_mm["len"] == pytest.approx(5000.0)
+    assert b.hw == pytest.approx(100.0)
+    # the band's axis is the long axis, and it is a real unit vector
+    assert b.ux == pytest.approx(0.0, abs=1e-9)
+    assert b.uy == pytest.approx(1.0)
+    assert b.families == ("str_member",)
+
+
+def test_member_rect_drawn_long_edge_first_is_unchanged():
+    """The A2 fix must be a no-op for the long-edge-first drawing order."""
+    doc = _new_doc()
+    msp = doc.modelspace()
+    _poly(msp, [(-2500.0, -100.0), (2500.0, -100.0),
+                (2500.0, 100.0), (-2500.0, 100.0)],
+         layer="FRAME-STEEL", closed=True)
+
+    fs = _extract(doc, source="STR")
+    bands = [f for f in fs.features if f.kind == "band"]
+    assert len(bands) == 1
+    b = bands[0]
+    assert b.length() == pytest.approx(5000.0)
+    assert b.hw == pytest.approx(100.0)
+    assert b.ux == pytest.approx(1.0)
+    assert b.uy == pytest.approx(0.0, abs=1e-9)
+
+
+def test_env_search_radius_cap_is_in_millimetres():
+    """A3: the grid-spacing cap must be applied in mm, once.
+
+    ``FitContext.median_spacing_mm`` is already in millimetres; the detector
+    used to multiply it by ``mm`` again, so on a metre drawing the cap was
+    1000× too loose and the checks searched a thousand times further.
+    """
+    fs = FT.FeatureSet(source="STR")
+    env = Env(policy=DEFAULT_POLICY, mm=1000.0, mech=fs, str=fs,
+              clf=Classifier(DEFAULT_POLICY), grid_spacing_mm=6000.0)
+    # 0.25 x 6000 mm = 1500 mm = 1.5 drawing units at 1000 mm per unit
+    assert env.search_mm(1_000_000.0) == pytest.approx(1500.0)
+    assert env.search_u(1_000_000.0) == pytest.approx(1.5)
+    # a radius below the cap is untouched
+    assert env.search_mm(100.0) == pytest.approx(100.0)
+    # with no grid spacing there is no cap at all
+    env2 = Env(policy=DEFAULT_POLICY, mm=1000.0, mech=fs, str=fs,
+               clf=Classifier(DEFAULT_POLICY))
+    assert env2.search_mm(1_000_000.0) == pytest.approx(1_000_000.0)
+
+
+def test_detect_does_not_convert_the_grid_spacing_twice(monkeypatch):
+    """A3: the value `detect()` hands to `Env` must already be in mm.
+
+    This is the call-site half of A3: `FitContext.median_spacing_mm` is
+    already millimetres, and `detect()` used to multiply it by `mm` again.
+    The difference only shows on a metre drawing, so the MECH document here
+    is in metres.
+    """
+    import core.mismatch as MM
+    from core.mismatch import checks as checks_mod
+    from core.transform2d import Affine2D
+
+    seen = {}
+    real_env = checks_mod.Env
+
+    class _SpyEnv(real_env):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            seen["grid_spacing_mm"] = kwargs.get("grid_spacing_mm")
+            seen["mm"] = kwargs.get("mm")
+
+    monkeypatch.setattr(checks_mod, "Env", _SpyEnv)
+
+    # a MECH drawing in metres ($INSUNITS = 6)
+    mech = _new_doc(insunits=6)
+    mech.modelspace().add_line((0, 0), (1000, 0), dxfattribs={"layer": "X"})
+    str_doc = _new_doc(insunits=6)
+    str_doc.modelspace().add_line((0, 0), (1000, 0), dxfattribs={"layer": "X"})
+
+    # transform.json's `median_spacing` is in MECH drawing units: 6000 m.
+    fit_ctx = {"median_spacing": 6000.0, "rms_residual": 0.0,
+               "correspondences": [], "quality": {"status": "ok"}}
+
+    MM.detect(mech, str_doc, Affine2D(), fit_ctx=fit_ctx)
+
+    assert seen["mm"] == 1000.0, "the MECH document must be read as metres"
+    # 6000 m of grid spacing == 6 000 000 mm.  The cap is that number, NOT
+    # 6 000 000 × 1000.
+    assert seen["grid_spacing_mm"] == pytest.approx(6_000_000.0)
+
+
+def test_clash_with_members_detects_a_band_overlap():
+    """A4: ``clash_with_members=True`` must actually test the members.
+
+    ``str_member`` features are *bands*, and ``polygon_of()`` returned an
+    empty array for anything that was not a rect or a polygon — so the bands
+    were silently skipped and the flag never found a clash.
+    """
+    from core.mismatch.checks import clash as clash_mod
+
+    # a STR beam drawn as two parallel lines 200 mm apart
+    str_doc = _new_doc()
+    for y in (100.0, 300.0):
+        str_doc.modelspace().add_line((-2500.0, y), (2500.0, y),
+                                      dxfattribs={"layer": "FRAME-STEEL"})
+    # a MECH equipment rectangle sitting on top of the beam
+    mech_doc = _new_doc()
+    _poly(mech_doc.modelspace(), [(-500.0, 150.0), (500.0, 150.0),
+                                  (500.0, 250.0), (-500.0, 250.0)],
+         layer="EQUIPMENT", closed=True)
+
+    pol = DEFAULT_POLICY.to_dict()
+    pol["clash_with_members"] = True
+    policy = MismatchPolicy.from_dict(pol)
+
+    mech_fs = _extract(mech_doc, source="MECH", policy=policy)
+    str_fs = _extract(str_doc, source="STR", policy=policy)
+    env = Env(policy=policy, mm=1.0, mech=mech_fs, str=str_fs,
+              clf=Classifier(policy))
+
+    bands = [f for f in str_fs.features if f.kind == "band"]
+    assert bands, "the STR beam must produce a band"
+
+    findings = clash_mod.run(env)
+    clashes = [f for f in findings if f.kind == "CLASH"]
+    assert clashes, (
+        "a band overlapping the equipment must be reported as a CLASH when "
+        "clash_with_members is enabled")
+    assert clashes[0].severity == "CRITICAL"
+    assert clashes[0].magnitude_mm is not None and clashes[0].magnitude_mm > 0.0
 
 
 # ── geometry helpers ──────────────────────────────────────────────────────

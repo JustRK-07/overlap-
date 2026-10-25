@@ -34,7 +34,7 @@ from core.spatial import GridIndex
 
 from .. import geom
 from ..model import Finding, format_message
-from . import Env, describe, polygon_of
+from . import Env, describe, footprint_bbox, polygon_of
 
 __all__ = ["run"]
 
@@ -64,7 +64,10 @@ def run(env: Env) -> list[Finding]:
         if not items or not others:
             env.track("clash", len(items), 0)
             continue
-        index = GridIndex(np.asarray([o.bbox() for o in others], dtype=float))
+        # `footprint_bbox` (not `Feature.bbox`) — a band's bbox is its
+        # centreline, which excludes the half-width the band actually covers.
+        index = GridIndex(np.asarray([footprint_bbox(o) for o in others],
+                                     dtype=float))
         n_matched = 0
         for item in sorted(items, key=lambda f: (round(f.cx, 6), round(f.cy, 6),
                                                  f.handle)):
@@ -83,7 +86,7 @@ def _item(env, item, others, index, mech_fam, str_fam):
     ring, hull_approx = _hull_ring(item)
     if len(ring) < 3:
         return [], False
-    hits = sorted(int(v) for v in index.query_bbox(item.bbox()))
+    hits = sorted(int(v) for v in index.query_bbox(footprint_bbox(item)))
     if not hits:
         return [], False
 
@@ -93,7 +96,9 @@ def _item(env, item, others, index, mech_fam, str_fam):
         oring, o_hull = _hull_ring(other)
         if len(oring) < 3:
             continue
-        name = describe([other.entity_ref(str_fam)])
+        # a band belongs to `str_member`, not to the paired family
+        ofam = other.families[0] if other.families else str_fam
+        name = describe([other.entity_ref(ofam)])
         sat = geom.sat_penetration(ring, oring)
         if sat is not None:
             depth, mtv = sat
@@ -101,7 +106,7 @@ def _item(env, item, others, index, mech_fam, str_fam):
                 out.append(Finding(
                     kind="CLASH", severity="CRITICAL",
                     mech_ref=item.entity_ref(mech_fam),
-                    str_ref=other.entity_ref(str_fam),
+                    str_ref=other.entity_ref(ofam),
                     location=item.centre(),
                     offset_mm=(float(mtv[0]) * mm, float(mtv[1]) * mm),
                     magnitude_mm=depth * mm, tolerance_mm=tol,
@@ -114,7 +119,7 @@ def _item(env, item, others, index, mech_fam, str_fam):
                 out.append(Finding(
                     kind="CLEARANCE", severity="WARNING",
                     mech_ref=item.entity_ref(mech_fam),
-                    str_ref=other.entity_ref(str_fam),
+                    str_ref=other.entity_ref(ofam),
                     location=item.centre(), magnitude_mm=gap * mm,
                     tolerance_mm=min_clear,
                     details={"hull_approx": bool(hull_approx), "str_hull_approx": bool(o_hull)},

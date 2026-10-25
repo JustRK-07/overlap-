@@ -658,8 +658,11 @@ def _str_block_names(doc, report: OverlayReport) -> set[str]:
     """
     names = set(report.str_block_map.values())
     seen = set()
+    # Build the handle set ONCE — inside the comprehension's condition it was
+    # rebuilt for every modelspace entity, which is O(N²) on the critical path.
+    str_handles = set(report.str_entity_handles)
     queue = [e for e in doc.modelspace()
-             if e.dxf.handle in set(report.str_entity_handles)
+             if e.dxf.handle in str_handles
              and e.dxftype() == "INSERT"]
     while queue:
         ins = queue.pop()
@@ -987,6 +990,13 @@ def run(job_id: str, *, pair_dir: Path | None = None,
         raise RuntimeError("transform.json missing — run fit first")
     transform_json = json.loads(transform_path.read_text())
     affine = Affine2D.from_json(transform_json)
+
+    if options is None:
+        # The drop budget follows the model that was ACTUALLY fitted: a
+        # similarity is exact (no drops allowed), the diagnostic affine model
+        # cannot represent a skewed INSERT and is allowed a little slack.
+        options = OverlayOptions.for_model(
+            str(transform_json.get("model") or "similarity"))
 
     mech_doc = _read_internal(str(mech_path))
     report = overlay_docs(mech_doc, _read_internal(str(str_path)), affine,

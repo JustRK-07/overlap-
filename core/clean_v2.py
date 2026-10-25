@@ -223,6 +223,9 @@ def run(job_id: str) -> None:
     cleaned = d / "cleaned"
     stages = d / "stages"
     stages.mkdir(exist_ok=True)
+    # see clean_v1.run — `doc.saveas()` needs the parent directory to exist,
+    # and legacy job dirs have no `cleaned/` at all.
+    cleaned.mkdir(parents=True, exist_ok=True)
 
     # Load the policy derived by stage 3.5b (clean_policy). If missing
     # (legacy job / no stage 3.5b yet), fall back to DEFAULT_POLICY.

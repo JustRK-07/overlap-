@@ -46,9 +46,11 @@ layout):
     convention skipped_axes warnings        (legacy)
     scale_x scale_y tx ty x_labels y_labels intersections   (legacy, exact)
 
-``scale_x`` / ``scale_y`` are the two column norms, i.e. the matrix diagonal
-— for a similarity they are both ``scale``.  They are only meaningful as an
-axis-aligned model when ``rotation_deg`` is 0.
+``scale_x`` / ``scale_y`` are the **matrix diagonal** (``a`` and ``d``), *not*
+the column norms: for a rotated similarity they are ``scale·cos(rotation_deg)``,
+not ``scale``.  They are only meaningful as an axis-aligned model when
+``rotation_deg`` is 0; use ``scale`` / ``rotation_deg`` (or the added
+``column_scales`` key) for anything else.
 """
 
 from __future__ import annotations
@@ -555,8 +557,12 @@ def run(job_id: str, *, pair_dir=None) -> None:
     transform = {
         **sol,
         # ── legacy, unchanged shape ──
+        # `scale_x`/`scale_y` are the matrix diagonal (a, d) — for a rotated
+        # similarity that is scale·cos(rotation_deg), NOT the scale.
         "scale_x": affine.a,
         "scale_y": affine.d,
+        # the TRUE column norms, added so consumers never have to guess
+        "column_scales": list(affine.column_scales()),
         "tx": affine.tx,
         "ty": affine.ty,
         "x_labels": x_labels,
