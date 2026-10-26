@@ -436,12 +436,18 @@ them:
 ISGEC_DIR=/path/to/ISGEC python3 -m pytest -q
 ```
 
-There is also a live-server smoke test that does not use pytest:
+There is also a live-server smoke test that does not use pytest — it drives
+a running server, so pytest does not collect it:
 
 ```bash
+pip install -r requirements-dev.txt  # requests — the only extra it needs
 ./run.sh &
 python3 tests/smoke_test.py          # upload → poll → pick axes → download
 ```
+
+It needs the real TP-104 drawings; point `ISGEC_DIR` at your ISGEC checkout
+and `OVERLAY_URL` at the server (it defaults to `http://127.0.0.1:8000`,
+which is where `run.sh` starts it).
 
 ---
 

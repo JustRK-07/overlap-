@@ -161,6 +161,14 @@ def run_pair(
     d = job_dir(job_id)
     src_cleaned = d / "cleaned"
 
+    # A pair of one file with itself is not a pair.  The route rejects it
+    # before it gets here; the runner rejects it too, so the check does
+    # not depend on the caller.
+    if mech_filename == str_filename:
+        raise ValueError(
+            f"a pair needs two different files — got {mech_filename!r} twice"
+        )
+
     if not (src_cleaned / mech_filename).exists():
         raise FileNotFoundError(
             f"mech_file {mech_filename!r} not in {src_cleaned}"

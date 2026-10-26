@@ -72,8 +72,8 @@ def test_list_pairs_404_on_unknown_job(fx_client, fx_isolated_jobs):
 # POST /{job_id}/pairs — validation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_post_pairs_self_loop_rejected(fx_client, fx_job_with_cleaned_dxfs):
-    job_id = fx_job_with_cleaned_dxfs
+def test_post_pairs_self_loop_rejected(fx_client, fx_job_without_dxfs):
+    job_id = fx_job_without_dxfs
     same = "mech_clean.dxf"
     r = fx_client.post(
         f"/api/v1/overlay/{job_id}/pairs",
@@ -84,8 +84,8 @@ def test_post_pairs_self_loop_rejected(fx_client, fx_job_with_cleaned_dxfs):
     assert "differ" in r.json()["detail"]
 
 
-def test_post_pairs_unknown_file_rejected(fx_client, fx_job_with_cleaned_dxfs):
-    job_id = fx_job_with_cleaned_dxfs
+def test_post_pairs_unknown_file_rejected(fx_client, fx_job_without_dxfs):
+    job_id = fx_job_without_dxfs
     r = fx_client.post(
         f"/api/v1/overlay/{job_id}/pairs",
         json={"mech_file": "ghost.dxf", "str_file": "str_clean.dxf",
@@ -107,9 +107,9 @@ def test_post_pairs_unknown_job_rejected(fx_client, fx_isolated_jobs):
 # GET /{job_id}/pairs/{pair_id}/{artifact} — path traversal
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_get_pair_artifact_path_traversal_blocked(fx_client, fx_job_with_cleaned_dxfs):
+def test_get_pair_artifact_path_traversal_blocked(fx_client, fx_job_without_dxfs):
     """`..` in the URL must be rejected with 400, not a path-traversal."""
-    job_id = fx_job_with_cleaned_dxfs
+    job_id = fx_job_without_dxfs
     r = fx_client.get(
         f"/api/v1/overlay/{job_id}/pairs/..%2F..%2Fetc/transform.json",
     )
@@ -123,16 +123,16 @@ def test_get_pair_artifact_path_traversal_blocked(fx_client, fx_job_with_cleaned
                    for s in ("path", "traversal", "separator"))
 
 
-def test_get_pair_artifact_unknown_artifact(fx_client, fx_job_with_cleaned_dxfs):
-    job_id = fx_job_with_cleaned_dxfs
+def test_get_pair_artifact_unknown_artifact(fx_client, fx_job_without_dxfs):
+    job_id = fx_job_without_dxfs
     r = fx_client.get(
         f"/api/v1/overlay/{job_id}/pairs/MECH_vs_STR/not-a-real-artifact.txt",
     )
     assert r.status_code == 400
 
 
-def test_get_pair_artifact_404_when_pair_missing(fx_client, fx_job_with_cleaned_dxfs):
-    job_id = fx_job_with_cleaned_dxfs
+def test_get_pair_artifact_404_when_pair_missing(fx_client, fx_job_without_dxfs):
+    job_id = fx_job_without_dxfs
     r = fx_client.get(
         f"/api/v1/overlay/{job_id}/pairs/no_such_pair/transform.json",
     )

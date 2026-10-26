@@ -148,6 +148,43 @@ the unfixed code*. A fix with no test is not done — it is a hope.
 | **Verification** | `tests/test_fit.py::test_transform_json_exposes_column_scales` — the new key equals the true scale for a rotated fit. |
 | **Status** | VERIFIED |
 
+### A11 · `routers/api.py:218-219, :351` — the upload filename is written raw
+
+| | |
+|---|---|
+| **Severity** | **Critical** (arbitrary file write) |
+| **Symptom** | The upload was written as `(job_dir / "uploads" / filename)`. `UploadFile.filename` is the raw `Content-Disposition` value and Starlette does **not** sanitise it, so `/etc/cron.d/evil.dxf` and `../../evil.dxf` both wrote **outside** the job directory. |
+| **Root cause** | Untrusted input used as a path. |
+| **Fix** | `_safe_upload_name()` — the name is reduced to `Path(raw).name`, and the name recorded in `job.json` is the same sanitised value (the cleaner looks the file up by that name).  The same class of bug in `GET /{id}/analyze?pair_id=…` is fixed by `_safe_pair_id()`. |
+| **Connected files** | `routers/api.py` (three write/read sites) · `core/analyze.py::_pair_artifact_root` (the consumer). |
+| **Verification** | `tests/test_upload_safety.py` — 4 tests: a `..` name, an absolute name, the N-file endpoint, and the `pair_id` traversal. |
+| **Status** | VERIFIED |
+
+### A12 · `core/spotcheck.py`, `core/mech_intra.py`, `core/str_intra.py`, `core/analyze.py` — the thresholds were bare drawing units
+
+| | |
+|---|---|
+| **Severity** | **Critical** (the whole spot-check family is silent on a metre-scale STR) |
+| **Symptom** | Every threshold is specified in millimetres, but the extractors worked in the drawing's own units.  A 100-unit minimum became 100 **metres**. |
+| **Measured** | the same fixture: **26 members / 7 gridlines in millimetres → 2 / 0 in metres**.  The bay bounds collapsed, so every saddle was reported grid-misaligned with an infinite distance. |
+| **Root cause** | The mm↔unit conversion was missing — the same class of bug commit `e56f9fb` fixed inside `core/mismatch/checks/`. |
+| **Fix** | The thresholds are divided by the drawing's mm-per-unit, read from `$INSUNITS` (`core.dxfio.mm_per_unit`). |
+| **Connected files** | `core/dxfio.py` (the new helper) · `core/spotcheck.py` (4 sites) · `core/mech_intra.py` (3) · `core/str_intra.py` (2) · `core/analyze.py` (the hotspot radius, now scaled from `transform.json`'s `units.mech`). |
+| **Verification** | `tests/test_unit_scaling.py` — 5 tests comparing the mm and metre extractions. |
+| **Status** | VERIFIED |
+
+### A13 · `core/str_intra.py` → `core/spotcheck.py` → `core/spotcheck_annotate.py` — the STR-intra issues were drawn in the wrong coordinate space
+
+| | |
+|---|---|
+| **Severity** | High (every STR marker landed in the wrong place) |
+| **Symptom** | `core/str_intra.py` reuses `mech_x`/`mech_y` for a **STR-space** point.  Every other issue — and the DXF the markers are drawn on — is in MECH world, so a `STR-###` marker was drawn thousands of millimetres away from the actual clash. |
+| **Measured** | the raw STR point `(1234, 567)` vs the MECH-world point `(197268.18, …)`. |
+| **Fix** | The issues are mapped through the fit at the one place the two coordinate spaces meet — the merge in `core/spotcheck.py`.  The `Issue` schema stays unchanged, so `mech_x`/`mech_y` now mean what they say. |
+| **Connected files** | `core/spotcheck.py` (the merge) · `core/str_intra.py` (the producer) · `core/spotcheck_annotate.py` (the consumer — unchanged, it was always right for MECH-space coordinates). |
+| **Verification** | `tests/test_unit_scaling.py::test_the_str_intra_issues_are_mapped_into_mech_world`. |
+| **Status** | VERIFIED |
+
 ---
 
 ## Part B — `PLAN.md` "Done when" criteria still unmet
@@ -158,7 +195,7 @@ the unfixed code*. A fix with no test is not done — it is a hope.
 | B2 | "inputs (uploads/converted) go through `recover.readfile`" | `inspect.py:33`, `labels.py:84,123`, `clean_policy.py:201-202`, `clean_v1.py:95`, `clean_v2.py:74` | use `dxfio.read_input` for uploads/converted | `tests/test_plan_acceptance.py::test_inspect_accepts_a_recoverable_upload` + `test_input_stages_use_the_recovering_reader` (5 modules) | VERIFIED |
 | B3 | "no silent fallback" in the fit | `core/transform2d.py:494-495` | the LOO refit must not silently switch model — it now raises, and `core/fit.py` turns that into a **gate failure** (so `force` can override it like every other gate) | `tests/test_plan_acceptance.py::test_loo_does_not_silently_switch_to_an_affine_model` + `test_a_degenerate_loo_becomes_a_fit_gate_not_a_crash` | VERIFIED |
 | B4 | "nothing in `package.py` silently discards geometry" | `core/package.py:562-563` | the preview no longer filters MTEXT out unconditionally; what the picture cannot show is now **reported**: `mtext_entities` / `mtext_drawn` / `mtext_not_drawn` in `report.json`, plus a per-image `mtext_skipped` for the retry path | `tests/test_plan_acceptance.py::test_mtext_is_not_filtered_out_of_the_preview` + `test_the_report_records_the_mtext_it_could_not_draw` | VERIFIED |
-| B5 | step 10: `tests/test_e2e_synthetic.py` | new file | 3 named e2e cases | the file itself | OPEN |
+| B5 | step 10: `tests/test_e2e_synthetic.py` | new file | 3 named e2e cases | the file itself | VERIFIED |
 
 **B4 — what the investigation found.** The blanket MTEXT exclusion turned out to be
 *cosmetic* on this machine: ezdxf's font manager has no font, so MTEXT draws no
@@ -269,35 +306,38 @@ tooltip that says why.
 
 | File | Named by | State |
 |---|---|---|
-| `tests/test_e2e_synthetic.py` | PLAN.md step 10 | OPEN |
-| `tests/test_mismatch_stage.py` | PLAN_MISMATCH §6.4 | OPEN |
-| `tests/test_findings_api.py` | PLAN_MISMATCH §6.4 | OPEN |
-| `tests/synth_perf.py` | PLAN_MISMATCH §6.5 | OPEN |
-| `tests/test_mismatch_perf.py` | PLAN_MISMATCH §6.5 | OPEN |
-| `tests/test_export_dwg.py` | PLAN_MISMATCH 8c | OPEN |
-| `test_kabsch_rigid_exact` | PLAN_MISMATCH §6.2 | OPEN |
-| `test_fit_uncertainty_inflates_tolerance` | PLAN_MISMATCH §6.2 | OPEN |
+| `tests/test_e2e_synthetic.py` | PLAN.md step 10 | VERIFIED — 4 tests: the legacy flow over two presets (HARD in metres at 7.5°, and HARD in mm at −3°), the N-file upload with the roles **reversed**, and the shifted-axis outlier case |
+| `tests/test_mismatch_stage.py` | PLAN_MISMATCH §6.4 | VERIFIED — 12 tests (8b.5) |
+| `tests/test_findings_api.py` | PLAN_MISMATCH §6.4 | VERIFIED — 17 tests (8b.6) |
+| `tests/synth_perf.py` | PLAN_MISMATCH §6.5 | VERIFIED — 190 328 entities |
+| `tests/test_mismatch_perf.py` | PLAN_MISMATCH §6.5 | VERIFIED — 4 tests |
+| `tests/test_export_dwg.py` | PLAN_MISMATCH 8c | VERIFIED — 10 tests, all mocked |
+| `test_kabsch_rigid_exact` | PLAN_MISMATCH §6.2 | VERIFIED |
+| `test_fit_uncertainty_inflates_tolerance` | PLAN_MISMATCH §6.2 | VERIFIED |
+| `tests/test_static_assets.py` | (new — the front end) | VERIFIED — 6 tests |
+| `tests/test_upload_safety.py` | (new — A11) | VERIFIED — 4 tests |
+| `tests/test_unit_scaling.py` | (new — A12/A13) | VERIFIED — 7 tests |
 
 ---
 
 ## Part D — test-suite hygiene (from the review)
 
-| ID | File:line | Defect | State |
-|---|---|---|---|
-| D1 | `tests/test_mismatch_synth.py:188,220` | the severity assertion is **vacuous** for all 12 CRITICAL expectations (`rank(f) >= rank(e)` is always true) — severity is effectively untested | OPEN |
-| D2 | `tests/test_dxfio.py:139,146` | **dead assertion** — the test snapshots `cleaning_policy.json`, production writes `clean_policy.json`; `ref` is always `None` | OPEN |
-| D3 | `tests/test_overlay.py:386-396` | the AST check does **not** detect `except Exception: pass` — the exact pattern the plan lists | OPEN |
-| D4 | `tests/test_fit.py:349` | `assert t["tx"] == t["tx"]` — always true | OPEN |
-| D5 | `tests/test_clean_v1_preserves_protected_labels.py:129` | `assert stats["error"] is None if "error" in stats else True` → `assert True` | OPEN |
-| D6 | `tests/test_pair_runner.py:136` | claims `run_pair` rejects a self-loop; the runner has **no such check** | OPEN |
-| D7 | `tests/test_fit.py:409-414` | `break` after the first of 12 correspondences | OPEN |
-| D8 | `tests/test_grid_robust_extent.py:76` | 50 % tolerance on a "must not shrink" assertion | OPEN |
-| D9 | `tests/test_clean_safety.py:92` | the v2 branch asserts only `"KEEP" in layers` | OPEN |
-| D10 | `tests/smoke_test.py:28` | `import requests` — **not in `requirements.txt`**; pytest imports it during collection | OPEN |
-| D11 | `tests/smoke_test.py:30` | API port 8765 vs `run.sh` port 8000 — the README's documented sequence fails | OPEN |
-| D12 | `tests/test_api_options.py` | `fx_no_worker` exists but 8 of ~11 job-creating tests don't use it | OPEN |
-| D13 | `tests/test_grid_robust_extent.py:18` | `from tests import synth` vs `import synth` — two distinct module objects | OPEN |
-| D14 | `tests/conftest.py:52` | 9 of the 24 TP-104 skips need **no DXF geometry** — they are fixture-cascade artefacts hiding a path-traversal guard and 4 validation guards | OPEN |
+| ID | File:line | Defect | Fix | State |
+|---|---|---|---|---|
+|  D1  |  `tests/test_mismatch_synth.py:188,220`  |  the severity assertion is **vacuous** for all 12 CRITICAL expectations (`rank(f) >= rank(e)` is always true) — severity is effectively untested  | the inequality is reversed: the finding must be **at least** as severe | VERIFIED |
+|  D2  |  `tests/test_dxfio.py:139,146`  |  **dead assertion** — the test snapshots `cleaning_policy.json`, production writes `clean_policy.json`; `ref` is always `None`  | the real file name, and the comparison now always runs | VERIFIED |
+|  D3  |  `tests/test_overlay.py:386-396`  |  the AST check does **not** detect `except Exception: pass` — the exact pattern the plan lists  | the predicate now looks for `ast.Pass`, and the check **tests itself** | VERIFIED |
+|  D4  |  `tests/test_fit.py:349`  |  `assert t["tx"] == t["tx"]` — always true  | the translation is compared with the generator's truth | VERIFIED |
+|  D5  |  `tests/test_clean_v1_preserves_protected_labels.py:129`  |  `assert stats["error"] is None if "error" in stats else True` → `assert True`  | `assert "error" not in stats` | VERIFIED |
+|  D6  |  `tests/test_pair_runner.py:136`  |  claims `run_pair` rejects a self-loop; the runner has **no such check**  | the **runner** now rejects it (so the check does not depend on the caller), and the test asserts the `ValueError` | VERIFIED |
+|  D7  |  `tests/test_fit.py:409-414`  |  `break` after the first of 12 correspondences  | every correspondence is checked, and the count is asserted | VERIFIED |
+|  D8  |  `tests/test_grid_robust_extent.py:76`  |  50 % tolerance on a "must not shrink" assertion  | 5 % | VERIFIED |
+|  D9  |  `tests/test_clean_safety.py:92`  |  the v2 branch asserts only `"KEEP" in layers`  | it now checks that the annotation-layer **geometry** survives and its **text** does not | VERIFIED |
+|  D10  |  `tests/smoke_test.py:28`  |  `import requests` — **not in `requirements.txt`**; pytest imports it during collection  | `collect_ignore` keeps pytest from importing it; `requirements-dev.txt` carries `requests` | VERIFIED |
+|  D11  |  `tests/smoke_test.py:30`  |  API port 8765 vs `run.sh` port 8000 — the README's documented sequence fails  | the default is 8000 | VERIFIED |
+|  D12  |  `tests/test_api_options.py`  |  `fx_no_worker` exists but 8 of ~11 job-creating tests don't use it  | all 14 now stop the worker | VERIFIED |
+|  D13  |  `tests/test_grid_robust_extent.py:18`  |  `from tests import synth` vs `import synth` — two distinct module objects  | one import path | VERIFIED |
+|  D14  |  `tests/conftest.py:52`  |  9 of the 24 TP-104 skips need **no DXF geometry** — they are fixture-cascade artefacts hiding a path-traversal guard and 4 validation guards  | a new `fx_job_without_dxfs` fixture (a job with an empty `cleaned/`) and the nine tests moved onto it | VERIFIED |
 
 ---
 
@@ -307,6 +347,7 @@ tooltip that says why.
 |---|---|---|
 | 2026-10-25 | Analysis | 7 review agents + 3 fix-mapping agents; 84 files; defects independently reproduced |
 | 2026-10-25 | Phase 1 (Tier 1) | **A1–A10 all VERIFIED.** 16 new regression tests; suite 389 → **405 passed**, 24 skipped, 0 failed. Every new test proven to FAIL on the original code (A1/A3/A5–A8 by temporary revert; A2/A4/A9/A10 by construction). |
+| 2026-10-25 | Phase 6 | **A11–A13 VERIFIED, all the missing plan test files written, and the hygiene D1–D14 fixed.**  Suite 478 → **494 passed**; the skips went 24 → 15 (nine geometry-free tests recovered).  D1 was the important one: the mismatch severity check was vacuous, so severity had never really been tested. |
 | 2026-10-25 | Phase 5 (8b.7 + 8c) | **C-8b.7 and C-8c VERIFIED.** `tests/synth_perf.py` (190 328 entities), `tests/test_mismatch_perf.py` (4 tests), `core/export_dwg.py`, `tests/test_export_dwg.py` (10 tests).  Suite 453 → **467 passed**, 24 skipped, 0 failed.  The perf test found an O(n²) bug in the pattern grouping — 81.9 s → 9.9 s. |
 | 2026-10-25 | Phase 4 (8b.6) | **C-8b.6 all VERIFIED.** 23 new tests (`tests/test_findings_api.py` + `tests/test_static_assets.py`); suite 428 → **453 passed**, 24 skipped, 0 failed.  The UI work also fixed the XSS the review flagged and the 9-column step rail. |
 | 2026-10-25 | Phase 3 (8b.5) | **C-8b.5 all 13 VERIFIED.** 12 new tests in `tests/test_mismatch_stage.py`; suite 418 → **428 passed**, 24 skipped, 0 failed. The engine is reachable end to end: the stage runs, the QA markers are drawn, the findings are merged, and the pipeline runs them. |

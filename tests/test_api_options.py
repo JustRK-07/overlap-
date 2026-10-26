@@ -89,7 +89,7 @@ def _upload_n(client, **data):
 # Options persisted
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_options_persisted_legacy_upload(fx_client, fx_isolated_jobs):
+def test_options_persisted_legacy_upload(fx_client, fx_isolated_jobs, fx_no_worker):
     """Every knob lands in job.options (and is echoed in the response)."""
     r = _upload2(
         fx_client,
@@ -123,7 +123,7 @@ def test_options_persisted_legacy_upload(fx_client, fx_isolated_jobs):
     assert raw["options"]["color_mode"] == "contrast"
 
 
-def test_options_defaults_legacy_upload(fx_client):
+def test_options_defaults_legacy_upload(fx_client, fx_no_worker):
     """Omitting every option yields the documented defaults."""
     r = _upload2(fx_client)
     assert r.status_code == 200, r.text
@@ -137,7 +137,7 @@ def test_options_defaults_legacy_upload(fx_client):
         assert opts[key] == val
 
 
-def test_options_shape_matches_stage_readers(fx_client):
+def test_options_shape_matches_stage_readers(fx_client, fx_no_worker):
     """The `fit` / `overlay` namespaces mirror the flat keys.
 
     core.fit.FitOptions reads the flat keys; core.overlay.OverlayStyle
@@ -164,7 +164,7 @@ def test_options_shape_matches_stage_readers(fx_client):
     assert job.options["overlay"]["color_mode"] == "contrast"
 
 
-def test_n_file_upload_options_persisted(fx_client, fx_isolated_jobs):
+def test_n_file_upload_options_persisted(fx_client, fx_isolated_jobs, fx_no_worker):
     """The N-file endpoint takes the same five options."""
     r = _upload_n(
         fx_client,
@@ -194,7 +194,7 @@ def test_n_file_upload_options_persisted(fx_client, fx_isolated_jobs):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("value", ["bogus", "ORIGINAL2", "orig", "contra st"])
-def test_bad_color_mode_400(fx_client, fx_isolated_jobs, value):
+def test_bad_color_mode_400(fx_client, fx_isolated_jobs, value, fx_no_worker):
     r = _upload2(fx_client, color_mode=value)
     assert r.status_code == 400, r.text
     detail = r.json()["detail"]
@@ -204,7 +204,7 @@ def test_bad_color_mode_400(fx_client, fx_isolated_jobs, value):
     assert not list(fx_isolated_jobs.iterdir())
 
 
-def test_blank_color_mode_uses_the_default(fx_client):
+def test_blank_color_mode_uses_the_default(fx_client, fx_no_worker):
     """FastAPI reads an empty form field as "absent" — so it means default."""
     r = _upload2(fx_client, color_mode="")
     assert r.status_code == 200, r.text
@@ -212,7 +212,7 @@ def test_blank_color_mode_uses_the_default(fx_client):
 
 
 @pytest.mark.parametrize("value", ["perspective", "Similar", "similarty"])
-def test_bad_fit_model_400(fx_client, value):
+def test_bad_fit_model_400(fx_client, value, fx_no_worker):
     r = _upload2(fx_client, fit_model=value)
     assert r.status_code == 400, r.text
     assert "fit_model" in r.json()["detail"]
@@ -221,7 +221,7 @@ def test_bad_fit_model_400(fx_client, value):
 @pytest.mark.parametrize("pair", [
     ("CONTRAST", "SIMILARITY"), (" Contrast ", "AFFINE"),
 ])
-def test_enum_values_are_case_and_space_insensitive(fx_client, pair):
+def test_enum_values_are_case_and_space_insensitive(fx_client, pair, fx_no_worker):
     """A hand-typed form value is trimmed and case-folded, not rejected."""
     color_mode, fit_model = pair
     r = _upload2(fx_client, color_mode=color_mode, fit_model=fit_model)
@@ -231,14 +231,14 @@ def test_enum_values_are_case_and_space_insensitive(fx_client, pair):
 
 
 @pytest.mark.parametrize("value", ["maybe", "2.5", "tru"])
-def test_bad_allow_weak_fit_400(fx_client, value):
+def test_bad_allow_weak_fit_400(fx_client, value, fx_no_worker):
     r = _upload2(fx_client, allow_weak_fit=value)
     assert r.status_code == 400, r.text
     assert "allow_weak_fit" in r.json()["detail"]
 
 
 @pytest.mark.parametrize("value", ["sometimes", "3"])
-def test_bad_qa_grid_400(fx_client, value):
+def test_bad_qa_grid_400(fx_client, value, fx_no_worker):
     r = _upload2(fx_client, qa_grid=value)
     assert r.status_code == 400, r.text
     assert "qa_grid" in r.json()["detail"]
@@ -248,7 +248,7 @@ def test_bad_qa_grid_400(fx_client, value):
     ("allow_weak_fit", "1"), ("allow_weak_fit", "yes"), ("allow_weak_fit", "OFF"),
     ("qa_grid", "false"), ("qa_grid", "no"), ("qa_grid", "0"),
 ])
-def test_bool_tokens_accepted(fx_client, field, value):
+def test_bool_tokens_accepted(fx_client, field, value, fx_no_worker):
     """A browser checkbox sends "on"/""; a JSON client sends true/false."""
     r = _upload2(fx_client, **{field: value})
     assert r.status_code == 200, r.text
@@ -256,20 +256,20 @@ def test_bool_tokens_accepted(fx_client, field, value):
 
 
 @pytest.mark.parametrize("value", ["-1", "9999", "thick", "1e3"])
-def test_bad_str_lineweight_400(fx_client, value):
+def test_bad_str_lineweight_400(fx_client, value, fx_no_worker):
     r = _upload2(fx_client, str_lineweight=value)
     assert r.status_code == 400, r.text
     assert "str_lineweight" in r.json()["detail"]
 
 
-def test_empty_str_lineweight_is_unset(fx_client):
+def test_empty_str_lineweight_is_unset(fx_client, fx_no_worker):
     """`str_lineweight=""` means "as drawn", not zero."""
     r = _upload2(fx_client, str_lineweight="")
     assert r.status_code == 200, r.text
     assert r.json()["options"]["str_lineweight"] is None
 
 
-def test_bad_color_mode_400_on_n_file_upload(fx_client):
+def test_bad_color_mode_400_on_n_file_upload(fx_client, fx_no_worker):
     """The N-file endpoint validates the same way."""
     r = _upload_n(fx_client, color_mode="rainbow")
     assert r.status_code == 400, r.text

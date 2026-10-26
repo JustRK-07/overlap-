@@ -98,7 +98,16 @@ def test_annotation_prefix_still_matches_am_and_rev(cleaner, tmp_path):
     if cleaner is clean_v1:       # v2 strips only annotation-layer TEXT, not geometry
         assert layers == {"KEEP"}
     else:
+        # v2 keeps the *geometry* on an annotation layer but strips its
+        # text — so the annotation layers must still be there, and only
+        # KEEP may be free of text.  The old assertion only checked that
+        # KEEP survived, so a v2 that stripped nothing at all passed.
         assert "KEEP" in layers
+        assert {"AM_5", "REV-B", "DIM", "TITLE"} <= layers, \
+            f"v2 must keep the annotation-layer geometry, got {layers}"
+        texts = {e.dxf.text.strip() for e in out.modelspace()
+                 if e.dxftype() in ("TEXT", "MTEXT")}
+        assert not texts, f"v2 must strip the annotation-layer text, got {texts}"
 
 
 def test_shape_alone_not_removed_but_marker_context_is(cleaner, tmp_path):

@@ -383,17 +383,51 @@ def test_run_writes_output_and_report(fx_synth_job):
     assert any(k.startswith("overlay:") for k in audit)
 
 
+def _swallows_everything(handler) -> bool:
+    """Does this handler do nothing but `pass`?
+
+    A docstring-only body counts as swallowing too — the exception is
+    discarded either way.
+    """
+    body = [n for n in handler.body
+            if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+    if not body:
+        return True
+    return all(isinstance(n, ast.Pass) for n in body)
+
+
 def test_no_bare_except_in_overlay():
-    """PLAN.md step 6: no `except: pass` anywhere in the module."""
+    """PLAN.md step 6: no `except: pass` anywhere in the module.
+
+    The old check only rejected a *docstring-only* body, so
+    ``except Exception: pass`` — the exact pattern the plan lists as a
+    defect — passed.  It also raised a false positive on a
+    docstring-only handler.
+    """
     tree = ast.parse((ROOT / "core" / "overlay.py").read_text())
     handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)]
-    assert handlers, "the module has no except clause at all"
     for node in handlers:
-        body = [n for n in node.body
-                if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
-        assert body, f"bare except at line {node.lineno}: {ast.dump(node.body[0])}"
+        assert not _swallows_everything(node), (
+            f"a handler that swallows everything at line {node.lineno}: "
+            f"{ast.dump(node.body[0])}")
         assert node.type is not None or node.name is not None, \
             f"bare except at line {node.lineno}"
+
+
+def test_the_bare_except_check_actually_catches_one():
+    """The check itself must be able to fail — otherwise it proves nothing."""
+    docstring_only = "try:\n    pass\nexcept Exception:\n    " + chr(34) * 3 + chr(34) * 3 + "\n"
+    sources = (
+        "try:\n    pass\nexcept:\n    pass\n",
+        "try:\n    pass\nexcept Exception:\n    pass\n",
+        docstring_only,
+    )
+    for source in sources:
+        tree = ast.parse(source)
+        handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)]
+        assert handlers
+        assert any(_swallows_everything(h) for h in handlers), (
+            f"the check missed: {source!r}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

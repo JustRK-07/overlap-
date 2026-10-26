@@ -347,7 +347,8 @@ def test_transform_json_legacy_keys_present(fit_job):
               "intersections", "rms_residual", "max_residual"):
         assert k in t, k
     assert t["scale_x"] == t["a"] and t["scale_y"] == t["d"]
-    assert t["tx"] == t["tx"] and t["ty"] == t["ty"]
+    assert t["tx"] == pytest.approx(pair.truth.tx, abs=1e-6)
+    assert t["ty"] == pytest.approx(pair.truth.ty, abs=1e-6)
     for row in t["x_labels"] + t["y_labels"]:
         assert set(("label", "str", "mech")) <= set(row)
     assert len(t["x_labels"]) + len(t["y_labels"]) >= 4
@@ -434,13 +435,17 @@ def test_spotcheck_uses_inverse_affine(fit_job):
         assert back[0] == pytest.approx(p[0], abs=1e-6)
         assert back[1] == pytest.approx(p[1], abs=1e-6)
 
-    # a MECH saddle lands where the generator says it should ...
+    # a MECH saddle lands where the generator says it should — every one
+    # of them, not just the first (the old `break` checked one of twelve)
+    checked = 0
     for (letter, digit), mpt in pair.intersections_mech.items():
         spt = pair.intersections_str.get((letter, digit))
         if spt is None:
             continue
-        assert inv.apply(tuple(mpt)) == pytest.approx(tuple(spt), abs=1e-6)
-        break
+        assert inv.apply(tuple(mpt)) == pytest.approx(tuple(spt), abs=1e-6), \
+            (letter, digit)
+        checked += 1
+    assert checked >= 10, f"only {checked} correspondences were checked"
 
     # ... while the pre-step-5 axis-aligned shortcut does not
     q = tuple(t["intersections"][0]["mech"])

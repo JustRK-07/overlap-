@@ -126,7 +126,9 @@ def test_grid_labels_inside_named_block_survive_when_protected(fx_str_dxf):
         protected=protected, protected_blocks=protected_blocks,
     )
 
-    assert stats["error"] is None if "error" in stats else True  # no exception
+    # `_clean_one` never returns an "error" key — the old assertion
+    # evaluated to `assert True` and could never fail.
+    assert "error" not in stats, stats
     assert out_dxf.exists()
 
     # Re-open and check the labels are still there.

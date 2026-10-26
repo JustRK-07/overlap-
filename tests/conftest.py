@@ -20,6 +20,12 @@ import pytest
 # Make sure overlay-app is importable.
 import sys
 HERE = Path(__file__).resolve().parent
+
+#: ``smoke_test.py`` is a standalone script (it drives a live server), not a
+#: pytest test.  pytest collects it because the name matches ``*_test.py``
+#: — and it imports ``requests``, which is not a runtime dependency.  Keep
+#: it out of the collection entirely.
+collect_ignore = ["smoke_test.py"]
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
@@ -58,6 +64,25 @@ def fx_tp104_dxfs(tmp_path):
     shutil.copyfile(src_mech, mech_dest)
     shutil.copyfile(src_str,  str_dest)
     return mech_dest, str_dest
+
+
+@pytest.fixture
+def fx_job_without_dxfs(fx_isolated_jobs):
+    """A job with an **empty** ``cleaned/`` directory.
+
+    Nine of the route-logic tests (the pair-artifact whitelist, the
+    traversal guard, the 404s) need no DXF geometry at all — they only
+    need a job that exists.  Depending on the TP-104 fixture made them
+    skip, which hid a path-traversal guard and four validation guards.
+    """
+    import uuid
+    from jobs import create_job_legacy, job_dir
+
+    job = create_job_legacy(drawing_a_name="mech.dxf", drawing_a_size=1,
+                            drawing_b_name="str.dxf", drawing_b_size=1,
+                            clean_version="v1")
+    (job_dir(job.job_id) / "cleaned").mkdir(parents=True, exist_ok=True)
+    return job.job_id
 
 
 @pytest.fixture

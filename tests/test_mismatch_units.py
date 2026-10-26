@@ -1079,3 +1079,68 @@ def test_layer_zero_inherits_insert_layer():
     assert clf.candidates("NONSENSE-LAYER", ()) == frozenset()
     # two distinct keys: the prefixed and bare names share one cache slot
     assert clf.prefilter_cache_size() == 2
+
+# ── the two §6.2 unit tests the plan names ────────────────────────────────
+
+def test_kabsch_rigid_exact():
+    """§6.2: the rigid fit must recover an exact rotation + translation.
+
+    The bolt-pattern fit (§1.3 A.3) is Kabsch, so its correctness has to
+    be pinned directly — not only through the synthetic pattern cases.
+    """
+    angle = math.radians(23.0)
+    R = np.asarray([[math.cos(angle), -math.sin(angle)],
+                    [math.sin(angle), math.cos(angle)]])
+    t = np.asarray([120.0, -45.0])
+    src = np.asarray([[0.0, 0.0], [10.0, 0.0], [0.0, 7.0], [13.0, -4.0]])
+    dst = src @ R.T + t
+
+    R_fit, t_fit, rms = geom.kabsch_rigid(src, dst)
+
+    assert rms == pytest.approx(0.0, abs=1e-9)
+    assert np.allclose(R_fit, R, atol=1e-9)
+    assert np.allclose(t_fit, t, atol=1e-9)
+    # a rigid fit does not scale
+    assert abs(float(np.linalg.det(R_fit)) - 1.0) < 1e-12
+
+
+def test_fit_uncertainty_inflates_tolerance():
+    """§6.2: the fit's own uncertainty widens the tolerance.
+
+    §3 of the plan: ``tol_eff = hypot(tol, k_fit · sigma_at(p))``.  A
+    finding that is inside the fit's own error bar must not be reported
+    as a defect — and the whole §3 machinery was untested because every
+    detection test ran against a *perfect* transform.
+    """
+    from core.mismatch.context import FitContext
+
+    # a fit with a 5 mm RMS residual at the inliers
+    payload = {
+        "rms_residual": 5.0,
+        "median_spacing": 6000.0,
+        "correspondences": [
+            {"mech": [0.0, 0.0], "loo_residual": 5.0, "inlier": True},
+            {"mech": [6000.0, 0.0], "loo_residual": 5.0, "inlier": True},
+            {"mech": [0.0, 6000.0], "loo_residual": 5.0, "inlier": True},
+            {"mech": [6000.0, 6000.0], "loo_residual": 5.0, "inlier": True},
+        ],
+        "quality": {"status": "ok"},
+    }
+
+    uncertain = FitContext.from_transform_json(payload, mm_per_unit=1.0,
+                                               k_fit=3.0)
+    perfect = FitContext.from_transform_json(
+        {"rms_residual": 0.0, "correspondences": [], "quality": {"status": "ok"}},
+        mm_per_unit=1.0, k_fit=3.0)
+
+    point = (3000.0, 3000.0)
+    assert uncertain.sigma_at(point) > 0.0
+    # the effective tolerance is wider than the bare one …
+    assert uncertain.tol_eff(1.0, point) > 1.0
+    # … and it is wider than it would be for a perfect fit
+    assert uncertain.tol_eff(1.0, point) > perfect.tol_eff(1.0, point)
+    # the documented formula
+    assert uncertain.tol_eff(1.0, point) == pytest.approx(
+        math.hypot(1.0, 3.0 * uncertain.sigma_at(point)))
+    # a perfect fit does not widen it at all
+    assert perfect.tol_eff(1.0, point) == pytest.approx(1.0)

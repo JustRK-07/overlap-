@@ -33,10 +33,10 @@ def test_get_analyze_404_on_unknown_job(fx_client, fx_isolated_jobs):
     assert r.status_code == 404
 
 
-def test_get_analyze_404_when_artifacts_missing(fx_client, fx_job_with_cleaned_dxfs):
+def test_get_analyze_404_when_artifacts_missing(fx_client, fx_job_without_dxfs):
     """A job that hasn't run stages 6/7.5 yet has no transform.json →
     404, not 500."""
-    job_id = fx_job_with_cleaned_dxfs
+    job_id = fx_job_without_dxfs
     r = fx_client.get(f"/api/v1/overlay/{job_id}/analyze")
     assert r.status_code == 404
     assert "transform.json" in r.json()["detail"]
@@ -91,9 +91,9 @@ def test_get_analyze_specific_pair(fx_client, fx_job_with_cleaned_dxfs, fx_tp104
     assert "intersections" in body
 
 
-def test_get_analyze_specific_pair_404_when_missing(fx_client, fx_job_with_cleaned_dxfs):
+def test_get_analyze_specific_pair_404_when_missing(fx_client, fx_job_without_dxfs):
     """?pair_id=X where X has no transform.json → 404."""
-    job_id = fx_job_with_cleaned_dxfs
+    job_id = fx_job_without_dxfs
     r = fx_client.get(
         f"/api/v1/overlay/{job_id}/analyze?pair_id=ghost",
     )
