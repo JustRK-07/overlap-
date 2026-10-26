@@ -36,6 +36,13 @@ Run the test suite:
 python3 -m pytest -q
 ```
 
+Every fix made in the 2026-10 review is recorded in **[FIXES.md](FIXES.md)**,
+with the reproduction that proved it.  Re-run them all at any time:
+
+```bash
+python3 tests/verify_fixes.py     # re-runs all 14 reproductions
+```
+
 ---
 
 ## Roles are explicit, never guessed

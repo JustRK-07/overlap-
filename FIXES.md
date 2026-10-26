@@ -21,6 +21,27 @@ the unfixed code*. A fix with no test is not done — it is a hope.
 
 ---
 
+## Where this ended up
+
+| | |
+|---|---|
+| **Defects found and fixed** | **13** (A1–A13) — every one reproduced before the fix and re-measured after |
+| **PLAN.md "Done when" criteria closed** | **5** (B1–B5) |
+| **PLAN_MISMATCH 8b.5 / 8b.6 / 8b.7 / 8c** | **31 of 31** deliverables |
+| **Test-suite hygiene defects** | **14** (D1–D14) |
+| **Test files the plans named but never had** | **8** — all written |
+| **Suite** | 389 passed / 24 skipped → **494 passed / 15 skipped** |
+| **Perf** | the overlay's handle lookup 14.83 s → 0.004 s; the bolt check 74.5 s → 2.4 s |
+
+**Re-verify everything at any time:**
+
+```bash
+python3 tests/verify_fixes.py     # re-runs all 14 reproductions — 14/14 pass
+python3 -m pytest -q              # the whole suite
+```
+
+---
+
 ## Part A — Tier 1: critical defects (all independently reproduced)
 
 ### A1 · `core/overlay.py:661-663` — overlay is O(N²) on the critical path
@@ -347,6 +368,8 @@ tooltip that says why.
 |---|---|---|
 | 2026-10-25 | Analysis | 7 review agents + 3 fix-mapping agents; 84 files; defects independently reproduced |
 | 2026-10-25 | Phase 1 (Tier 1) | **A1–A10 all VERIFIED.** 16 new regression tests; suite 389 → **405 passed**, 24 skipped, 0 failed. Every new test proven to FAIL on the original code (A1/A3/A5–A8 by temporary revert; A2/A4/A9/A10 by construction). |
+| 2026-10-26 | **Verification** | `tests/verify_fixes.py` re-runs all 14 reproductions — **14/14 pass**.  The app boots on the `PORT` override, serves the findings panel, and `/api/v1/capabilities` reports `dwg_export: false` (ODA is not installed here).  `run.sh` now honours `PORT`/`HOST` — the README documented a `PORT=8765 ./run.sh` that was silently ignored. |
+| 2026-10-26 | Phase 7 | Final state recorded below. |
 | 2026-10-25 | Phase 6 | **A11–A13 VERIFIED, all the missing plan test files written, and the hygiene D1–D14 fixed.**  Suite 478 → **494 passed**; the skips went 24 → 15 (nine geometry-free tests recovered).  D1 was the important one: the mismatch severity check was vacuous, so severity had never really been tested. |
 | 2026-10-25 | Phase 5 (8b.7 + 8c) | **C-8b.7 and C-8c VERIFIED.** `tests/synth_perf.py` (190 328 entities), `tests/test_mismatch_perf.py` (4 tests), `core/export_dwg.py`, `tests/test_export_dwg.py` (10 tests).  Suite 453 → **467 passed**, 24 skipped, 0 failed.  The perf test found an O(n²) bug in the pattern grouping — 81.9 s → 9.9 s. |
 | 2026-10-25 | Phase 4 (8b.6) | **C-8b.6 all VERIFIED.** 23 new tests (`tests/test_findings_api.py` + `tests/test_static_assets.py`); suite 428 → **453 passed**, 24 skipped, 0 failed.  The UI work also fixed the XSS the review flagged and the 9-column step rail. |
