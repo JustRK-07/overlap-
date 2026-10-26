@@ -39,6 +39,7 @@ from ezdxf import transform as ez_transform
 from ezdxf import xref
 from ezdxf.addons.importer import Importer
 from ezdxf.entities import Insert
+from ezdxf.lldxf.const import DXFAttributeError
 from ezdxf.tools import standards
 
 from jobs import job_dir, load_job
@@ -732,7 +733,13 @@ def apply_source_layers(doc, report: OverlayReport, style: OverlayStyle | None =
 
     def add(entities, source: str, *, in_block: bool) -> None:
         for e in entities:
-            layer = e.dxf.layer
+            try:
+                layer = e.dxf.layer
+            except (AttributeError, DXFAttributeError):
+                # Some entity types carry no layer of their own — RTEXT (the
+                # Autodesk rich-text proxy) is one.  There is nothing to
+                # rename, so skip it rather than abort the whole overlay.
+                continue
             if in_block and layer in KEEP_LAYERS:
                 continue                     # ByBlock / ByLayer inheritance
             key = (source, layer)

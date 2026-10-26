@@ -75,6 +75,12 @@ def test_run_pairs_for_job_runs_both_pairs_to_done(fx_isolated_jobs, fx_three_dx
             meta["cleaned_filename"] = meta["name"]
         else:
             meta.cleaned_filename = meta.name
+    # The real TP-104 MECH drawing declares $INSUNITS=1 (inch) but is drawn
+    # in millimetres, so the fit's unit prior expects 0.0394 against a true
+    # scale of 1.0.  The grid proves the two drawings share an origin, so the
+    # header is wrong — allow the weak fit, which is what a user does with
+    # this drawing.
+    job.options = {**(job.options or {}), "allow_weak_fit": True}
     save_job(job)
 
     # Write a convention.json so fit.py can read it.
@@ -134,6 +140,12 @@ def test_pairs_endpoint_returns_both_pairs(fx_client, fx_isolated_jobs, fx_three
             meta["cleaned_filename"] = meta["name"]
         else:
             meta.cleaned_filename = meta.name
+    # The real TP-104 MECH drawing declares $INSUNITS=1 (inch) but is drawn
+    # in millimetres, so the fit's unit prior expects 0.0394 against a true
+    # scale of 1.0.  The grid proves the two drawings share an origin, so the
+    # header is wrong — allow the weak fit, which is what a user does with
+    # this drawing.
+    job.options = {**(job.options or {}), "allow_weak_fit": True}
     save_job(job)
 
     (d / "axes").mkdir(exist_ok=True)
@@ -176,6 +188,12 @@ def test_analyze_endpoint_returns_pairs_wrapper(fx_client, fx_isolated_jobs, fx_
             meta["cleaned_filename"] = meta["name"]
         else:
             meta.cleaned_filename = meta.name
+    # The real TP-104 MECH drawing declares $INSUNITS=1 (inch) but is drawn
+    # in millimetres, so the fit's unit prior expects 0.0394 against a true
+    # scale of 1.0.  The grid proves the two drawings share an origin, so the
+    # header is wrong — allow the weak fit, which is what a user does with
+    # this drawing.
+    job.options = {**(job.options or {}), "allow_weak_fit": True}
     save_job(job)
 
     (d / "axes").mkdir(exist_ok=True)
@@ -222,6 +240,12 @@ def test_run_pair_idempotent_when_re_run(fx_isolated_jobs, fx_three_dxfs):
             meta["cleaned_filename"] = meta["name"]
         else:
             meta.cleaned_filename = meta.name
+    # The real TP-104 MECH drawing declares $INSUNITS=1 (inch) but is drawn
+    # in millimetres, so the fit's unit prior expects 0.0394 against a true
+    # scale of 1.0.  The grid proves the two drawings share an origin, so the
+    # header is wrong — allow the weak fit, which is what a user does with
+    # this drawing.
+    job.options = {**(job.options or {}), "allow_weak_fit": True}
     save_job(job)
 
     (d / "axes").mkdir(exist_ok=True)

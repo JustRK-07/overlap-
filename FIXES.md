@@ -31,7 +31,8 @@ the unfixed code*. A fix with no test is not done — it is a hope.
 | **Test-suite hygiene defects** | **14** (D1–D14) |
 | **Test files the plans named but never had** | **8** — all written |
 | **Findings from the review left open** | **13 groups** — see **Part E** |
-| **Suite** | 389 passed / 24 skipped → **494 passed / 15 skipped** (509 collected) |
+| **Suite (synthetic)** | 389 passed / 24 skipped → **494 passed / 15 skipped** (509 collected) |
+| **Suite (real TP-104)** | 500 passed / 9 failed / 0 skipped → **509 passed / 0 failed / 0 skipped** |
 | **Perf** | the overlay's handle lookup 14.83 s → 0.004 s; the bolt check 74.5 s → 2.4 s |
 
 **Re-verify everything at any time:**
@@ -520,13 +521,69 @@ repeated many times.
 
 ---
 
+## Part F — the real TP-104 drawings
+
+The whole review ran against synthetic fixtures.  The real drawings turned
+out to be on this machine at
+`edi_sem_5/ISGEC-4/dxf/TP-104 {MECH,STR} GA_clean3.dxf`, so the suite was
+run against them:
+
+```bash
+ISGEC_DIR=.../edi_sem_5/ISGEC-4 python3 -m pytest -q
+```
+
+That took the skips from 15 to **0** and immediately exposed three defects
+that no synthetic fixture can reach.
+
+### F1 · `core/grid.py` — a drawing that only *labels* its grid cannot be detected
+
+| | |
+|---|---|
+| **Severity** | **Critical** (the superimposition does not run) |
+| **Symptom** | The TP-104 **MECH** drawing has *no gridlines* — it only labels them.  Each axis is a short LINE on a "CEN"-type layer beside its label (~600 units away).  `detect_grid` needs a *candidate segment* of at least `MIN_LEN_FRAC` (0.15) × the drawing's extent, so the short marker lines were thrown away and 6 of the 7 axes came back `missing` ("no candidate line within gates"). |
+| **Measured** | before: MECH **1/7** axes, STR 7/7 → the fit found **0** shared intersections and died. |
+| **Root cause** | The extent-relative candidate filter assumes the drawing *draws* its grid. |
+| **Fix** | `core/grid.py` gained an **axis-aligned fallback**: a label that cannot be associated with a candidate segment is associated with the nearest *strongly axis-aligned* line, whatever its length and layer.  The distance is to the nearest point **of the segment**, not to the infinite line — a long line that merely passes beside the label is 0 away from the infinite line but far from the line itself. |
+| **Why not a layer list** | The original ISGEC script used a whitelist (`CEN`, `CENETR LINE`, `CENTER`, `PHANTOM`, `PANTHOM`, `HIDDEN`, `HIDDDEN`).  The fallback is **layer-agnostic** and reproduces the same seven coordinates, so it survives the next drawing.  Measured: the perpendicular-to-infinite-line rule gives 4/7; the point-to-segment rule gives **7/7**. |
+| **Connected files** | `core/grid.py` (`_axis_aligned_candidates`, `_associate_axis_aligned`, `detect_grid`, `_associate`).  `tests/test_grid.py` — the "no candidate" assertion now accepts either message. |
+| **Status** | **VERIFIED** — MECH **7/7**, STR 7/7, 12 intersections each. |
+
+### F2 · `core/overlay.py` — RTEXT has no `layer` attribute
+
+| | |
+|---|---|
+| **Severity** | High (the overlay stage aborts on a real drawing) |
+| **Symptom** | `apply_source_layers` did `e.dxf.layer` on every entity.  The TP-104 drawings contain **RTEXT** (Autodesk's rich-text proxy), which carries no layer of its own in ezdxf 1.4.4 → `DXFAttributeError: Invalid DXF attribute "layer" for entity RTEXT` — the whole overlay stage died. |
+| **Root cause** | The entity list was assumed to be uniformly layer-bearing. |
+| **Fix** | The layer read is guarded; an entity with no layer of its own is skipped (there is nothing to rename). |
+| **Connected files** | `core/overlay.py::apply_source_layers` only. |
+| **Status** | **VERIFIED** |
+
+### F3 · the TP-104 MECH drawing's `$INSUNITS` is wrong
+
+| | |
+|---|---|
+| **Severity** | Medium (the fit is refused on an exact fit) |
+| **Symptom** | The MECH header says `$INSUNITS = 1` (**inch**) but the drawing is in **millimetres**.  The fit's unit prior therefore expects a scale of 0.0394 while the grid gives exactly 1.0, and the fit is refused. |
+| **Root cause** | A wrong header in the drawing — not a bug in the pipeline.  The gate is doing exactly its job: a header that disagrees with the grid is the first thing to check. |
+| **Decision** | **The gate stays.**  Weakening it ("an exact fit implies the header is wrong") is indistinguishable from the case the gate exists for — a genuinely unit-mismatched pair also fits exactly.  The designed escape hatch is `allow_weak_fit` (PLAN.md step 9), which downgrades the gate to a warning. |
+| **The transform** | with `allow_weak_fit`: scale **1.0**, rotation **0.0**, tx **208379.8605**, ty **−179584.5241**, rms **7.9e-07**, 12/12 inliers — **identical to the original ISGEC pipeline's own `transform.json`** (tx 208379.86046, ty −179584.52411, rms 2.3e-07). |
+| **Connected files** | `core/fit.py` (unchanged), `tests/conftest.py` — the TP-104 job fixture now sets `allow_weak_fit`, which is what a user does with this drawing. |
+| **Status** | **VERIFIED** |
+
+---
+
+---
+
 ## Execution log
 
 | Date | Phase | Result |
 |---|---|---|
 | 2026-10-25 | Analysis | 7 review agents + 3 fix-mapping agents; 84 files; defects independently reproduced |
 | 2026-10-25 | Phase 1 (Tier 1) | **A1–A10 all VERIFIED.** 16 new regression tests; suite 389 → **405 passed**, 24 skipped, 0 failed. Every new test proven to FAIL on the original code (A1/A3/A5–A8 by temporary revert; A2/A4/A9/A10 by construction). |
+| 2026-10-26 | Phase 8 | **The real drawings.**  Found on this machine at `edi_sem_5/ISGEC-4/dxf/`.  Running the suite against them took the skips from 15 to 0 and exposed three defects no synthetic fixture can reach: the MECH grid is only *labelled*, not drawn (F1); RTEXT carries no `layer` (F2); and the MECH header says inches (F3).  Real-drawings suite: **509 passed, 0 failed, 0 skipped** (12 min — the drawings are 14 MB).  The transform the pipeline now produces matches the original ISGEC pipeline's own `transform.json` to 4 decimals. |
 | 2026-10-26 | **Verification** | 509 tests collected; **494 passed, 15 skipped, 0 failed**.  64 files changed, +5 686 / −331. |
+| 2026-10-26 | Phase 8 | **The real drawings.**  Found on this machine at `edi_sem_5/ISGEC-4/dxf/`.  Running the suite against them took the skips from 15 to 0 and exposed three defects no synthetic fixture can reach: the MECH grid is only *labelled*, not drawn (F1); RTEXT carries no `layer` (F2); and the MECH header says inches (F3).  Real-drawings suite: **509 passed, 0 failed, 0 skipped** (12 min — the drawings are 14 MB).  The transform the pipeline now produces matches the original ISGEC pipeline's own `transform.json` to 4 decimals. |
 | 2026-10-26 | **Verification** | `tests/verify_fixes.py` re-runs all 14 reproductions — **14/14 pass**.  The app boots on the `PORT` override, serves the findings panel, and `/api/v1/capabilities` reports `dwg_export: false` (ODA is not installed here).  `run.sh` now honours `PORT`/`HOST` — the README documented a `PORT=8765 ./run.sh` that was silently ignored. |
 | 2026-10-26 | Phase 7 | Final state recorded below. |
 | 2026-10-25 | Phase 6 | **A11–A13 VERIFIED, all the missing plan test files written, and the hygiene D1–D14 fixed.**  Suite 478 → **494 passed**; the skips went 24 → 15 (nine geometry-free tests recovered).  D1 was the important one: the mismatch severity check was vacuous, so severity had never really been tested. |

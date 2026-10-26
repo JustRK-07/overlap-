@@ -117,6 +117,12 @@ def fx_job_with_cleaned_dxfs(fx_isolated_jobs, fx_tp104_dxfs, tmp_path):
 
     # Mark the job as state="done" so endpoints that gate on state pass.
     job.state = "done"
+    # The real TP-104 MECH drawing declares $INSUNITS=1 (inch) but is drawn
+    # in millimetres, so the fit's unit prior computes an expected scale of
+    # 0.0394 against a true scale of 1.0.  The grid says the two drawings
+    # share an origin, so the header — not the fit — is wrong: allow the weak
+    # fit, which is what a user does with this drawing.
+    job.options = {**(job.options or {}), "allow_weak_fit": True}
     save_job(job)
     return job.job_id
 

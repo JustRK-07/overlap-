@@ -414,7 +414,96 @@ def merge_collinear(segs: Sequence[Segment], ang_tol: float = 1e-6,
     return out
 
 
-# ───────────────────────────── detection ─────────────────────────────
+# ── the axis-aligned fallback ──────────────────────────────────────────────
+#
+# Some drawings do not draw their grid — they only *label* it.  The TP-104
+# MECH drawing is one: each grid axis is a short LINE on a "CEN"-type layer
+# beside its label, and there is no long gridline to find at all.  The
+# extent-relative candidate filter (MIN_LEN_FRAC x extent) throws those away,
+# so the label can never be associated with a line.
+#
+# The fallback associates a label with the nearest *strongly axis-aligned*
+# segment, whatever its length and whatever its layer.  It is deliberately
+# layer-agnostic — a project-specific layer list would not survive the next
+# drawing.
+
+#: How far a line may drift across its own axis and still count as
+#: axis-aligned (drawing units).
+AXIS_ALIGNED_DRIFT = 1.0
+
+#: How long an axis-aligned line must be along its axis to be a candidate.
+AXIS_ALIGNED_MIN_LEN = 100.0
+
+#: The fallback's gate: how far the label may sit from the line, as a
+#: fraction of the drawing's extent.
+FALLBACK_PERP_FRAC = 0.1
+
+
+def _axis_aligned_candidates(lines) -> list[GridLineCand]:
+    """Every strongly axis-aligned world segment, as a candidate.
+
+    These are *not* filtered by length or layer — that is the point: they are
+    the short marker lines a drawing puts beside its grid labels.
+    """
+    out: list[GridLineCand] = []
+    for it in lines:
+        e = it.entity
+        try:
+            layer = e.dxf.layer
+            segs = _entity_segments(e)
+        except Exception:
+            continue
+        for a, b in segs:
+            wa, wb = _world_pt(it.m, a), _world_pt(it.m, b)
+            dx, dy = wb.x - wa.x, wb.y - wa.y
+            if abs(dx) <= AXIS_ALIGNED_DRIFT and abs(dy) >= AXIS_ALIGNED_MIN_LEN:
+                lo, hi = (wa, wb) if wa.y <= wb.y else (wb, wa)
+                cand = GridLineCand(point=lo, dir=Vec2(0.0, 1.0),
+                                    length=abs(dy))
+            elif abs(dy) <= AXIS_ALIGNED_DRIFT and abs(dx) >= AXIS_ALIGNED_MIN_LEN:
+                lo, hi = (wa, wb) if wa.x <= wb.x else (wb, wa)
+                cand = GridLineCand(point=lo, dir=Vec2(1.0, 0.0),
+                                    length=abs(dx))
+            else:
+                continue
+            seg = Segment(lo, hi, layer, it.handles, it.chain)
+            cand.members.append(seg)
+            cand.chains.add(it.chain)
+            cand.handle_sets.add(it.handles)
+            cand.layers.add(layer.upper())
+            out.append(cand)
+    return out
+
+
+def _associate_axis_aligned(occ: LabelOcc, cands: list[GridLineCand],
+                            start: int, extent: float):
+    """The fallback: the nearest axis-aligned line to the label.
+
+    The distance is to the nearest point **of the segment**, not to the
+    infinite line: a long line that merely passes beside the label is 0 away
+    from the infinite line but far away from the line itself, and it is the
+    latter that says "this label belongs to this line".
+
+    Returns ``(index | None, reason)``.  The index is into ``cands`` at or
+    after ``start`` — the fallback pool.
+    """
+    best, best_dist = None, float("inf")
+    for i in range(start, len(cands)):
+        c = cands[i]
+        t = c.param(occ.world_pt)
+        t = 0.0 if t < 0.0 else (c.length if t > c.length else t)
+        px = c.point.x + c.dir.x * t
+        py = c.point.y + c.dir.y * t
+        dist = math.hypot(occ.world_pt.x - px, occ.world_pt.y - py)
+        if dist < best_dist:
+            best_dist, best = dist, i
+    if best is None:
+        return None, "no axis-aligned line near the occurrence"
+    gate = FALLBACK_PERP_FRAC * max(extent, 1.0)
+    if best_dist > gate:
+        return None, (f"no axis-aligned line within the gate — the nearest is "
+                      f"{best_dist:.0f} away (gate {gate:.0f})")
+    return best, "nearest axis-aligned line"
 
 @dataclass
 class GridAxis:
@@ -440,16 +529,22 @@ class GridResult:
         return {k: a for k, a in self.axes.items() if a.status == "ok"}
 
 
-def _associate(occ: LabelOcc, cands: list[GridLineCand]):
-    """Return (candidate index | None, reason)."""
+def _associate(occ: LabelOcc, cands: list[GridLineCand], limit: int | None = None):
+    """Return (candidate index | None, reason).
+
+    ``limit`` bounds the search to the first ``limit`` candidates — the
+    extent-relative pool.  The axis-aligned fallback pool that follows it is
+    only consulted when this returns nothing.
+    """
+    n = len(cands) if limit is None else limit
     # 1) same-INSERT rule
-    same = [i for i, c in enumerate(cands) if occ.handles and occ.handles in c.handle_sets]
+    same = [i for i in range(n) if occ.handles and occ.handles in cands[i].handle_sets]
     if len(same) == 1:
         return same[0], "same-insert"
     if same:
         pool, gated = same, False
     else:
-        pool, gated = list(range(len(cands))), True
+        pool, gated = list(range(n)), True
     best, best_cost = None, float("inf")
     for i in pool:
         c = cands[i]
@@ -475,6 +570,10 @@ def detect_grid(doc, prefix: str, suffixes: Sequence[str]) -> GridResult:
     segs = candidate_segments(doc, _lines=lines, _extent_val=ext)
     cands = [c for c in merge_collinear(segs, 1e-6, 1e-6 * ext, MERGE_GAP_FRAC * ext)
              if c.length >= MIN_LEN_FRAC * ext]
+    # The fallback pool: short, strongly axis-aligned lines.  Kept separate so
+    # the primary strategy never sees them.
+    n_primary = len(cands)
+    cands = cands + _axis_aligned_candidates(lines)
 
     axes: dict[str, GridAxis] = {}
     chosen: dict[str, int] = {}
@@ -486,7 +585,10 @@ def detect_grid(doc, prefix: str, suffixes: Sequence[str]) -> GridResult:
             continue
         votes = Counter()
         for o in occs[sfx]:
-            idx, why = _associate(o, cands)
+            idx, why = _associate(o, cands, n_primary)
+            if idx is None:
+                # the drawing may only *label* its grid, not draw it
+                idx, why = _associate_axis_aligned(o, cands, n_primary, ext)
             if idx is None:
                 ax.reasons.append(f"occurrence at ({o.world_pt.x:.3f}, {o.world_pt.y:.3f}): {why}")
             else:
