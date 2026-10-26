@@ -30,7 +30,7 @@ the unfixed code*. A fix with no test is not done — it is a hope.
 | **PLAN_MISMATCH 8b.5 / 8b.6 / 8b.7 / 8c** | **31 of 31** deliverables |
 | **Test-suite hygiene defects** | **14** (D1–D14) |
 | **Test files the plans named but never had** | **8** — all written |
-| **Suite** | 389 passed / 24 skipped → **494 passed / 15 skipped** |
+| **Suite** | 389 passed / 24 skipped → **494 passed / 15 skipped** (509 collected) |
 | **Perf** | the overlay's handle lookup 14.83 s → 0.004 s; the bolt check 74.5 s → 2.4 s |
 
 **Re-verify everything at any time:**
@@ -368,6 +368,7 @@ tooltip that says why.
 |---|---|---|
 | 2026-10-25 | Analysis | 7 review agents + 3 fix-mapping agents; 84 files; defects independently reproduced |
 | 2026-10-25 | Phase 1 (Tier 1) | **A1–A10 all VERIFIED.** 16 new regression tests; suite 389 → **405 passed**, 24 skipped, 0 failed. Every new test proven to FAIL on the original code (A1/A3/A5–A8 by temporary revert; A2/A4/A9/A10 by construction). |
+| 2026-10-26 | **Verification** | 509 tests collected; **494 passed, 15 skipped, 0 failed**.  64 files changed, +5 686 / −331. |
 | 2026-10-26 | **Verification** | `tests/verify_fixes.py` re-runs all 14 reproductions — **14/14 pass**.  The app boots on the `PORT` override, serves the findings panel, and `/api/v1/capabilities` reports `dwg_export: false` (ODA is not installed here).  `run.sh` now honours `PORT`/`HOST` — the README documented a `PORT=8765 ./run.sh` that was silently ignored. |
 | 2026-10-26 | Phase 7 | Final state recorded below. |
 | 2026-10-25 | Phase 6 | **A11–A13 VERIFIED, all the missing plan test files written, and the hygiene D1–D14 fixed.**  Suite 478 → **494 passed**; the skips went 24 → 15 (nine geometry-free tests recovered).  D1 was the important one: the mismatch severity check was vacuous, so severity had never really been tested. |
