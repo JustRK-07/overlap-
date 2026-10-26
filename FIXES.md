@@ -30,6 +30,7 @@ the unfixed code*. A fix with no test is not done — it is a hope.
 | **PLAN_MISMATCH 8b.5 / 8b.6 / 8b.7 / 8c** | **31 of 31** deliverables |
 | **Test-suite hygiene defects** | **14** (D1–D14) |
 | **Test files the plans named but never had** | **8** — all written |
+| **Findings from the review left open** | **13 groups** — see **Part E** |
 | **Suite** | 389 passed / 24 skipped → **494 passed / 15 skipped** (509 collected) |
 | **Perf** | the overlay's handle lookup 14.83 s → 0.004 s; the bolt check 74.5 s → 2.4 s |
 
@@ -359,6 +360,163 @@ tooltip that says why.
 |  D12  |  `tests/test_api_options.py`  |  `fx_no_worker` exists but 8 of ~11 job-creating tests don't use it  | all 14 now stop the worker | VERIFIED |
 |  D13  |  `tests/test_grid_robust_extent.py:18`  |  `from tests import synth` vs `import synth` — two distinct module objects  | one import path | VERIFIED |
 |  D14  |  `tests/conftest.py:52`  |  9 of the 24 TP-104 skips need **no DXF geometry** — they are fixture-cascade artefacts hiding a path-traversal guard and 4 validation guards  | a new `fx_job_without_dxfs` fixture (a job with an empty `cleaned/`) and the nine tests moved onto it | VERIFIED |
+
+---
+
+## Part E — findings from the review that are **still open**
+
+The review raised more findings than the plan's scope.  These are recorded
+here so the work is resumable — they were found, understood, and left.
+
+### E1 · `core/clean_policy.py:279` — the STR keep-list is chosen by set length
+
+```python
+keep_block_prefixes_str = str_prefixes if len(str_prefixes) >= len(mech_prefixes) else mech_prefixes
+```
+
+The MECH and STR drawings are passed in separately, and then merged by
+*how many prefixes each had*.  A MECH-heavy drawing therefore replaces the
+STR namespaces, and `core/clean_common.py` then deletes the STR geometry
+outright.  The two lists must never be merged.
+
+### E2 · `core/labels.py:85` — the label dedup is used for *protection*
+
+`core/axes.extract_labels` deduplicates by text, which is right for
+*scoring* a suggestion but wrong for *deciding what must not be deleted*.
+TP-104 puts the same axis label at **both ends** of a gridline, so exactly
+one copy is protected and the other is stripped — the delivered drawing
+loses half its grid annotations.
+
+### E3 · `core/clean_common.py` — four smaller defects
+
+* `:430` — `dimltype` (a **linetype** name) is added to the reachable-**block**
+  set, so a block named like a linetype is never deleted.
+* `:527` — the documented `*U`/`*D` orphan deletion is **dead**: the
+  condition is unreachable because `_is_safe_to_delete` has no `*` prefix.
+* `:284` — the marker-block prefix match is case-sensitive, while the
+  layer match next to it is not.
+* `:250` — `e.dxf.layer != policy.marker_layer` is an exact, case-sensitive
+  comparison; a layer named `Box` keeps every callout balloon.
+
+### E4 · `core/axes.py:150` — `MIN_GRIDLINE_LENGTH = 100.0` is still absolute
+
+The same class as A12: a metre-scale drawing loses every gridline from
+the proximity evidence, so the prefix suggestion degrades.
+
+### E5 · `core/smart3d.py` — the INSERT transform is incomplete
+
+`walk_block_lines` applies translation + scale only: **no rotation, no
+block base point, no negative scale**.  A rotated member lands in the
+wrong place, which poisons every distance check downstream.  The 90 %
+anchor heuristic can also flip the whole document when one block is
+repeated many times.
+
+### E6 · `core/spotcheck.py` / `core/mech_intra.py` / `core/str_intra.py`
+
+* the saddle placement ignores the INSERT rotation (`:207`)
+* `is_bolted` accepts a bolt **anywhere** in the drawing (`:624`)
+* the intra-merge `except Exception` discards the **whole** issue set on a
+  schema mismatch, and the failure only reaches stdout (`:709-716`)
+* only the **largest** building outline is used, so equipment in a second
+  building is a false `BUILDING_CLASH` (`mech_intra.py:313`)
+* `BUILDING_CLASH.distance` is a vertex count but the DOCX prints it as mm
+* `_detect_clearance` is O(n²) with no spatial index (`mech_intra.py:378`)
+* `str_intra` promotes `Bolt-*` / `Connection-*` blocks to beams — the
+  cross-drawing extractor skips them, so the two disagree
+* the same-block exclusion is by **name**, so a beam↔column clash inside
+  one block is never reported
+
+### E7 · `core/fit.py` / `core/transform2d.py`
+
+* the affine branch can write `model: "affine"` for a **similarity**
+  (`:353`)
+* an invalid option value is silently dropped (`:122`)
+* the plan's `weak` status was implemented as `forced` (`:333`)
+* `FitOptions.from_job` reads the flat keys but not the derived `fit`
+  sub-dict — while `OverlayStyle` reads the sub-dict.  The two readers are
+  asymmetric.
+* `ransac_similarity` silently truncates to the first 400
+  correspondences (`transform2d.py:412`)
+
+### E8 · `core/overlay.py`
+
+* the `Importer` fallback **loses the anonymous `*U` blocks** — real
+  drawings use them heavily (`:165`)
+* one skipped entity discards the **whole** block-name mapping (`:205`)
+* the explode path can leave entities untransformed (`:275`) — the one
+  hole in the "never leave an entity untransformed" guarantee
+* `apply_source_layers` deletes the original layer entries even when a
+  layer-state references them (`:781`)
+* a source layer that already starts with `STR|` would be double-prefixed
+
+### E9 · `core/package.py`
+
+* the grid preview is padded **twice** (5 % then 10 % → 15.5 %), and the
+  report's two "grid" extents disagree
+* `_build_report` indexes `transform[...]` directly, so a **legacy**
+  transform.json raises `KeyError` and fails the job after the drawing
+  was already produced
+* `report["counts"]["mech_in"]` / `str_in` silently become `None` on an
+  N-file job
+* `outliers_total` and `len(outliers)` disagree past 200 outliers
+
+### E10 · `routers/api.py` — the API contract vs the README
+
+* an **empty** form field contradicts the documented "use the default":
+  `qa_grid=""` gives False when the default is True, and `color_mode=""`
+  gives a 400 instead of the default
+* `auto_run=False` starts the worker anyway, and the response says
+  `auto_run: false`
+* `apply_axes` type-checks neither `prefix` nor the axis entries, so a
+  bad body is a **500**, not a 400 that names the field
+* the per-run `options` on `POST /{id}/pairs` are not validated
+* `POST /{id}/policy` succeeds but **cannot affect the run** — the
+  cleaning stage has already read the policy
+* `list_pairs` reports a never-run pair as `"done"`
+* `job_id` is never validated
+
+### E11 · `jobs.py`
+
+* `update_status` is a **racy read-modify-write** — the lock covers only
+  the write, so two concurrent updates lose a field
+* `status.json` is documented in two places and **never written**
+* `detected_axes` is a dead field
+* `_atomic_write` uses a fixed `.tmp` suffix (two processes would collide)
+
+### E12 · `static/app.js` — the front end
+
+* the Advanced **policy panel is clobbered by the 500 ms poll** — only
+  `label_regex` is guarded, so the other four fields cannot be edited
+* the axis-suggestion list is **rebuilt every poll**, destroying the
+  "selected" highlight
+* `pollStatus` swallows every HTTP error and polls forever
+* `loadDone` and the confirm POST never check `r.ok`, so a failure looks
+  like success
+
+### E13 · the smaller ones
+
+* `core/roles.py:78` — a malformed manifest raises a bare `TypeError`
+* `core/roles.py:65`, `core/dxfio.py:78` — the manifest and the audit
+  trail are written non-atomically; a corrupt `audit.json` is silently
+  discarded, destroying the audit trail
+* `core/convert.py:35` — the stem-collision check is case-sensitive, so
+  `Plant.dxf` + `plant.dxf` overwrite each other on Windows
+* `core/grid.py:95` — the `root=` docstring is inverted (the code is
+  right; a maintainer could "fix" working code)
+* `core/grid.py:73` — a failed `multi_insert()` degrades to one cell
+* `core/analyze.py:157` — the dead `_cleaned_dir` helper computes the
+  **wrong** path; the hotspot comprehension is duplicated verbatim
+* `core/clean_v1.py` / `core/clean_v2.py` — `run()` is ~85 % duplicated
+* `core/mismatch/policy.py` — four knobs are accepted, hashed and
+  validated but **never read**; a partial `families` override is fatal
+* `core/mismatch/features.py:870` — the band pairing is O(n²) rather than
+  GridIndex-based (the perf fixture does not stress it — the noise lines
+  are on a non-material layer)
+* `core/mismatch/checks/containment.py:173` — `_inward_normal` assumes a
+  CCW ring, and `features.py` does not normalise the winding, so a
+  clockwise outline makes every `EDGE_DISTANCE` arrow point outward
+
+---
 
 ---
 
