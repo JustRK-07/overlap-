@@ -19,6 +19,7 @@ Output:
 
 from __future__ import annotations
 
+from . import dxfio
 from .dxfio import read_internal as _read_internal, save as _dxf_save
 
 import json
@@ -105,7 +106,8 @@ def _extract_members(doc) -> tuple[list, list]:
     # A real structural column in a steel frame is at least 1-2m long
     # (single-story) or 3-6m (multi-story). Anything shorter is likely a
     # column-stub from a flange mark or end-plate detail.
-    MIN_COLUMN_LENGTH = 500.0
+    # 500 mm, expressed in the STR drawing's own units.
+    MIN_COLUMN_LENGTH = 500.0 / max(dxfio.mm_per_unit(doc), 1e-9)
 
     beams, columns = [], []
     for ins in doc.modelspace():
@@ -135,7 +137,8 @@ def _extract_members(doc) -> tuple[list, list]:
             dx = b[0] - a[0]
             dy = b[1] - a[1]
             length = math.hypot(dx, dy)
-            if length < 100:
+            # 100 mm, in the STR drawing's units
+            if length < 100.0 / max(dxfio.mm_per_unit(doc), 1e-9):
                 continue
             seg = ((a, b), handle, nm)
             if abs(dy) < 0.1 * length:

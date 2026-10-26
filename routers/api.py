@@ -148,6 +148,21 @@ def set_option(job, key: str, value) -> None:
     job.options = normalize_options({**(job.options or {}), key: value})
 
 
+def _safe_upload_name(raw: str | None, fallback: str) -> str:
+    """The name an upload is stored under — **never** a path.
+
+    ``UploadFile.filename`` is the raw ``Content-Disposition`` value and
+    Starlette does not sanitise it, so ``/etc/cron.d/evil.dxf`` and
+    ``../../evil.dxf`` both arrive intact.  ``Path(raw).name`` keeps only
+    the last component, so the file always lands inside the job's
+    ``uploads/`` directory.
+    """
+    name = Path(raw or "").name.strip()
+    if not name or name in (".", ".."):
+        return fallback
+    return name
+
+
 @router.post("")
 async def create_overlay(
     drawing_a: UploadFile = File(..., alias="drawing_a"),
@@ -208,11 +223,15 @@ async def create_overlay(
         if f.size and f.size > body_limit:
             raise HTTPException(413, f"{f.filename} exceeds {MAX_UPLOAD_MB} MB limit")
 
-    # Create job + persist uploads
+    # Create job + persist uploads.  The recorded name and the written
+    # name are the same sanitised value — the cleaner looks the file up
+    # by the name in job.json.
+    name_a = _safe_upload_name(drawing_a.filename, "a.dxf")
+    name_b = _safe_upload_name(drawing_b.filename, "b.dxf")
     job = create_job_legacy(
-        drawing_a_name=drawing_a.filename or "a.dxf",
+        drawing_a_name=name_a,
         drawing_a_size=drawing_a.size or 0,
-        drawing_b_name=drawing_b.filename or "b.dxf",
+        drawing_b_name=name_b,
         drawing_b_size=drawing_b.size or 0,
         clean_version=clean_version,
         enabled_checks=checks,
@@ -220,8 +239,8 @@ async def create_overlay(
     )
 
     d = job_dir(job.job_id) / "uploads"
-    (d / drawing_a.filename).write_bytes(await drawing_a.read())
-    (d / drawing_b.filename).write_bytes(await drawing_b.read())
+    (d / name_a).write_bytes(await drawing_a.read())
+    (d / name_b).write_bytes(await drawing_b.read())
 
     # Spawn pipeline worker thread — DON'T await it; let it run in background
     threading.Thread(
@@ -324,8 +343,11 @@ async def upload_n_files(
     if str_count < 1:
         raise HTTPException(400, "at least one file must be role=str")
 
-    # No duplicate filenames (the cleaner uses them as keys).
-    names = [f.filename or f"file_{i}.dxf" for i, f in enumerate(files)]
+    # No duplicate filenames (the cleaner uses them as keys).  The name is
+    # reduced to its last path component — the raw filename is untrusted
+    # input and must never reach the filesystem.
+    names = [_safe_upload_name(f.filename, f"file_{i}.dxf")
+             for i, f in enumerate(files)]
     if len(set(names)) != len(names):
         raise HTTPException(400, "duplicate filenames in upload")
 
@@ -1298,6 +1320,12 @@ async def analyze(job_id: str, pair_id: str | None = None):
     job = load_job(job_id)
     if job is None:
         raise HTTPException(404, f"No such job: {job_id}")
+
+    # `pair_id` is a URL query parameter — untrusted.  It reaches
+    # `core.analyze._pair_artifact_root`, which joins it onto the job
+    # directory, so it must be sanitised before it gets there.
+    if pair_id is not None:
+        pair_id = _safe_pair_id(pair_id)
 
     from core.analyze import analyze_pair
 

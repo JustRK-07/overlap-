@@ -29,6 +29,7 @@ Writes:
 
 from __future__ import annotations
 
+from . import dxfio
 from .dxfio import read_internal as _read_internal, save as _dxf_save
 from .transform2d import Affine2D
 
@@ -132,6 +133,9 @@ def _find_mech_saddles(doc) -> list[dict]:
     """Return a list of {centroid: (x,y), block_name, handle, layer, footprint}."""
     saddles = []
     msp = doc.modelspace()
+    # the size bounds below are in millimetres; the geometry is in the
+    # MECH drawing's own units
+    mm = max(dxfio.mm_per_unit(doc), 1e-9)
 
     def _is_saddle_layer(layer: str) -> bool:
         upper = (layer or "").upper()
@@ -157,7 +161,8 @@ def _find_mech_saddles(doc) -> list[dict]:
         ys = [p[1] for p in pts]
         w = max(xs) - min(xs)
         h = max(ys) - min(ys)
-        if not (200 <= w <= 5000 and 200 <= h <= 5000):
+        if not (200.0 / mm <= w <= 5000.0 / mm
+                and 200.0 / mm <= h <= 5000.0 / mm):
             continue
         cx, cy = _polygon_centroid(pts)
         saddles.append({
@@ -202,7 +207,8 @@ def _find_mech_saddles(doc) -> list[dict]:
             ys = [p[1] for p in pts_local]
             w = (max(xs) - min(xs)) * abs(sx)
             h = (max(ys) - min(ys)) * abs(sy)
-            if not (200 <= w <= 5000 and 200 <= h <= 5000):
+            if not (200.0 / mm <= w <= 5000.0 / mm
+                    and 200.0 / mm <= h <= 5000.0 / mm):
                 continue
             pts_world = [(ix + sx * p[0], iy + sy * p[1]) for p in pts_local]
             cx, cy = _polygon_centroid(pts_world)
@@ -223,6 +229,11 @@ def _find_mech_saddles(doc) -> list[dict]:
 def _extract_str_beams_and_columns(doc) -> tuple[list, list]:
     """Walk every non-anonymous block + its INSERTs.
 
+    The thresholds below are in millimetres; the geometry is in the STR
+    drawing's own units, so they are divided by the drawing's
+    ``mm_per_unit``.  Without that a metre-scale STR (a 20 m beam = 20
+    units) fails the 100 unit minimum and *every* member is discarded.
+    
     Skips Bolt-* (their LINEs are bolt outlines, not beams — positions
     extracted separately via _extract_str_bolts) and Connection-*
     (empty placeholder blocks).
@@ -237,6 +248,7 @@ def _extract_str_beams_and_columns(doc) -> tuple[list, list]:
       columns:  list of ((x1,y1),(x2,y2), handle, block_name)
                 (long-axis = vertical, short-axis = horizontal)
     """
+    min_str_mm = max(dxfio.mm_per_unit(doc), 1e-9)
     is_anchor, _, _, _, _ = _detect_anchor_pattern(doc)
     apply_t = not is_anchor
 
@@ -268,7 +280,9 @@ def _extract_str_beams_and_columns(doc) -> tuple[list, list]:
             dx = b[0] - a[0]
             dy = b[1] - a[1]
             length = math.hypot(dx, dy)
-            if length < 100:
+            # 100 mm, expressed in the STR drawing's own units — a
+            # metre-scale STR would otherwise discard every member.
+            if length < 100.0 / min_str_mm:
                 continue
             try:
                 handle = ins.dxf.handle if ins.dxf.hasattr("handle") else ""
@@ -347,6 +361,7 @@ def _extract_str_gridlines(doc) -> list[tuple[float, str]]:
     Uses `grid.walk_world`, so block base point / rotation / nesting are
     applied through the ezdxf INSERT matrices (world coordinates).
     """
+    min_str_mm = max(dxfio.mm_per_unit(doc), 1e-9)
     from . import grid
     coords = []
     for it in grid.walk_world(doc):
@@ -363,7 +378,8 @@ def _extract_str_gridlines(doc) -> list[tuple[float, str]]:
             continue
         dx, dy = b.x - a.x, b.y - a.y
         length = math.hypot(dx, dy)
-        if length < 100:
+        # 100 mm, in the STR drawing's units
+        if length < 100.0 / min_str_mm:
             continue
         if abs(dx) < 0.1 * length:    # vertical -> X gridline
             coords.append((a.x, "X"))
@@ -796,8 +812,21 @@ def run(job_id: str, *,
     if str_intra_path.exists():
         try:
             str_intra_data = json.loads(str_intra_path.read_text())
+            # The STR-intra detector works in the STR drawing's own
+            # coordinates; every other issue — and the DXF the markers
+            # are drawn on — is in MECH world.  Map them here, at the one
+            # place the two coordinate spaces meet, so `mech_x`/`mech_y`
+            # mean what they say.
+            str_to_mech = _affine_from(t)
             for raw in str_intra_data.get("issues", []):
-                intra_issues.append(Issue(**raw))
+                issue = Issue(**raw)
+                try:
+                    mx, my = str_to_mech.apply(
+                        (float(issue.mech_x), float(issue.mech_y)))
+                    issue.mech_x, issue.mech_y = float(mx), float(my)
+                except Exception:
+                    pass
+                intra_issues.append(issue)
         except Exception as e:
             print(f"  spotcheck: failed to merge str_intra: {e}")
 
