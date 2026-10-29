@@ -36,6 +36,13 @@ Run the test suite:
 python3 -m pytest -q
 ```
 
+Every fix made in the 2026-10 review is recorded in **[FIXES.md](FIXES.md)**,
+with the reproduction that proved it.  Re-run them all at any time:
+
+```bash
+python3 tests/verify_fixes.py     # re-runs all 14 reproductions
+```
+
 ---
 
 ## Roles are explicit, never guessed
@@ -66,7 +73,9 @@ Nothing in `core/` globs a directory or sorts a filename list to decide a role
 ```
 
 `role` ∈ `mech` | `str` | `other`. `insunits` is the drawing's `$INSUNITS`,
-recorded at clean time and used as the fit's scale prior.
+recorded at clean time and used as the fit's scale prior — unless the user
+set the units by hand, in which case `job.json`'s `unit_overrides` wins
+(see **Units** below).
 
 Job dirs written before the manifest existed have none; `core/roles.py` rebuilds
 the same information from `job.json`, so old jobs still load.
@@ -103,14 +112,105 @@ for you, and 8–11 run after you confirm.
 | 4 | Scan grid labels | `core/labels.py` | finds the labels both drawings agree on → `protected_handles.json`, `cross_drawing_agreement.json` |
 | 5 | Derive cleaning policy | `core/clean_policy.py` | project-specific label regex / keep-prefixes / marker + annotation layers → `stages/clean_policy.json` (editable from the UI's Advanced panel) |
 | 6 | Clean | `core/clean_v1.py` / `clean_v2.py` | → `cleaned/<stem>_clean.dxf` |
-| 7 | **Grid axes** | `core/axes.py`, `core/grid.py` | ⏸ **waits for you.** Auto-suggest a prefix, then match the axes you confirm |
+| 7 | **Grid axes** | `core/axes.py`, `core/grid.py`, `core/units.py` | ⏸ **waits for you.** Auto-suggest a prefix, then match the axes you confirm. The grid spacing is compared with the drawings' `$INSUNITS` headers; if they disagree the job pauses and asks which units each drawing is in |
 | 8 | Fit | `core/fit.py` | shared grid intersections → similarity transform (Umeyama + RANSAC) with quality gates → `transform.json`, `grid_mech.json`, `grid_str.json` |
 | 9 | Overlay | `core/overlay.py` | import STR via `xref.Loader`, transform in one `ezdxf.transform.inplace`, then paint `MECH\|`/`STR\|` layers and draw the QA grid |
+| 9.4 | Mismatch | `core/mismatch/` | MECH⇄STR item-level misalignment (bolts, supports, containment, clash) → `stages/mismatch.json` + `QA|MISMATCH_*` markers |
 | 9.5 | Spot-check | `core/spotcheck.py`, `core/{mech,str}_intra.py`, `core/spotcheck_annotate.py` | support / clash issues + an annotated DXF |
+| 9.6 | Findings | `core/findings.py` | the native findings + the remaining spot-check issues → `out/findings.{json,csv,docx}` |
 | 10 | Package | `core/package.py` | `preview.png` (full extents), `preview_grid.png` (grid close-up), `preview_meta.json`, `report.json` |
 | 11 | Done | — | download links |
 
 Spot-check is non-fatal: if it raises, the job still finishes and says so.
+The mismatch stage is non-fatal too, and it has its own vocabulary — the
+**check's** status, deliberately kept apart from the job's:
+
+| Status | Meaning |
+|---|---|
+| `passed` | the drawings were really compared, and they agree |
+| `discrepancies_found` | they were compared, and something was found |
+| `insufficient_coverage` | **no rule had items on both sides** — the drawings were not really compared, so nothing can be concluded. Never `passed` |
+| `blocked` | the grid fit was forced or is otherwise untrusted, so the alignment cannot be relied on |
+| `failed` | the check itself raised |
+| `disabled` | the policy turned the check off |
+
+There is no `ok`: "no findings" and "nothing was compared" are different
+things, and only one of them means the drawings agree. A check that did not
+run is **never** reported as "0 findings".
+
+**The status is the cross-drawing check's alone.** The spot-check and the
+intra-drawing checks look *inside* one drawing, so they say something
+different; their findings go into a separate list, `other_warnings`, with
+their own count, and they can never turn `insufficient_coverage` into
+`discrepancies_found`. On the TP-104 drawings the headline reads
+`insufficient_coverage` with "N other warnings (intra-drawing)" beneath it.
+
+### The STR drawing: profiles
+
+A CAD export puts everything on one layer and names its blocks
+`<prefix><id> - <id>`, so the rules match on the **prefix**, not the name.
+A **profile** (`profiles/<name>.json`) describes one kind of export: which
+prefixes mean what, and which family their geometry belongs to. It is
+applied only to a drawing it recognises (by its block-name prefixes), so a
+synthetic fixture is never touched by it.
+
+| | |
+|---|---|
+| `prefixes` | `{prefix: {kind, family, shape, rules}}` — `kind` is `geometry` / `annotation` / `grid` / `reference`; `shape: "obb"` reads the block as the oriented bounding box of its `LINE`/`CIRCLE`/`ARC` primitives; `rules` pick the family from the shape of that box |
+| `families` | overrides the size ranges and the families of the default policy |
+| `match` | the signature: the prefixes a drawing must have for the profile to apply |
+
+The inventory of what a drawing contained — per family, per prefix and per
+layer/block combination, with the combinations that produced nothing and
+why — is in `report.json["mismatch"]["inventory"]`.
+
+### The offset check
+
+The fifth check answers a different question from the other four: **these
+two things are supposed to line up — how far apart are they?**  A MECH duct
+edge against the STR member it should sit on; a handrail against a handrail.
+
+What may be compared is decided by the **rules** — `offset_rules` in the
+policy, and in the profile that describes the drawing:
+
+```jsonc
+{"name": "R1",
+ "mech_selector": {"layers": ["MAIN OBJECT", "Chute", "Belt", "Sheeting", "handrail"]},
+ "str_selector":  {"families": ["str_member", "str_plate"]},
+ "method": "edge_to_edge",        // edge_to_edge | hole_centre | axis_to_axis | outline_in_outline
+ "search_mm": 25,                 // the largest offset that may be paired at all
+ "tolerance_mm": 5,               // at or below this: matched, and NOT reported
+ "warn_mm": 5, "critical_mm": 15,  // the severity bands
+ "min_overlap_mm": 300,           // the two edges must run alongside this long
+ "needs_review": true}            // the rule is provisional
+```
+
+**Nothing is compared that no rule pairs.**  A rule may select by layer or
+by family, and the check refuses three things:
+
+* it never compares a drawing with **its own control points** — a circle
+  on a grid intersection is the alignment, not an object, so it is excluded
+  from every rule;
+* it never **guesses** — when two STR candidates are equally good, the
+  match is reported as *ambiguous* and the item stays unpaired;
+* it never reports a **width difference** as a position shift — two
+  opposite edges offset by equal and opposite amounts mean the widths
+  differ, and that is reported with the width difference.
+
+The per-family counts behind the status travel with it —
+`{family: {extracted, eligible, matched, unmatched}}`:
+
+* **extracted** — items of that family the drawing contains;
+* **eligible** — items of that family that took part in a comparison (a
+  rule with an empty side was never really checked);
+* **matched** — items that found a counterpart;
+* **unmatched** — eligible minus matched.
+
+`report.json` carries both statuses side by side — the overlay's
+(`report["status"]["overlay"]`) and the cross-drawing check's
+(`report["status"]["mismatch"]`) — with the count of the intra-drawing
+warnings (`report["status"]["other_warnings"]`) and a one-line reason; so do
+`out/findings.json`, the DOCX and the UI banner.
 
 ---
 
@@ -126,6 +226,10 @@ came from, so you can switch one drawing off in any CAD viewer:
 | `QA\|GRID` (ACI 3) | the MECH gridlines, a CIRCLE per intersection, and a `"{label} r={residual}"` TEXT per correspondence |
 | `QA\|GRID_STR` (ACI 6) | the STR gridlines mapped through the fitted transform, with an X per intersection |
 | `QA\|OUTLIER` (ACI 1) | an X at every intersection the fit rejected |
+| `QA\|MISMATCH_CRITICAL` (ACI 1) | a mismatch marker: circle + offset arrow + label |
+| `QA\|MISMATCH_WARNING` (ACI 30) | the same, for a warning |
+| `QA\|MISMATCH_INFO` (ACI 8) | the same, for an informational finding |
+| `QA\|MISMATCH_REF` (ACI 4) | ghost outlines of the two items involved |
 
 The separator `|` is the constant `core.overlay.SOURCE_LAYER_SEP`.
 
@@ -197,8 +301,10 @@ Written by stage 8 next to the DXF (`jobs/<id>/transform.json`, or
 }
 ```
 
-`scale_x` / `scale_y` are the two **column norms** (the matrix diagonal), not an
-independent x/y scale. They only mean something when `rotation_deg == 0`.
+`scale_x` / `scale_y` are the **matrix diagonal** (`a` and `d`), *not* the
+column norms — for a rotated fit they are `scale·cos(rotation_deg)`. They only
+mean something when `rotation_deg == 0`; use `scale` and `rotation_deg`
+otherwise. `column_scales` carries the true column norms.
 
 `grid_mech.json` / `grid_str.json` sit next to it: every detected axis with its
 world `point`, `dir`, `length`, `n_occurrences`, `status`
@@ -217,7 +323,7 @@ The transform is only written if it survives five gates (`core/fit.py`):
 | not just two points | exactly 2 correspondences: the fit is exact but unverifiable |
 | enough inliers | `n_inliers < 3` or the inlier ratio `< 60%` |
 | leave-one-out | `loo_max > 0.005 × median grid spacing` — the fit depends on one point |
-| `$INSUNITS` prior | `\|scale / expected − 1\| > 2%`, where `expected` comes from the two `$INSUNITS` headers |
+| units prior | `\|scale / expected − 1\| > 2%`, where `expected` comes from the units of the two drawings (see **Units** below) |
 
 Each failure message names the problem and what to do (which labels are
 outliers, what the unit headers claim, …).
@@ -226,14 +332,8 @@ outliers, what the unit headers claim, …).
 the transform is then written with `quality.status == "forced"` and a
 `warnings` entry saying which gate was overridden.
 
-Two ways to ask for it:
-
 ```bash
-# at upload time — the "Allow weak fit" checkbox
-curl -F drawing_a=@mech.dxf -F drawing_b=@str.dxf \
-     -F allow_weak_fit=true http://localhost:8000/api/v1/overlay
-
-# or after the axes report, when you've seen which gate is complaining
+# after the axes report, when you've seen which gate is complaining
 curl -X POST -H 'Content-Type: application/json' \
      -d '{"force": true}' \
      http://localhost:8000/api/v1/overlay/<job_id>/axes/confirm
@@ -241,16 +341,77 @@ curl -X POST -H 'Content-Type: application/json' \
 
 ---
 
+## Units — the drawing says, the grid says
+
+Two drawings of one building only superimpose if you know what a drawing
+unit is worth in each file. There are two independent readings, and the
+pipeline compares them at the axes step:
+
+* **the header** — what `$INSUNITS` claims;
+* **the grid** — what the drawings themselves say. Two drawings of one
+  building have the same physical grid spacing, so the ratio of the two
+  median spacings — each in its **own** drawing units — is the scale
+  between them. This reading needs no header, so it is immune to a wrong
+  one.
+
+When the two disagree (more than 2% apart) the job **pauses at
+`awaiting_axes`** and says so:
+
+> the grid spacing says the two drawings share a scale of 1, but the units
+> say 0.0394 (2440% apart) — grid spacing indicates both drawings are in mm.
+> Choose the units for each drawing to continue.
+
+The suggested interpretation is the one the geometry supports: the grid
+fixes the *ratio* of the two units, and the header that makes the physical
+grid spacing a sane distance for a building is the one kept.
+
+### Choosing the units by hand
+
+Both axes endpoints accept a `units` object, keyed by role or by file id:
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"prefix": "TP104-", "axes": ["A","B","C","D","1","2","3"],
+          "units": {"mech": "mm", "str": "mm"}}' \
+     http://localhost:8000/api/v1/overlay/<job_id>/axes
+```
+
+The choice is recorded in `job.json` as `unit_overrides` (`file_id → unit`)
+and is used by `core/fit.py`, `core/overlay.py` and `core/mismatch` — the
+mismatch engine's `mm_per_unit` becomes the value you chose, not the one
+the header claims. **`mm` / `cm` / `m` / `in` / `ft`.**
+
+**The drawings are never modified.** The answer lives beside the job, in
+`job.json`; the uploaded and converted files are left exactly as they
+arrived.
+
+### What the report says
+
+`report.json` carries a `units` section:
+
+```jsonc
+"units": {
+  "mech": {"header_insunits": 1, "header_units": "in", "units": "mm",
+           "source": "override", "reason": "the drawing's $INSUNITS header says in but the units were set to mm by hand"},
+  "str":  {"header_insunits": 4, "header_units": "mm", "units": "mm",
+           "source": "header",  "reason": "the drawing's $INSUNITS header says mm"},
+  "grid_spacing": {"mech": 5000.0, "str": 5000.0},
+  "grid_scale": 1.0, "expected_scale": 1.0, "mm_per_unit": 1.0,
+  "reason": "the units of mech were set by hand"
+}
+```
+
+---
+
 ## Options (`job.options`)
 
-Five knobs, accepted by **both** upload endpoints, validated with a **400**
+Four knobs, accepted by **both** upload endpoints, validated with a **400**
 naming the offending field, and stored in `job.options`:
 
 | Form field | Type | Default | Effect |
 |---|---|---|---|
 | `color_mode` | `original` \| `contrast` | `original` | `original` keeps each drawing's own layer colours; `contrast` forces `MECH\|*` to ACI 5 (blue) and `STR\|*` to ACI 1 (red) and sets every entity to BYLAYER |
 | `fit_model` | `similarity` \| `affine` | `similarity` | `similarity` = uniform scale + rotation + translation. `affine` allows shear and is diagnostic only |
-| `allow_weak_fit` | bool | `false` | `FitOptions.force` — see the gates above |
 | `str_lineweight` | int (1/100 mm) or empty | empty | force this lineweight on every `STR\|*` layer. DXF's range is 0–211 (2.11 mm); empty means "as drawn" |
 | `qa_grid` | bool | `true` | draw `QA\|GRID` / `QA\|GRID_STR` / `QA\|OUTLIER` |
 
@@ -272,7 +433,6 @@ disagree:
 {
   "color_mode": "contrast",
   "fit_model": "similarity",
-  "allow_weak_fit": false,
   "str_lineweight": 50,
   "qa_grid": true,
 
@@ -281,8 +441,8 @@ disagree:
 }
 ```
 
-* `core.fit.FitOptions.from_job` reads the flat `fit_model` / `allow_weak_fit`
-  (aliases `model` / `force`).
+* `core.fit.FitOptions.from_job` reads the flat `fit_model` / `force`
+  (aliases `model`).
 * `core.overlay.OverlayStyle.from_options` reads the flat keys or the `overlay`
   sub-dict, which wins.
 
@@ -302,7 +462,7 @@ dropped on load, as before.
 | `GET` | `/api/v1/overlay/{id}/status` | lightweight state, polled every 500 ms |
 | `GET` | `/api/v1/overlay/{id}/axes` | auto-suggested conventions + the derived cleaning policy |
 | `POST` | `/api/v1/overlay/{id}/axes` | `{prefix, axes}` → per-label grid status and the paired axes |
-| `POST` | `/api/v1/overlay/{id}/axes/confirm` | optional `{"force": true}`; resumes stages 8–11 |
+| `POST` | `/api/v1/overlay/{id}/axes/confirm` | optional `{"force": true, "units": {...}}`; resumes stages 8–11 |
 | `POST` | `/api/v1/overlay/{id}/policy` | edit the cleaning policy while `awaiting_axes` |
 | `GET` | `/api/v1/overlay/{id}/download` | the superimposed DXF |
 | `GET` | `/api/v1/overlay/{id}/preview.png` | preview over the **full** extents |
@@ -310,6 +470,13 @@ dropped on load, as before.
 | `GET` | `/api/v1/overlay/{id}/preview_meta.json` | world → pixel map of `preview.png` |
 | `GET` | `/api/v1/overlay/{id}/report.json` | counts, fit quality, overlay failures, outliers, audit |
 | `GET`/`POST` | `/api/v1/overlay/{id}/pairs` | list / run a pair in the multi-pair layout |
+| `GET` | `/api/v1/overlay/{id}/findings` | the findings, filtered (`severity`, `kind`, `origin`, `min_magnitude_mm`, `bbox`, `limit`, `offset`) |
+| `GET` | `/api/v1/overlay/{id}/findings/{fid}` | one finding, by id (`MM-0001`) or uid |
+| `GET` | `/api/v1/overlay/{id}/findings.csv`, `/findings.docx` | the findings as a file |
+| `GET`/`PUT` | `/api/v1/overlay/{id}/mismatch/policy` | the resolved mismatch policy / replace it (a bad policy is a 400) |
+| `POST` | `/api/v1/overlay/{id}/mismatch/rerun` | re-run the mismatch check — no refit |
+| `GET` | `/api/v1/overlay/{id}/download.dwg` | the superimposed drawing as DWG (needs the ODA File Converter; 501 when it is missing) |
+| `GET` | `/api/v1/capabilities` | what this server can do (`dwg_export`, `dwg_versions`) |
 | `GET` | `/api/v1/overlay/{id}/pairs/{pair_id}/{artifact}` | one pair artifact (whitelisted; `..` is rejected) |
 | `GET` | `/api/v1/overlay/{id}/analyze` | grid-intersection depth analysis + issues |
 | `GET` | `/api/v1/overlay/{id}/spotcheck.json`, `/spotcheck.docx`, `/annotated.dxf` | spot-check outputs |
@@ -346,7 +513,8 @@ jobs/<job_id>/
 │   ├── files.json            the roles manifest
 │   ├── clean_policy.json     the derived (and editable) cleaning policy
 │   ├── audit.json            per-stage recover/audit summaries
-│   └── overlay_report.json   what stage 9 imported, renamed and failed on
+│   ├── overlay_report.json   what stage 9 imported, renamed and failed on
+│   └── mismatch.json         the MECH⇄STR mismatch result (diagnostic)
 ├── transform.json            the fit (see above)
 ├── grid_mech.json, grid_str.json
 └── out/
@@ -356,7 +524,8 @@ jobs/<job_id>/
     ├── preview_grid.png              grid box + 10%
     ├── preview_meta.json             world → pixel map
     ├── report.json                   the audit trail
-    └── spotcheck.{json,docx}
+    ├── spotcheck.{json,docx}
+    └── findings.{json,csv,docx}   the merged findings
 ```
 
 A multi-pair job instead nests each pair under `out/pairs/<pair_id>/` with the
@@ -416,12 +585,18 @@ them:
 ISGEC_DIR=/path/to/ISGEC python3 -m pytest -q
 ```
 
-There is also a live-server smoke test that does not use pytest:
+There is also a live-server smoke test that does not use pytest — it drives
+a running server, so pytest does not collect it:
 
 ```bash
+pip install -r requirements-dev.txt  # requests — the only extra it needs
 ./run.sh &
 python3 tests/smoke_test.py          # upload → poll → pick axes → download
 ```
+
+It needs the real TP-104 drawings; point `ISGEC_DIR` at your ISGEC checkout
+and `OVERLAY_URL` at the server (it defaults to `http://127.0.0.1:8000`,
+which is where `run.sh` starts it).
 
 ---
 
@@ -433,7 +608,7 @@ Browser (static/index.html + app.js, vanilla JS state machine, 500 ms polling)
   │  POST   /api/v1/overlay              (multipart, + options)
   │  GET    /{id}/status                 (polled every 500 ms)
   │  GET    /{id}/axes                   POST /{id}/axes
-  │  POST   /{id}/axes/confirm           (optional {"force": true})
+  │  POST   /{id}/axes/confirm           (optional {"force": true, "units": {...}})
   │  GET    /{id}/download, /preview*.png, /report.json
   ▼
 FastAPI (app.py)

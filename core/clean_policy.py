@@ -18,7 +18,7 @@ in the file.
 
 from __future__ import annotations
 
-from .dxfio import read_internal as _read_internal, save as _dxf_save
+from .dxfio import read_input as _read_input, save as _dxf_save
 
 import json
 import re
@@ -198,8 +198,10 @@ def derive_policy_from_drawing_pair(mech_path, str_path) -> "CleaningPolicy":
       4. Auto-derive block prefixes by walking INSERTs.
       5. Fall back to DEFAULT if no agreement found.
     """
-    mech_doc = _read_internal(str(mech_path))
-    str_doc = _read_internal(str(str_path))
+    # `converted/` is an INPUT (PLAN.md decision 8) — read it with the
+    # recovering reader so a file convert accepted is not rejected here.
+    mech_doc, _audit_m = _read_input(str(mech_path))
+    str_doc, _audit_s = _read_input(str(str_path))
 
     mech_labels = _strip_metadata_labels(extract_labels(mech_doc))
     str_labels = _strip_metadata_labels(extract_labels(str_doc))

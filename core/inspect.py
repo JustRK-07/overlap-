@@ -16,7 +16,7 @@ Writes jobs/<id>/stages/inspect.json with:
 
 from __future__ import annotations
 
-from .dxfio import read_internal as _read_internal, save as _dxf_save
+from .dxfio import read_input as _read_input, save as _dxf_save
 
 import json
 from collections import Counter
@@ -30,7 +30,9 @@ from jobs import job_dir
 def _inspect_dxf(path: Path) -> dict:
     """Return entity-type histogram + layer list for a DXF."""
     try:
-        doc = _read_internal(str(path))
+        # An upload is an INPUT: PLAN.md decision 8 says inputs are read with
+        # `recover.readfile`, so a file stage 1 accepted does not fail here.
+        doc, _audit = _read_input(str(path))
     except Exception as e:
         return {"error": str(e)}
 
@@ -54,13 +56,15 @@ def _inspect_dxf(path: Path) -> dict:
         except Exception:
             continue
 
-    # Extents
+    # Extents — `msp.bbox()` does not exist in ezdxf 1.4.4, so use the
+    # module-level helper and report null for an empty modelspace.
     try:
-        ext = msp.bbox()
-        extents = {
-            "min": [float(ext.extmin[0]), float(ext.extmin[1])],
-            "max": [float(ext.extmax[0]), float(ext.extmax[1])],
-        }
+        from ezdxf import bbox as ez_bbox
+        box = ez_bbox.extents(msp, fast=False)
+        extents = ({
+            "min": [float(box.extmin[0]), float(box.extmin[1])],
+            "max": [float(box.extmax[0]), float(box.extmax[1])],
+        } if box.has_data else None)
     except Exception:
         extents = None
 

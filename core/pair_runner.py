@@ -161,6 +161,14 @@ def run_pair(
     d = job_dir(job_id)
     src_cleaned = d / "cleaned"
 
+    # A pair of one file with itself is not a pair.  The route rejects it
+    # before it gets here; the runner rejects it too, so the check does
+    # not depend on the caller.
+    if mech_filename == str_filename:
+        raise ValueError(
+            f"a pair needs two different files — got {mech_filename!r} twice"
+        )
+
     if not (src_cleaned / mech_filename).exists():
         raise FileNotFoundError(
             f"mech_file {mech_filename!r} not in {src_cleaned}"
@@ -181,12 +189,26 @@ def run_pair(
     shutil.copyfile(src_cleaned / str_filename, pair_cleaned / str_filename)
 
     # Explicit roles for every stage below (they call roles.resolve_pair
-    # with this pair_dir). Written BEFORE any stage runs. `roles` reads
-    # only `mech` / `str`; the options ride along so a pair directory is
-    # self-describing after the fact.
-    from .roles import write_pair_json
+    # with this pair_dir). Written BEFORE any stage runs.  The converted
+    # paths ride along too (step 8b.5) so the mismatch stage can read the
+    # pre-cleaning drawings through `resolve_pair(stage="converted")`.
+    from .roles import resolve_inputs, write_pair_json
+
+    mech_converted = str_converted = None
+    try:
+        entries = resolve_inputs(job_id)
+        for e in entries:
+            if Path(e.cleaned).name == mech_filename:
+                mech_converted = e.converted
+            elif Path(e.cleaned).name == str_filename:
+                str_converted = e.converted
+    except Exception:
+        pass
+
     write_pair_json(root, mech_filename, str_filename, pair_id,
-                    options=effective_options)
+                    options=effective_options,
+                    mech_converted=mech_converted,
+                    str_converted=str_converted)
 
     # Pre-create the per-pair stages/ and out/ directories. Each stage
     # expects to write into them but doesn't mkdir()-and-write atomically;
@@ -218,11 +240,25 @@ def run_pair(
     # 7 — overlay (depends on transform). Writes out/superimposed.dxf.
     overlay_mod.run(job_id, pair_dir=pair_cleaned)
 
+    # 7.2 — mismatch (MECH⇄STR misalignment). NON-FATAL: the stage writes
+    # findings.json status="error" itself.
+    try:
+        import core.mismatch as mismatch_mod
+        mismatch_mod.run(job_id, pair_dir=pair_cleaned)
+    except Exception as e:
+        print(f"  mismatch skipped: {e}")
+
     # 7.5 — split spotchecks into MECH intra, STR intra, cross, then
-    # annotate the DXF. Order matches pipelines.resume_after_axes().
+    # merge the findings and annotate the DXF.  Order matches
+    # pipelines.resume_after_axes().
     mech_intra_mod.run(job_id, enabled_checks=enabled_checks, pair_dir=pair_cleaned)
     str_intra_mod.run(job_id, enabled_checks=enabled_checks, pair_dir=pair_cleaned)
     spotcheck_mod.run(job_id, enabled_checks=enabled_checks, pair_dir=pair_cleaned)
+    try:
+        import core.findings as findings_mod
+        findings_mod.run(job_id, pair_dir=pair_cleaned)
+    except Exception as e:
+        print(f"  findings skipped: {e}")
     spotcheck_annotate_mod.run(job_id, pair_dir=pair_cleaned)
 
     # 8 — package (preview PNG + report JSON). Reads transform + spotcheck
@@ -267,6 +303,10 @@ def run_pair(
             "report":              str(root / "out" / "report.json"),
             "spotcheck_docx":      str(root / "out" / "spotcheck.docx"),
             "spotcheck_json":      str(root / "out" / "spotcheck.json"),
+            "mismatch":            str(root / "stages" / "mismatch.json"),
+            "findings_json":       str(root / "out" / "findings.json"),
+            "findings_csv":        str(root / "out" / "findings.csv"),
+            "findings_docx":       str(root / "out" / "findings.docx"),
         },
     }
     (root / "metadata.json").write_text(json.dumps(metadata, indent=2))

@@ -169,10 +169,30 @@ def annotate_dxf(job_id: str, *, pair_dir=None) -> int:
 # DOCX report
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _severity_heading(doc, sev: str, n: int):
+    """A level-2 heading ``SEV (n)`` coloured by severity. Returns the heading.
+
+    Factored out of :func:`_build_docx` so the findings DOCX (PLAN_MISMATCH
+    §4) uses exactly the same severity colours.
+    """
+    from docx.shared import RGBColor
+
+    h = doc.add_heading(f"{sev} ({n})", level=2)
+    if sev == "CRITICAL":
+        color = RGBColor(0xC0, 0x00, 0x00)
+    elif sev == "WARNING":
+        color = RGBColor(0xC0, 0x70, 0x00)
+    else:
+        color = RGBColor(0x40, 0x40, 0x40)
+    for run in h.runs:
+        run.font.color.rgb = color
+        run.bold = True
+    return h
+
+
 def _build_docx(job_id: str, issues_data: dict, out_path: Path) -> None:
     """Write a DOCX report — one section per issue, severity-colored headings."""
     from docx import Document
-    from docx.shared import RGBColor
 
     doc = Document()
 
@@ -227,16 +247,7 @@ def _build_docx(job_id: str, issues_data: dict, out_path: Path) -> None:
         if not sev_issues:
             continue
         # Severity subheading
-        h = doc.add_heading(f"{sev} ({len(sev_issues)})", level=2)
-        if sev == "CRITICAL":
-            color = RGBColor(0xC0, 0x00, 0x00)
-        elif sev == "WARNING":
-            color = RGBColor(0xC0, 0x70, 0x00)
-        else:
-            color = RGBColor(0x40, 0x40, 0x40)
-        for run in h.runs:
-            run.font.color.rgb = color
-            run.bold = True
+        _severity_heading(doc, sev, len(sev_issues))
 
         for issue in sev_issues:
             doc.add_heading(issue["id"], level=3)

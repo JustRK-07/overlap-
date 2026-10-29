@@ -213,7 +213,10 @@ def test_label_without_nearby_line_is_missing_with_reason():
     msp.add_text("TP104-A", dxfattribs={"insert": (50000, 50000)})
     res = grid.detect_grid(doc, "TP104-", ["A"])
     assert res.axes["A"].status == "missing"
-    assert "no candidate" in " ".join(res.axes["A"].reasons)
+    # the reason must say *why* nothing was near — the exact wording is not
+    # the contract (the axis-aligned fallback has its own message).
+    reasons = " ".join(res.axes["A"].reasons)
+    assert "no candidate" in reasons or "no axis-aligned line" in reasons, reasons
 
 
 def test_tied_vote_is_ambiguous():

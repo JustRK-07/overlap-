@@ -136,15 +136,18 @@ def test_clean_policy_ignores_previous_outputs(fx_synth_job):
     d = job_dir(job_id)
     (d / "stages").mkdir(exist_ok=True)
     clean_policy.run(job_id)
-    p1 = (d / "stages" / "cleaning_policy.json")
-    ref = p1.read_text() if p1.exists() else None
+    # the stage writes `clean_policy.json` — the old test looked for
+    # `cleaning_policy.json`, which production never writes, so `ref` was
+    # always None and the comparison never ran.
+    p1 = (d / "stages" / "clean_policy.json")
+    assert p1.exists(), "the clean_policy stage must write clean_policy.json"
+    ref = p1.read_text()
 
     # Stale junk output that sorts first and is not part of the manifest.
     (d / "cleaned" / "a_stale_clean.dxf").write_text("garbage not a dxf")
     (d / "cleaned" / "x_clean.dxf").write_text("garbage not a dxf")
     clean_policy.run(job_id)  # must not read the junk
-    if ref is not None:
-        assert p1.read_text() == ref
+    assert p1.read_text() == ref, "the policy must not change"
 
 
 def test_read_input_reports_audit_fixes(tmp_path):

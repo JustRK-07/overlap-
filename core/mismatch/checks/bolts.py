@@ -76,6 +76,13 @@ def group_patterns(bolts, eps_units) -> list[list]:
     Two bolts link when they are no further apart than ``eps_units`` **and**
     their radii agree within :data:`RADIUS_LINK_TOL`.  Bolts under different
     root INSERTs never link, so the same block drawn twice stays two groups.
+
+    The neighbours are found with a spatial index rather than by scanning
+    every pair: two bolts can only link when they are within
+    ``eps_units`` of each other, so only those have to be compared.  The
+    all-pairs scan was O(n²) — 200 million comparisons for the 20 000
+    bolts of the performance fixture, and the bolt check alone took 74 of
+    the 90 second budget.
     """
     n = len(bolts)
     if n == 0:
@@ -93,11 +100,26 @@ def group_patterns(bolts, eps_units) -> list[list]:
         if ri != rj:
             parent[max(ri, rj)] = min(ri, rj)
 
+    radii = [_radius(b) for b in bolts]
+    max_r = max(radii) if radii else 0.0
+    boxes = np.asarray(
+        [(b.cx - r, b.cy - r, b.cx + r, b.cy + r)
+         for b, r in zip(bolts, radii)], dtype=float)
+    # a cell of eps_units keeps ~1 bolt per bucket, so a query returns a
+    # handful of candidates instead of the whole drawing
+    cell = float(eps_units) if eps_units and eps_units > 0.0 else None
+    index = GridIndex(boxes, cell=cell)
+
     for i in range(n):
-        for j in range(i + 1, n):
+        cand = index.query_radius((bolts[i].cx, bolts[i].cy),
+                                  eps_units + max_r)
+        for j in cand:
+            j = int(j)
+            if j <= i:
+                continue
             if bolts[i].root_block != bolts[j].root_block:
                 continue
-            ri, rj = _radius(bolts[i]), _radius(bolts[j])
+            ri, rj = radii[i], radii[j]
             if abs(ri - rj) > RADIUS_LINK_TOL * max(ri, rj, 1e-9):
                 continue
             d = math.hypot(bolts[i].cx - bolts[j].cx, bolts[i].cy - bolts[j].cy)
@@ -289,7 +311,7 @@ def run(env: Env) -> list[Finding]:
             # it is recorded in the coverage and stays quiet: a
             # MISSING_COUNTERPART per bolt for a drawing that simply has no
             # counterpart family would drown the report (PLAN_MISMATCH §4).
-            env.track("bolts", len(bolts), 0)
+            env.track_pair("bolts", mech_fam, str_fam, len(bolts), len(holes))
             continue
         out += _pairing(env, bolts, holes, mech_fam, str_fam, holes_taken)
     if env.policy.checks.extra_hole:
@@ -308,12 +330,18 @@ def _pairing(env: Env, bolts, holes, mech_fam, str_fam, holes_taken) -> list[Fin
 
     findings: list[Finding] = []
     n_assigned = 0
+    n_bolts_matched = 0
+    n_holes_matched = 0
     for pattern in group_patterns(bolts, env.u(pol.search.pattern_eps)):
-        found, matched = _judge_pattern(env, pattern, holes, index, plates,
-                                        plate_index, mech_fam, str_fam, holes_taken)
+        found, matched, n_bolts, n_holes = _judge_pattern(
+            env, pattern, holes, index, plates, plate_index, mech_fam, str_fam,
+            holes_taken)
         findings += found
         n_assigned += matched
-    env.track("bolts", len(bolts), n_assigned)
+        n_bolts_matched += n_bolts
+        n_holes_matched += n_holes
+    env.track_pair("bolts", mech_fam, str_fam, len(bolts), len(holes),
+                   matched_mech=n_bolts_matched, matched_str=n_holes_matched)
     return findings
 
 
@@ -394,7 +422,8 @@ def _judge_pattern(env: Env, pattern, holes, index, plates, plate_index,
         else:
             findings += _plate_fallback(env, pattern, loose, mech_fam, plates,
                                         plate_index, r_mm)
-    return findings, len(pairs)
+    holes_used = {j for _i, j, _d in pairs}
+    return findings, len(pairs), len(assigned), len(holes_used)
 
 
 def _pattern_finding(env, pattern, pairs, holes, R, t, res, inliers,

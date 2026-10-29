@@ -20,6 +20,12 @@ import pytest
 # Make sure overlay-app is importable.
 import sys
 HERE = Path(__file__).resolve().parent
+
+#: ``smoke_test.py`` is a standalone script (it drives a live server), not a
+#: pytest test.  pytest collects it because the name matches ``*_test.py``
+#: — and it imports ``requests``, which is not a runtime dependency.  Keep
+#: it out of the collection entirely.
+collect_ignore = ["smoke_test.py"]
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
@@ -30,6 +36,33 @@ def fx_isolated_jobs(monkeypatch, tmp_path):
     from jobs import JOBS_DIR
     monkeypatch.setattr("jobs.JOBS_DIR", tmp_path)
     return tmp_path
+
+
+@pytest.fixture
+def fx_no_worker(monkeypatch):
+    """Stop every pipeline worker from outliving the test.
+
+    An upload spawns a background thread that runs the pipeline.  A test
+    that does not wait for it leaves that thread running, and by the time
+    the *next* test starts ``jobs.JOBS_DIR`` points at that test's tmp
+    directory — so the leaked worker creates a job directory in it and
+    breaks the next test's "a rejected request creates nothing"
+    assertion.  It is intermittent, and it gets worse the slower the
+    pipeline is (the real TP-104 drawings).
+
+    Every entry point a worker can reach is patched, not just the first
+    one: the 2-file upload runs ``pipelines.run_pipeline``, the N-file
+    upload also runs the pair pipeline, and confirming the axes runs
+    ``pipelines.resume_after_axes``.
+    """
+    import pipelines
+    import routers.api as api_mod
+
+    monkeypatch.setattr(pipelines, "run_pipeline", lambda *a, **k: None)
+    monkeypatch.setattr(pipelines, "resume_after_axes", lambda *a, **k: None)
+    monkeypatch.setattr(api_mod, "_maybe_run_pairs_after_cleaning",
+                        lambda *a, **k: None)
+    return True
 
 
 ISGEC = Path(os.environ.get(
@@ -58,6 +91,25 @@ def fx_tp104_dxfs(tmp_path):
     shutil.copyfile(src_mech, mech_dest)
     shutil.copyfile(src_str,  str_dest)
     return mech_dest, str_dest
+
+
+@pytest.fixture
+def fx_job_without_dxfs(fx_isolated_jobs):
+    """A job with an **empty** ``cleaned/`` directory.
+
+    Nine of the route-logic tests (the pair-artifact whitelist, the
+    traversal guard, the 404s) need no DXF geometry at all — they only
+    need a job that exists.  Depending on the TP-104 fixture made them
+    skip, which hid a path-traversal guard and four validation guards.
+    """
+    import uuid
+    from jobs import create_job_legacy, job_dir
+
+    job = create_job_legacy(drawing_a_name="mech.dxf", drawing_a_size=1,
+                            drawing_b_name="str.dxf", drawing_b_size=1,
+                            clean_version="v1")
+    (job_dir(job.job_id) / "cleaned").mkdir(parents=True, exist_ok=True)
+    return job.job_id
 
 
 @pytest.fixture
@@ -92,6 +144,12 @@ def fx_job_with_cleaned_dxfs(fx_isolated_jobs, fx_tp104_dxfs, tmp_path):
 
     # Mark the job as state="done" so endpoints that gate on state pass.
     job.state = "done"
+    # The real TP-104 MECH drawing declares $INSUNITS=1 (inch) but is drawn
+    # in millimetres, so the fit's unit prior computes an expected scale of
+    # 0.0394 against a true scale of 1.0.  The grid says the two drawings
+    # share an origin, so the header — not the fit — is wrong: say so
+    # explicitly, which is what a user does with this drawing.
+    job.unit_overrides = {"drawing_a": "mm", "drawing_b": "mm"}
     save_job(job)
     return job.job_id
 

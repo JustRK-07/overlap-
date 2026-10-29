@@ -61,3 +61,5 @@ async def health():
 # Wire up the API router (upload + status + job state)
 from routers import api as api_router
 app.include_router(api_router.router)
+# …and the /api/v1/capabilities probe (outside the overlay prefix)
+app.include_router(api_router.capabilities_router)

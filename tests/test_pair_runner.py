@@ -133,12 +133,13 @@ def test_run_pair_idempotent(fx_job_with_cleaned_dxfs, fx_tp104_dxfs):
                - second["metrics"]["n_issues"]) <= 1
 
 
-def test_run_pair_self_loop_rejected(fx_job_with_cleaned_dxfs):
+def test_run_pair_self_loop_rejected(fx_job_without_dxfs):
     """A pair with mech_file == str_file should raise immediately, before
     we even touch the stages. The route rejects this earlier with HTTP 400;
     the runner should too."""
-    job_id = fx_job_with_cleaned_dxfs
-    with pytest.raises((FileNotFoundError, ValueError, RuntimeError)):
+    job_id = fx_job_without_dxfs
+    # the runner rejects a self-loop itself — it is not the caller's job
+    with pytest.raises(ValueError, match="two different files"):
         run_pair(
             job_id,
             mech_filename="same.dxf",
@@ -149,8 +150,8 @@ def test_run_pair_self_loop_rejected(fx_job_with_cleaned_dxfs):
         )
 
 
-def test_run_pair_unknown_file_rejected(fx_job_with_cleaned_dxfs):
-    job_id = fx_job_with_cleaned_dxfs
+def test_run_pair_unknown_file_rejected(fx_job_without_dxfs):
+    job_id = fx_job_without_dxfs
     with pytest.raises(FileNotFoundError):
         run_pair(
             job_id,

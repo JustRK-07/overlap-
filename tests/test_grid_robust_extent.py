@@ -15,7 +15,7 @@ import ezdxf
 import pytest
 
 from core import grid
-from tests import synth
+import synth
 
 PREFIX = "TP104-"
 SUFFIXES = ["A", "B", "C", "D", "1", "2", "3"]
@@ -73,4 +73,6 @@ def test_extent_unchanged_without_strays(tmp_path):
                 xs.append(w.x)
                 ys.append(w.y)
     true_ext = max(max(xs) - min(xs), max(ys) - min(ys))
-    assert ext == pytest.approx(true_ext, rel=0.5)
+    # the window must not shrink the drawing — a 50 % tolerance would
+    # have passed a window that lost half the extent
+    assert ext == pytest.approx(true_ext, rel=0.05)

@@ -20,6 +20,7 @@ Output:
 
 from __future__ import annotations
 
+from . import dxfio
 from .dxfio import read_internal as _read_internal, save as _dxf_save
 
 import json
@@ -224,8 +225,11 @@ def _find_mech_footprints(doc) -> list[dict]:
             continue
         bb = _bbox(pts)
         w, h = bb[2] - bb[0], bb[3] - bb[1]
-        # Skip very small (noise) or very large (>10m) — those are room outlines
-        if w < 200 or h < 200 or w > 10000 or h > 10000:
+        # Skip very small (noise) or very large (>10m) — those are room
+        # outlines.  The bounds are in millimetres; the geometry is in the
+        # MECH drawing's units, so they are scaled by mm_per_unit.
+        mm = max(dxfio.mm_per_unit(doc), 1e-9)
+        if w < 200.0 / mm or h < 200.0 / mm or w > 10000.0 / mm or h > 10000.0 / mm:
             continue
         out.append({
             "pts": pts,
@@ -269,7 +273,8 @@ def _find_mech_footprints(doc) -> list[dict]:
             ys = [p[1] for p in pts_local]
             w = (max(xs) - min(xs)) * abs(sx)
             h = (max(ys) - min(ys)) * abs(sy)
-            if w < 200 or h < 200 or w > 10000 or h > 10000:
+            mm = max(dxfio.mm_per_unit(doc), 1e-9)
+            if w < 200.0 / mm or h < 200.0 / mm or w > 10000.0 / mm or h > 10000.0 / mm:
                 continue
             pts_world = [(ix + sx * p[0], iy + sy * p[1]) for p in pts_local]
             out.append({
@@ -304,8 +309,10 @@ def _find_building_outline(doc) -> list | None:
             continue
         bb = _bbox(pts)
         w, h = bb[2] - bb[0], bb[3] - bb[1]
-        # Building outlines are big (typically >5m on each side)
-        if w > 5000 and h > 5000:
+        # Building outlines are big (typically >5m on each side) — 5 m,
+        # expressed in the MECH drawing's units.
+        mm = max(dxfio.mm_per_unit(doc), 1e-9)
+        if w > 5000.0 / mm and h > 5000.0 / mm:
             candidates.append((w * h, pts, layer))
     if not candidates:
         return None

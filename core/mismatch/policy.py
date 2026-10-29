@@ -160,6 +160,166 @@ def _pair_list(value, where: str) -> tuple[tuple[str, str], ...]:
     return tuple(out)
 
 
+# ── offset rules ────────────────────────────────────────────────────────────
+
+#: How two items are compared.
+#:
+#: ``edge_to_edge``       the edges of two outlines, side by side
+#: ``hole_centre``        the centres of two holes
+#: ``axis_to_axis``       the axes of two members
+#: ``outline_in_outline`` one outline inside another
+OFFSET_METHODS = ("edge_to_edge", "hole_centre", "axis_to_axis",
+                  "outline_in_outline")
+
+#: The keys a selector may carry.
+SELECTOR_KEYS = ("layers", "families")
+
+
+def _selector(d, where: str) -> dict:
+    """``{"layers": [...], "families": [...]}`` — what a side may pair."""
+    d = _obj(d, where)
+    _strict(d, SELECTOR_KEYS, where)
+    layers = d.get("layers") or ()
+    families = d.get("families") or ()
+    if isinstance(layers, str):
+        layers = (layers,)
+    if isinstance(families, str):
+        families = (families,)
+    for v in layers:
+        if not isinstance(v, str):
+            raise PolicyError(f"{where}.layers must be strings")
+    for v in families:
+        if not isinstance(v, str):
+            raise PolicyError(f"{where}.families must be strings")
+    return {"layers": list(layers), "families": list(families)}
+
+
+@dataclass(frozen=True)
+class OffsetRule:
+    """One pairing rule: what may be compared with what, and how.
+
+    A rule is the *only* thing that may make the offset check compare two
+    items — "never compare entities that no rule pairs".  The selectors say
+    which layers (or families) each side may contribute; the numbers say
+    how far apart two items may be and what that means.
+    """
+
+    name: str
+    mech_selector: dict = field(default_factory=dict)
+    str_selector: dict = field(default_factory=dict)
+    method: str = "edge_to_edge"
+    search_mm: float = 25.0
+    tolerance_mm: float = 5.0
+    warn_mm: float = 5.0
+    critical_mm: float = 15.0
+    min_overlap_mm: float = 300.0
+    needs_review: bool = False
+    enabled: bool = True
+
+    KEYS = ("name", "mech_selector", "str_selector", "method", "search_mm",
+            "tolerance_mm", "warn_mm", "critical_mm", "min_overlap_mm",
+            "needs_review", "enabled")
+
+    def __post_init__(self) -> None:
+        if self.method not in OFFSET_METHODS:
+            raise PolicyError(f"offset rule {self.name!r}: method must be one "
+                              f"of {list(OFFSET_METHODS)}, got {self.method!r}")
+
+    def to_dict(self) -> dict:
+        return {"name": self.name,
+                "mech_selector": dict(self.mech_selector),
+                "str_selector": dict(self.str_selector),
+                "method": self.method,
+                "search_mm": self.search_mm,
+                "tolerance_mm": self.tolerance_mm,
+                "warn_mm": self.warn_mm,
+                "critical_mm": self.critical_mm,
+                "min_overlap_mm": self.min_overlap_mm,
+                "needs_review": self.needs_review,
+                "enabled": self.enabled}
+
+    @classmethod
+    def from_dict(cls, d, where: str = "offset_rules") -> "OffsetRule":
+        d = _obj(d, where)
+        _strict(d, cls.KEYS, where)
+        name = _need(d, "name", where)
+        if not isinstance(name, str) or not name:
+            raise PolicyError(f"{where}.name must be a non-empty string")
+        method = d.get("method", "edge_to_edge")
+        if method not in OFFSET_METHODS:
+            raise PolicyError(f"{where}.method must be one of "
+                              f"{list(OFFSET_METHODS)}, got {method!r}")
+        return cls(
+            name=name,
+            mech_selector=_selector(d.get("mech_selector") or {},
+                                    f"{where}.mech_selector"),
+            str_selector=_selector(d.get("str_selector") or {},
+                                   f"{where}.str_selector"),
+            method=method,
+            search_mm=_num(d, "search_mm", where, lo=0.0) if "search_mm" in d else 25.0,
+            tolerance_mm=_num(d, "tolerance_mm", where, lo=0.0) if "tolerance_mm" in d else 5.0,
+            warn_mm=_num(d, "warn_mm", where, lo=0.0) if "warn_mm" in d else 5.0,
+            critical_mm=_num(d, "critical_mm", where, lo=0.0) if "critical_mm" in d else 15.0,
+            min_overlap_mm=_num(d, "min_overlap_mm", where, lo=0.0) if "min_overlap_mm" in d else 300.0,
+            needs_review=bool(d.get("needs_review", False)),
+            enabled=bool(d.get("enabled", True)),
+        )
+
+
+# ── prefix rules ────────────────────────────────────────────────────────────
+
+#: What a block-name prefix means.
+#:
+#: ``geometry``   the blocks contribute geometry (a member, a plate …)
+#: ``annotation`` the blocks are annotation — dimensions, marks, text
+#: ``grid``       the blocks are the drawing's own grid
+#: ``reference``  the blocks are a reference model
+PREFIX_KINDS = ("geometry", "annotation", "grid", "reference")
+
+#: How a geometry prefix's geometry is read.
+#:
+#: ``native``  the normal per-entity extraction
+#: ``obb``     one feature per block: the oriented bounding box of its
+#:             LINE / CIRCLE / ARC primitives
+PREFIX_SHAPES = ("native", "obb")
+
+#: The keys a prefix rule may carry.
+PREFIX_KEYS = ("kind", "family", "shape", "rules")
+
+
+def _prefix_rules(d, where: str) -> dict:
+    """``{prefix: rule}`` — validated, plain dicts (they carry predicates)."""
+    d = _obj(d, where)
+    out: dict = {}
+    for prefix, raw in d.items():
+        w = f"{where}[{prefix!r}]"
+        rule = _obj(raw, w)
+        # a key starting with "_" is a comment
+        _strict({k: v for k, v in rule.items() if not k.startswith("_")},
+                PREFIX_KEYS, w)
+        kind = rule.get("kind", "geometry")
+        if kind not in PREFIX_KINDS:
+            raise PolicyError(f"{w}.kind must be one of {list(PREFIX_KINDS)}, "
+                              f"got {kind!r}")
+        shape = rule.get("shape", "native")
+        if shape not in PREFIX_SHAPES:
+            raise PolicyError(f"{w}.shape must be one of {list(PREFIX_SHAPES)}, "
+                              f"got {shape!r}")
+        family = rule.get("family")
+        if family is not None and not isinstance(family, str):
+            raise PolicyError(f"{w}.family must be a string")
+        rules = rule.get("rules") or ()
+        if not isinstance(rules, (list, tuple)):
+            raise PolicyError(f"{w}.rules must be a list")
+        for i, r in enumerate(rules):
+            rr = _obj(r, f"{w}.rules[{i}]")
+            if not isinstance(rr.get("family"), str):
+                raise PolicyError(f"{w}.rules[{i}].family must be a string")
+        out[str(prefix)] = {"kind": kind, "shape": shape, "family": family,
+                            "rules": [dict(r) for r in rules]}
+    return out
+
+
 # ── sections ────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -185,9 +345,13 @@ class Family:
     size_min_mm: float | None = None
     size_max_mm: float | None = None
     size_key: str = "w"
+    #: Block-name **prefixes** this family claims.  A CAD export names its
+    #: blocks ``Part-116860372-114953 - 114867``; a regex over the whole
+    #: name is hopeless, but the prefix is stable.
+    block_prefixes: tuple[str, ...] = ()
 
     KEYS = ("src", "feature", "layer_regex", "block_regex",
-            "size_min_mm", "size_max_mm", "size_key")
+            "size_min_mm", "size_max_mm", "size_key", "block_prefixes")
 
     def __post_init__(self) -> None:
         if self.src not in SOURCES:
@@ -199,12 +363,23 @@ class Family:
         if bad:
             raise PolicyError(f"family {self.name!r}: unknown feature type(s) {bad}; "
                               f"allowed {list(FEATURES)}")
-        if self.layer_regex is None and self.block_regex is None:
+        if self.layer_regex is None and self.block_regex is None \
+                and not self.block_prefixes:
             raise PolicyError(f"family {self.name!r}: at least one of "
-                              "layer_regex / block_regex is required")
+                              "layer_regex / block_regex / block_prefixes "
+                              "is required")
         if self.size_key not in SIZE_KEYS:
             raise PolicyError(f"family {self.name!r}: size_key must be one of "
                               f"{list(SIZE_KEYS)}, got {self.size_key!r}")
+        if self.layer_regex is None and self.block_regex is None \
+                and not self.block_prefixes:
+            raise PolicyError(f"family {self.name!r}: at least one of "
+                              "layer_regex / block_regex / block_prefixes "
+                              "is required")
+        for pref in self.block_prefixes:
+            if not isinstance(pref, str) or not pref:
+                raise PolicyError(f"family {self.name!r}: block_prefixes must "
+                                  "be non-empty strings")
 
     def has_feature(self, feature: str) -> bool:
         return feature in self.features
@@ -216,6 +391,13 @@ class Family:
     def block_re(self):
         """Compiled block-name regex, or ``None``."""
         return None if self.block_regex is None else re.compile(self.block_regex, re.IGNORECASE)
+
+    def claims_prefix(self, name: str) -> bool:
+        """Does a block called ``name`` belong to this family by its prefix?"""
+        if not self.block_prefixes:
+            return False
+        low = str(name).lower()
+        return any(low.startswith(p.lower()) for p in self.block_prefixes)
 
     def size_ok(self, size_mm: dict) -> bool:
         """Is a feature's world-mapped ``{w, h, r, len}`` inside the range?"""
@@ -240,7 +422,8 @@ class Family:
                 "block_regex": self.block_regex,
                 "size_min_mm": self.size_min_mm,
                 "size_max_mm": self.size_max_mm,
-                "size_key": self.size_key}
+                "size_key": self.size_key,
+                "block_prefixes": list(self.block_prefixes)}
 
     @classmethod
     def from_dict(cls, name: str, d, where: str | None = None) -> "Family":
@@ -259,6 +442,7 @@ class Family:
             size_min_mm=_opt_num(d, "size_min_mm", w, lo=0.0),
             size_max_mm=_opt_num(d, "size_max_mm", w, lo=0.0),
             size_key=d.get("size_key", "w"),
+            block_prefixes=tuple(d.get("block_prefixes") or ()),
         )
 
 
@@ -496,12 +680,22 @@ class MismatchPolicy:
     # top level so they are strict-checked and hashed like everything else.
     clash_with_members: bool = False        # beams excluded from clash unless True
     containment_requires_counterpart: bool = False
+    #: What a block-name prefix means — ``{prefix: rule}``.  See
+    #: :func:`_prefix_rules`.
+    prefixes: dict = field(default_factory=dict)
+    #: The pairing rules the offset check may use.  **Only** what a rule
+    #: pairs is ever compared.
+    offset_rules: tuple = ()
+    #: The profile in force (its name).  The profile itself is applied by
+    #: :func:`apply_profile`, once the drawing is known.
+    profile: str | None = None
 
     KEYS = ("enabled", "source_docs", "families", "pairs", "checks", "tol_mm",
             "search_mm", "band", "crit_bearing", "context",
             "detect_polygon_circles", "reconstruct_rects_from_lines",
             "restrict_to", "grid_margin_bays", "render", "max_findings",
-            "clash_with_members", "containment_requires_counterpart")
+            "clash_with_members", "containment_requires_counterpart",
+            "prefixes", "profile", "offset_rules")
 
     SECTIONS = ("pairs", "checks", "tol_mm", "search_mm", "band", "context", "render")
 
@@ -543,6 +737,9 @@ class MismatchPolicy:
             "max_findings": self.max_findings,
             "clash_with_members": self.clash_with_members,
             "containment_requires_counterpart": self.containment_requires_counterpart,
+            "prefixes": {k: dict(v) for k, v in self.prefixes.items()},
+            "profile": self.profile,
+            "offset_rules": [r.to_dict() for r in self.offset_rules],
         }
 
     @classmethod
@@ -591,6 +788,20 @@ class MismatchPolicy:
         if "containment_requires_counterpart" in d:
             kw["containment_requires_counterpart"] = _bool(
                 d, "containment_requires_counterpart", where)
+        if "prefixes" in d:
+            kw["prefixes"] = _prefix_rules(d["prefixes"], f"{where}.prefixes")
+        if "offset_rules" in d:
+            rules = d["offset_rules"] or []
+            if not isinstance(rules, (list, tuple)):
+                raise PolicyError(f"{where}.offset_rules must be a list")
+            kw["offset_rules"] = tuple(
+                OffsetRule.from_dict(r, f"{where}.offset_rules[{i}]")
+                for i, r in enumerate(rules))
+        if "profile" in d:
+            name = d["profile"]
+            if name is not None and not isinstance(name, str):
+                raise PolicyError(f"{where}.profile must be a string")
+            kw["profile"] = name
 
         pol = cls(**kw)
         pol._validate_references()
@@ -623,6 +834,117 @@ class MismatchPolicy:
         return policy_hash(self)
 
 
+# ── profiles ────────────────────────────────────────────────────────────────
+
+#: Where the per-drawing profiles live: ``<repo>/profiles/<name>.json``.
+PROFILES_DIR = Path(__file__).resolve().parents[2] / "profiles"
+
+#: The profile used when a policy does not name one.
+DEFAULT_PROFILE = "tp104"
+
+
+def available_profiles() -> list[str]:
+    """The profiles on disk, by name."""
+    if not PROFILES_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in PROFILES_DIR.glob("*.json"))
+
+
+def load_profile(name: str) -> dict | None:
+    """Read ``profiles/<name>.json``.
+
+    ``None`` when the profile does not exist — a missing profile is not an
+    error, it just means the drawing gets the default rules.
+    """
+    path = PROFILES_DIR / f"{name}.json"
+    if not path.exists():
+        return None
+    try:
+        doc = json.loads(path.read_text())
+    except Exception as exc:
+        raise PolicyError(f"profile {name!r} is not valid JSON: {exc}") from None
+    if not isinstance(doc, dict):
+        raise PolicyError(f"profile {name!r} must be a JSON object")
+    return doc
+
+
+def _profile_matches(spec: dict, prefixes: set[str], inserts: int) -> bool:
+    """Does this drawing look like the one the profile describes?
+
+    The signature is the set of block-name prefixes the profile expects —
+    a Tekla export has ``Connection-``/``Mark-``/``StraightDimension-``,
+    which nothing else does.
+    """
+    match = spec.get("match") or {}
+    if not isinstance(match, dict):
+        raise PolicyError("profile 'match' must be an object")
+    wanted = match.get("prefixes") or ()
+    if isinstance(wanted, str):
+        wanted = (wanted,)
+    low = {p.lower() for p in wanted}
+    have = {p.lower() for p in prefixes}
+    if low and not low.issubset(have):
+        return False
+    min_inserts = match.get("min_inserts")
+    if min_inserts is not None and inserts < int(min_inserts):
+        return False
+    return True
+
+
+def apply_profile(pol: "MismatchPolicy", doc=None) -> "MismatchPolicy":
+    """Apply the profile in force to a policy, if the drawing matches it.
+
+    A profile can override the **prefixes**, the **size ranges** and the
+    **families** of the default policy.  It is only applied when the
+    drawing it describes is the one in hand — otherwise the default rules
+    (and the synthetic fixtures) are left alone.
+    """
+    name = pol.profile or DEFAULT_PROFILE
+    spec = load_profile(name)
+    if not spec:
+        return pol
+    prefixes = set()
+    inserts = 0
+    if doc is not None:
+        try:
+            for e in doc.modelspace():
+                if e.dxftype() == "INSERT":
+                    inserts += 1
+                    nm = str(e.dxf.name or "")
+                    prefixes.add(nm.split("-")[0] + "-" if "-" in nm else nm)
+        except Exception:
+            return pol
+    if not _profile_matches(spec, prefixes, inserts):
+        return pol
+
+    kw: dict = {}
+    if spec.get("offset_rules") is not None:
+        # A profile describes one drawing's pairing, so its rules replace
+        # the policy's rather than adding to them.
+        rules = spec["offset_rules"] or []
+        kw["offset_rules"] = tuple(
+            OffsetRule.from_dict(r, f"profile {name!r}.offset_rules[{i}]")
+            for i, r in enumerate(rules))
+    if spec.get("prefixes"):
+        kw["prefixes"] = _prefix_rules(spec["prefixes"], f"profile {name!r}.prefixes")
+    fams = spec.get("families")
+    if fams:
+        merged = {f.name: f.to_dict() for f in pol.families}
+        for fname, spec_fam in (fams or {}).items():
+            base = merged.get(fname, {})
+            base = {**base, **(spec_fam or {})}
+            merged[fname] = base
+        # a family the profile introduces
+        for fname, spec_fam in (fams or {}).items():
+            if fname not in merged:
+                merged[fname] = dict(spec_fam)
+        kw["families"] = tuple(
+            Family.from_dict(fname, spec_fam, f"profile {name!r}.families[{fname!r}]")
+            for fname, spec_fam in merged.items())
+    kw["profile"] = name
+    return pol.replace(**kw)
+
+
 # ── defaults (§1.2 family table) ────────────────────────────────────────────
 
 DEFAULT_FAMILIES: tuple[Family, ...] = (
@@ -653,7 +975,23 @@ DEFAULT_FAMILIES: tuple[Family, ...] = (
 )
 
 #: The baseline policy: the §1.2 table plus the §1.5 JSON verbatim.
-DEFAULT_POLICY = MismatchPolicy(families=DEFAULT_FAMILIES)
+#: The pairing rule the offset check starts from.  It pairs **anything**
+#: with anything, within the numbers below — a drawing that has no profile
+#: of its own still gets compared.  A profile replaces it (see
+#: :func:`apply_profile`): one that describes a real drawing says exactly
+#: which layers may be paired with which families.
+DEFAULT_OFFSET_RULES: tuple[OffsetRule, ...] = (
+    OffsetRule(
+        name="default",
+        mech_selector={"layers": ["*"], "families": []},
+        str_selector={"layers": ["*"], "families": []},
+        method="edge_to_edge",
+        search_mm=25.0, tolerance_mm=5.0, warn_mm=5.0, critical_mm=15.0,
+        min_overlap_mm=50.0, needs_review=True),
+)
+
+DEFAULT_POLICY = MismatchPolicy(families=DEFAULT_FAMILIES,
+                                offset_rules=DEFAULT_OFFSET_RULES)
 
 
 # ── hashing ─────────────────────────────────────────────────────────────────

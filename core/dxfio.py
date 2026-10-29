@@ -30,6 +30,32 @@ class DXFReadError(RuntimeError):
 AuditSummary = dict  # {"fixes": int, "errors": [str, ...]}
 
 
+def mm_per_unit(doc) -> float:
+    """How many millimetres one drawing unit of ``doc`` is worth.
+
+    Read from ``$INSUNITS``.  A drawing that declares no units (or an
+    unknown code) is **assumed** to be in millimetres — which is what the
+    rest of the pipeline assumes too.
+
+    Every geometric threshold in the project is specified in millimetres
+    (the plan says so), so the modules that work in *drawing* units must
+    divide their thresholds by this factor.  Getting it wrong is not a
+    rounding error: on a metre-scale STR drawing a 100 mm threshold
+    becomes 100 m, and every member of the drawing is discarded.
+    """
+    try:
+        code = int(doc.header.get("$INSUNITS", 0))
+    except Exception:
+        code = 0
+    if code <= 0:
+        return 1.0
+    from .units import mm_per_unit_of_code
+    factor = mm_per_unit_of_code(code)
+    if not (factor > 0.0) or factor != factor:      # not finite / NaN
+        return 1.0
+    return factor
+
+
 def _summarize(auditor, extra_fixes: int = 0) -> AuditSummary:
     return {
         "fixes": len(auditor.fixes) + extra_fixes,

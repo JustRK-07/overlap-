@@ -83,7 +83,11 @@ KINDS = (
 )
 
 #: Most severe first — this is also the numeric rank used for sorting.
-SEVERITIES = ("CRITICAL", "WARNING", "INFO")
+#: ``REVIEW`` is not a defect: it is something a human has to look at —
+#: an ambiguous match, or a finding from a provisional rule.  It is
+#: deliberately **not** CRITICAL or WARNING, so it stays out of those
+#: counts.
+SEVERITIES = ("CRITICAL", "WARNING", "INFO", "REVIEW")
 SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITIES)}
 
 #: ``mismatch`` = produced by this stage; ``spotcheck`` = promoted from a
@@ -365,6 +369,16 @@ def finding_to_dict(f: Finding) -> dict:
         "location": _pair(f.location),
         "str_location": _pair(f.str_location),
         "offset_mm": _pair(f.offset_mm),
+        # the same vector, split — the report and the scoreboard read
+        # these (A7 asks for dx_mm / dy_mm)
+        "dx_mm": (f.offset_mm[0] if f.offset_mm else None),
+        "dy_mm": (f.offset_mm[1] if f.offset_mm else None),
+        # the location, split — the CSV's shape, so a JSON consumer does
+        # not have to unpack "location"
+        "x": (f.location[0] if f.location else None),
+        "y": (f.location[1] if f.location else None),
+        # the grid bay, when the finding knows one (the offset check)
+        "grid_bay": (f.details or {}).get("grid_bay"),
         "magnitude_mm": f.magnitude_mm,
         "local_offset_mm": _pair(f.local_offset_mm),
         "local_magnitude_mm": f.local_magnitude_mm,

@@ -31,12 +31,15 @@ def _validate_dxf(path: Path) -> dict:
         msp = doc.modelspace()
         ent_count = sum(1 for _ in msp)
         layer_count = len(doc.layers)
+        # `msp.bbox()` does not exist in ezdxf 1.4.4 — the correct call is
+        # `ezdxf.bbox.extents()`, and an empty modelspace reports no data.
         try:
-            ext = msp.bbox()
-            extents = {
-                "min": [ext.extmin[0], ext.extmin[1]],
-                "max": [ext.extmax[0], ext.extmax[1]],
-            }
+            from ezdxf import bbox as ez_bbox
+            box = ez_bbox.extents(msp, fast=False)
+            extents = ({
+                "min": [float(box.extmin[0]), float(box.extmin[1])],
+                "max": [float(box.extmax[0]), float(box.extmax[1])],
+            } if box.has_data else None)
         except Exception:
             extents = None
 

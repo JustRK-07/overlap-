@@ -30,7 +30,7 @@ See `clean_v1.py` for the recommended default.
 
 from __future__ import annotations
 
-from .dxfio import read_internal as _read_internal, save as _dxf_save
+from .dxfio import read_input as _read_input, read_internal as _read_internal, save as _dxf_save
 
 import json
 from pathlib import Path
@@ -71,7 +71,9 @@ def _clean_one(path: Path, out_path: Path, *, is_str: bool,
     protected_blocks: set of block names that must NOT be deleted even
         if no INSERT references them.
     """
-    doc = _read_internal(str(path))
+    # `converted/` is an INPUT (PLAN.md decision 8) — read it with the
+    # recovering reader so a file convert accepted is not rejected here.
+    doc, _audit = _read_input(str(path))
     msp = doc.modelspace()
 
     # Step 1: strip annotation entities (DIMENSION, MTEXT, etc.) in modelspace.
@@ -223,6 +225,9 @@ def run(job_id: str) -> None:
     cleaned = d / "cleaned"
     stages = d / "stages"
     stages.mkdir(exist_ok=True)
+    # see clean_v1.run — `doc.saveas()` needs the parent directory to exist,
+    # and legacy job dirs have no `cleaned/` at all.
+    cleaned.mkdir(parents=True, exist_ok=True)
 
     # Load the policy derived by stage 3.5b (clean_policy). If missing
     # (legacy job / no stage 3.5b yet), fall back to DEFAULT_POLICY.

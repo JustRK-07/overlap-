@@ -29,6 +29,7 @@ Writes:
 
 from __future__ import annotations
 
+from . import dxfio
 from .dxfio import read_internal as _read_internal, save as _dxf_save
 from .transform2d import Affine2D
 
@@ -132,6 +133,9 @@ def _find_mech_saddles(doc) -> list[dict]:
     """Return a list of {centroid: (x,y), block_name, handle, layer, footprint}."""
     saddles = []
     msp = doc.modelspace()
+    # the size bounds below are in millimetres; the geometry is in the
+    # MECH drawing's own units
+    mm = max(dxfio.mm_per_unit(doc), 1e-9)
 
     def _is_saddle_layer(layer: str) -> bool:
         upper = (layer or "").upper()
@@ -157,7 +161,8 @@ def _find_mech_saddles(doc) -> list[dict]:
         ys = [p[1] for p in pts]
         w = max(xs) - min(xs)
         h = max(ys) - min(ys)
-        if not (200 <= w <= 5000 and 200 <= h <= 5000):
+        if not (200.0 / mm <= w <= 5000.0 / mm
+                and 200.0 / mm <= h <= 5000.0 / mm):
             continue
         cx, cy = _polygon_centroid(pts)
         saddles.append({
@@ -202,7 +207,8 @@ def _find_mech_saddles(doc) -> list[dict]:
             ys = [p[1] for p in pts_local]
             w = (max(xs) - min(xs)) * abs(sx)
             h = (max(ys) - min(ys)) * abs(sy)
-            if not (200 <= w <= 5000 and 200 <= h <= 5000):
+            if not (200.0 / mm <= w <= 5000.0 / mm
+                    and 200.0 / mm <= h <= 5000.0 / mm):
                 continue
             pts_world = [(ix + sx * p[0], iy + sy * p[1]) for p in pts_local]
             cx, cy = _polygon_centroid(pts_world)
@@ -223,6 +229,11 @@ def _find_mech_saddles(doc) -> list[dict]:
 def _extract_str_beams_and_columns(doc) -> tuple[list, list]:
     """Walk every non-anonymous block + its INSERTs.
 
+    The thresholds below are in millimetres; the geometry is in the STR
+    drawing's own units, so they are divided by the drawing's
+    ``mm_per_unit``.  Without that a metre-scale STR (a 20 m beam = 20
+    units) fails the 100 unit minimum and *every* member is discarded.
+    
     Skips Bolt-* (their LINEs are bolt outlines, not beams — positions
     extracted separately via _extract_str_bolts) and Connection-*
     (empty placeholder blocks).
@@ -237,6 +248,7 @@ def _extract_str_beams_and_columns(doc) -> tuple[list, list]:
       columns:  list of ((x1,y1),(x2,y2), handle, block_name)
                 (long-axis = vertical, short-axis = horizontal)
     """
+    min_str_mm = max(dxfio.mm_per_unit(doc), 1e-9)
     is_anchor, _, _, _, _ = _detect_anchor_pattern(doc)
     apply_t = not is_anchor
 
@@ -268,7 +280,9 @@ def _extract_str_beams_and_columns(doc) -> tuple[list, list]:
             dx = b[0] - a[0]
             dy = b[1] - a[1]
             length = math.hypot(dx, dy)
-            if length < 100:
+            # 100 mm, expressed in the STR drawing's own units — a
+            # metre-scale STR would otherwise discard every member.
+            if length < 100.0 / min_str_mm:
                 continue
             try:
                 handle = ins.dxf.handle if ins.dxf.hasattr("handle") else ""
@@ -347,6 +361,7 @@ def _extract_str_gridlines(doc) -> list[tuple[float, str]]:
     Uses `grid.walk_world`, so block base point / rotation / nesting are
     applied through the ezdxf INSERT matrices (world coordinates).
     """
+    min_str_mm = max(dxfio.mm_per_unit(doc), 1e-9)
     from . import grid
     coords = []
     for it in grid.walk_world(doc):
@@ -363,7 +378,8 @@ def _extract_str_gridlines(doc) -> list[tuple[float, str]]:
             continue
         dx, dy = b.x - a.x, b.y - a.y
         length = math.hypot(dx, dy)
-        if length < 100:
+        # 100 mm, in the STR drawing's units
+        if length < 100.0 / min_str_mm:
             continue
         if abs(dx) < 0.1 * length:    # vertical -> X gridline
             coords.append((a.x, "X"))
@@ -464,6 +480,81 @@ CROSS_DRAWING_TYPES = (
     "GRID_MISALIGN",
 )
 
+#: PLAN_MISMATCH §5 — a spot-check issue is superseded by a native mismatch
+#: finding of an equivalent kind.  GRID_MISALIGN has no native equivalent
+#: (the mismatch engine reports the *cause*, not a grid offset) and is
+#: therefore never superseded.
+DEDUPE_EQUIVALENTS = {
+    "NO_BEAM_SUPPORT": ("SUPPORT_OFF_MEMBER", "SUPPORT_POINT_OFF_MEMBER",
+                        "MISSING_COUNTERPART"),
+    "COLUMN_CLASH": ("CLASH",),
+    "BAY_OVERHANG": ("OUTSIDE_OUTLINE",),
+}
+
+#: The proximity below which a spot-check issue is considered the *same*
+#: defect as a native finding.  PLAN_MISMATCH §5: "max(500 mm, half the
+#: footprint diagonal)" — the footprint diagonal is not carried on an
+#: ``Issue``, so the 500 mm floor is used and converted to drawing units.
+DEDUPE_RADIUS_MM = 500.0
+
+
+def _dedupe_against_findings(issues: list, payload: dict | None,
+                             *, mm_per_unit: float | None) -> tuple[list, list]:
+    """``(kept, superseded)`` — the issues a native finding already covers.
+
+    ``payload`` is ``stages/mismatch.json``.  An issue is superseded when a
+    native finding of an equivalent kind refers to the same MECH entity, or
+    sits within :data:`DEDUPE_RADIUS_MM` of it.
+    """
+    kept: list = []
+    superseded: list = []
+    if not payload:
+        return kept, superseded
+
+    findings = payload.get("findings") or []
+    by_kind: dict[str, list] = {}
+    for f in findings:
+        by_kind.setdefault(str(f.get("kind", "")), []).append(f)
+    if not by_kind:
+        return kept, superseded
+
+    mm = float(mm_per_unit) if mm_per_unit else None
+    radius_units = (DEDUPE_RADIUS_MM / mm) if mm else DEDUPE_RADIUS_MM
+
+    for issue in issues:
+        equivalents = DEDUPE_EQUIVALENTS.get(issue.type)
+        if not equivalents:
+            kept.append(issue)
+            continue
+        candidates = []
+        for kind in equivalents:
+            candidates.extend(by_kind.get(kind, ()))
+        if not candidates:
+            kept.append(issue)
+            continue
+
+        uid = None
+        for f in candidates:
+            ref = f.get("mech_ref") or {}
+            if ref.get("handle") and ref.get("handle") == issue.mech_entity:
+                uid = f.get("uid") or f.get("id")
+                break
+            loc = f.get("location")
+            if loc and len(loc) == 2:
+                try:
+                    d = math.hypot(float(loc[0]) - float(issue.mech_x),
+                                   float(loc[1]) - float(issue.mech_y))
+                except (TypeError, ValueError):
+                    continue
+                if d <= radius_units:
+                    uid = f.get("uid") or f.get("id")
+                    break
+        if uid:
+            superseded.append({**asdict(issue), "by": uid})
+        else:
+            kept.append(issue)
+    return kept, superseded
+
 
 def _cluster_intra(issues: list, *, radius: float) -> list:
     """Group issues of the same type within `radius` of each other.
@@ -543,7 +634,8 @@ def run(job_id: str, *,
         column_tolerance: float = 100.0,
         max_issues: int = 500,
         cluster_radius: float = 5000.0,
-        pair_dir: Path | None = None) -> SpotCheckResult:
+        pair_dir: Path | None = None,
+        dedupe_against: Path | None = None) -> SpotCheckResult:
     """Stage 7.5: detect support issues. Returns SpotCheckResult.
 
     Merges 3 sources into a single issues list:
@@ -555,6 +647,11 @@ def run(job_id: str, *,
     (`jobs/<id>/out/pairs/<pair_id>/cleaned/`) for Slice-1 multi-pair
     runs. When None, the legacy single-pair path is taken — bit-equivalent
     behaviour.
+
+    `dedupe_against` is the native-findings JSON (PLAN_MISMATCH §5).  It
+    defaults to `<root>/stages/mismatch.json` when that file exists: a
+    cross-drawing issue that a native finding already covers is moved to
+    `superseded` instead of being reported twice.
 
     Default tolerances (industry-researched):
       beam_tolerance=500mm     — beam flange width (~300mm) + erection ±10mm
@@ -583,6 +680,11 @@ def run(job_id: str, *,
         root = Path(pair_dir).parent
     else:
         root = d
+    if dedupe_against is None:
+        # PLAN_MISMATCH §5: the native findings supersede the equivalent
+        # spot-check issues by default.
+        candidate = root / "stages" / "mismatch.json"
+        dedupe_against = candidate if candidate.exists() else None
     from .roles import resolve_pair
     mech_path, str_path = resolve_pair(job_id, pair_dir)   # explicit roles
 
@@ -710,8 +812,21 @@ def run(job_id: str, *,
     if str_intra_path.exists():
         try:
             str_intra_data = json.loads(str_intra_path.read_text())
+            # The STR-intra detector works in the STR drawing's own
+            # coordinates; every other issue — and the DXF the markers
+            # are drawn on — is in MECH world.  Map them here, at the one
+            # place the two coordinate spaces meet, so `mech_x`/`mech_y`
+            # mean what they say.
+            str_to_mech = _affine_from(t)
             for raw in str_intra_data.get("issues", []):
-                intra_issues.append(Issue(**raw))
+                issue = Issue(**raw)
+                try:
+                    mx, my = str_to_mech.apply(
+                        (float(issue.mech_x), float(issue.mech_y)))
+                    issue.mech_x, issue.mech_y = float(mx), float(my)
+                except Exception:
+                    pass
+                intra_issues.append(issue)
         except Exception as e:
             print(f"  spotcheck: failed to merge str_intra: {e}")
 
@@ -722,6 +837,22 @@ def run(job_id: str, *,
     # MECH-/STR- prefixes and don't conflict with these).
     for idx, iss in enumerate(result.issues, start=1):
         iss.id = f"ISSUE-{idx:03d}"
+
+    # ── Supersede what the mismatch check already reported ──────────────
+    # A cross-drawing issue that a native finding already covers must not
+    # be reported twice (PLAN_MISMATCH §5).  It moves to `superseded`.
+    superseded: list = []
+    if dedupe_against is not None and Path(dedupe_against).exists():
+        try:
+            native = json.loads(Path(dedupe_against).read_text())
+        except Exception as e:
+            native = None
+            print(f"  spotcheck: failed to read {dedupe_against}: {e}")
+        if native:
+            mm_per_unit = ((native.get("units") or {}).get("mm_per_unit"))
+            kept, superseded = _dedupe_against_findings(
+                result.issues, native, mm_per_unit=mm_per_unit)
+            result.issues = kept
 
     # Final ordering: severity (CRITICAL > WARNING > INFO), then id
     sev_rank = {"CRITICAL": 0, "WARNING": 1, "INFO": 2, "": 3}
@@ -758,6 +889,7 @@ def run(job_id: str, *,
         "truncated": truncated,
         "enabled_checks": list(enabled_checks),
         "issues": [asdict(i) for i in result.issues],
+        "superseded": superseded,
     }, indent=2))
 
     return result

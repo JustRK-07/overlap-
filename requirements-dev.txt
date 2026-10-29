@@ -1,0 +1,6 @@
+# Test-only dependencies — not needed to run the app.
+#
+# requests   the standalone live-server smoke script (tests/smoke_test.py).
+#            It is deliberately NOT a pytest test — pytest does not collect
+#            it — so the app itself does not depend on it.
+requests>=2.31

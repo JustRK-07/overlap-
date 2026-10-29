@@ -28,7 +28,9 @@ Writes: jobs/<id>/out/preview.png          — the full extents
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import math
 import time
 from dataclasses import asdict, dataclass, field
@@ -173,6 +175,47 @@ def _patch_font_cache() -> None:
         _CacheClass.find_best_match = _safe_find_best_match
     except Exception:
         pass
+
+
+def _ezdxf_can_draw_text() -> bool:
+    """Does ezdxf's font manager have a usable font?
+
+    Without one the text renderer produces no glyphs, so TEXT/MTEXT in the
+    drawing is invisible in the preview — the geometry is still fine and the
+    DXF itself is unaffected.  The preview must *say* so rather than let the
+    picture and the report disagree.
+    """
+    try:
+        from ezdxf.fonts.font_manager import FontManager
+        face = FontManager().find_best_match(family="Arial", style="Regular",
+                                             italic=False)
+    except Exception:
+        return False
+    if face is None:
+        return False
+    return getattr(face, "filename", None) not in (None, "", "_no_font_")
+
+
+@contextlib.contextmanager
+def _quiet_ezdxf_font_warnings():
+    """Silence ezdxf's "no default font found" chatter during a render.
+
+    ezdxf logs one such line per TEXT/MTEXT it draws, under the ``ezdxf``
+    logger.  The preview handles the missing-font case deliberately (a stub
+    ``FontFace`` — see :func:`_patch_font_cache`), so the warning is
+    expected noise, but it would otherwise print one line per entity.
+    """
+    loggers = [logging.getLogger("ezdxf"),
+               logging.getLogger("ezdxf.fonts"),
+               logging.getLogger("ezdxf.properties")]
+    old = [lg.level for lg in loggers]
+    for lg in loggers:
+        lg.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        for lg, lvl in zip(loggers, old):
+            lg.setLevel(lvl)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -551,16 +594,23 @@ def _world_to_px(ax, box, png_w: int, png_h: int) -> list[list[float]]:
 def _render_one(doc, msp, box, out_png: Path, by_handle: dict) -> dict | None:
     """Draw one picture of ``doc`` framed on ``box``.
 
-    Returns ``{png_w, png_h, world_to_px, world_extents}`` on success and
-    ``None`` when the renderer had to give up (a blank PNG is still written so
-    ``/preview.png`` does not 404 — the DXF itself is unaffected).
+    Returns ``{png_w, png_h, world_to_px, world_extents, mtext_skipped}`` on
+    success and ``None`` when the renderer had to give up (a blank PNG is
+    still written so ``/preview.png`` does not 404 — the DXF itself is
+    unaffected).
+
+    MTEXT is drawn.  It used to be filtered out unconditionally — the
+    renderer "needs a font" — which silently discarded real geometry while
+    the reported extents still counted it.  The stub font below is enough
+    for ezdxf to render MTEXT; if the render still fails, it is retried
+    without MTEXT and the count of skipped entities is *reported*.
     """
     xmin, ymin, xmax, ymax = box
 
-    def in_view(e) -> bool:
+    def in_view(e, skip_mtext: bool) -> bool:
         try:
-            if e.dxftype() == "MTEXT":
-                return False        # the complex MTEXT renderer needs a font
+            if skip_mtext and e.dxftype() == "MTEXT":
+                return False
         except Exception:
             pass
         ext = None
@@ -575,51 +625,70 @@ def _render_one(doc, msp, box, out_png: Path, by_handle: dict) -> dict | None:
         return not (ext[2] < xmin or ext[0] > xmax or
                     ext[3] < ymin or ext[1] > ymax)
 
-    fig, ax = plt.subplots(figsize=(10, 6), dpi=100)
-    try:
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlim(xmin, xmax)
-        ax.set_ylim(ymin, ymax)
-        ax.axis("off")
-        ax.set_facecolor("white")
+    n_mtext = sum(1 for e in msp if e.dxftype() == "MTEXT")
 
-        ctx = RenderContext(doc)
-        # Force a stub FontFace so text rendering never goes looking for a
-        # font on disk (the "no fonts available" failure on minimal systems).
-        from ezdxf.fonts import fonts as ezdxf_fonts
+    def draw(skip_mtext: bool) -> dict:
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=100)
         try:
-            ctx.fonts = {"": ezdxf_fonts.FontFace()}
-        except Exception:
-            pass
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xlim(xmin, xmax)
+            ax.set_ylim(ymin, ymax)
+            ax.axis("off")
+            ax.set_facecolor("white")
 
-        out_b = MatplotlibBackend(ax, adjust_figure=False)
-        config = draw_config.Configuration(color_policy=draw_config.ColorPolicy.COLOR)
-        Frontend(ctx, out_b, config=config).draw_layout(
-            msp, finalize=True, filter_func=in_view)
-        # ezdxf's backend switches autoscale back on, forces an "equal" datalim
-        # aspect and would resize the figure; put the requested frame back and
-        # let the aspect adjust the axes *box*, so the drawing keeps exactly
-        # the extents that were measured (and said so in the report).
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlim(xmin, xmax)
-        ax.set_ylim(ymin, ymax)
-        # The transform is only final once the canvas has been drawn.
-        fig.canvas.draw()
-        png_w, png_h = (int(v) for v in fig.canvas.get_width_height())
-        meta = {
-            "png_w": png_w,
-            "png_h": png_h,
-            "world_to_px": _world_to_px(ax, box, png_w, png_h),
-            "world_extents": [float(v) for v in box],
-        }
-        fig.savefig(str(out_png), bbox_inches=None, pad_inches=0, facecolor="white")
-        return meta
+            ctx = RenderContext(doc)
+            # Force a stub FontFace so text rendering never goes looking for
+            # a font on disk (the "no fonts available" failure on minimal
+            # systems).  It is enough for ezdxf to render MTEXT.
+            from ezdxf.fonts import fonts as ezdxf_fonts
+            try:
+                ctx.fonts = {"": ezdxf_fonts.FontFace()}
+            except Exception:
+                pass
+
+            out_b = MatplotlibBackend(ax, adjust_figure=False)
+            config = draw_config.Configuration(color_policy=draw_config.ColorPolicy.COLOR)
+            Frontend(ctx, out_b, config=config).draw_layout(
+                msp, finalize=True,
+                filter_func=lambda e: in_view(e, skip_mtext))
+            # ezdxf's backend switches autoscale back on, forces an "equal"
+            # datalim aspect and would resize the figure; put the requested
+            # frame back and let the aspect adjust the axes *box*, so the
+            # drawing keeps exactly the extents that were measured (and said
+            # so in the report).
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xlim(xmin, xmax)
+            ax.set_ylim(ymin, ymax)
+            # The transform is only final once the canvas has been drawn.
+            fig.canvas.draw()
+            png_w, png_h = (int(v) for v in fig.canvas.get_width_height())
+            meta = {
+                "png_w": png_w,
+                "png_h": png_h,
+                "world_to_px": _world_to_px(ax, box, png_w, png_h),
+                "world_extents": [float(v) for v in box],
+                "mtext_skipped": n_mtext if skip_mtext else 0,
+            }
+            fig.savefig(str(out_png), bbox_inches=None, pad_inches=0,
+                        facecolor="white")
+            return meta
+        finally:
+            plt.close(fig)
+
+    try:
+        try:
+            return draw(skip_mtext=False)
+        except Exception as exc:                 # noqa: BLE001 — retried below
+            # MTEXT needs a font the system may not have.  Fall back to
+            # leaving it out — but RECORD that it was left out, so the
+            # preview never silently disagrees with the reported extents.
+            print(f"  WARN: preview render failed with MTEXT ({exc}); "
+                  "retrying without MTEXT")
+            return draw(skip_mtext=True)
     except Exception as e:                       # noqa: BLE001 — reported below
         _write_blank_png(out_png)
         print(f"  WARN: preview render failed (non-fatal): {e}")
         return None
-    finally:
-        plt.close(fig)
 
 
 def _write_blank_png(out_png: Path) -> None:
@@ -667,8 +736,23 @@ def _render_preview(dxf_path: Path, out_png: Path, *, grid_png: Path | None = No
         "dangling_inserts": dangling[:MAX_DANGLING],
         "entity_boxes": ext.entity_boxes,
         "colors": recolor["colors"],
+        # MTEXT is rendered when ezdxf has a usable font; when it does not,
+        # the text simply does not appear in the picture.  Report it, so the
+        # preview never silently disagrees with the drawing.
+        "mtext_entities": sum(1 for e in msp if e.dxftype() == "MTEXT"),
+        "mtext_drawn": False,
+        "mtext_not_drawn": 0,
         "images": [],
     }
+    n_mtext = summary["mtext_entities"]
+    if n_mtext:
+        can_draw = _ezdxf_can_draw_text()
+        summary["mtext_drawn"] = bool(can_draw)
+        summary["mtext_not_drawn"] = 0 if can_draw else n_mtext
+        if not can_draw:
+            print(f"  WARN: {n_mtext} MTEXT entit(ies) are in the drawing but "
+                  "no usable font was found, so they do not appear in the "
+                  "preview (the DXF is unaffected)")
     if dangling:
         print(f"  WARN: dropped {len(dangling)} INSERT(s) with a missing block "
               "definition (see report.json → dangling_inserts)")
@@ -685,18 +769,28 @@ def _render_preview(dxf_path: Path, out_png: Path, *, grid_png: Path | None = No
     for target, box, name in targets:
         if box is None:
             continue
-        meta = _render_one(doc, msp, box, target, by_handle)
+        with _quiet_ezdxf_font_warnings():
+            meta = _render_one(doc, msp, box, target, by_handle)
         entry = {"name": name, "world_extents": [float(v) for v in box]}
         if meta:
             entry.update({k: meta[k] for k in ("png_w", "png_h", "world_to_px")})
+            # MTEXT that could not be drawn — reported, never silent
+            entry["mtext_skipped"] = int(meta.get("mtext_skipped", 0))
             if name == PREVIEW_PNG:
                 fallback = meta
         else:
             entry["rendered"] = False
         summary["images"].append(entry)
+    summary["mtext_skipped"] = sum(
+        int(e.get("mtext_skipped", 0)) for e in summary["images"])
+    summary["mtext_skipped"] = summary["mtext_skipped"]
 
     if meta_path is not None and fallback is not None:
-        meta_path.write_text(json.dumps(fallback, indent=2))
+        # preview_meta.json has a fixed contract (the UI reads it): the
+        # mtext_skipped count belongs in report.json, not here.
+        meta_path.write_text(json.dumps(
+            {k: fallback[k] for k in ("png_w", "png_h", "world_to_px",
+                                      "world_extents")}, indent=2))
         summary["meta"] = fallback
     return summary
 
@@ -819,6 +913,65 @@ def _fit_section(transform: dict | None) -> dict:
     }
 
 
+def _units_section(job_id: str, transform: dict | None, root: Path) -> dict:
+    """The units of each drawing: the header, the choice, and the reason.
+
+    ``transform.json`` carries what the fit decided; the ``axes/units.json``
+    sidecar carries the grid spacing the axes step measured.  Together
+    they answer the three questions a reader of the report has: what the
+    drawings *claimed*, what was *used*, and *why*.
+    """
+    units = dict((transform or {}).get("units") or {})
+    sidecar = _load_json(root / "axes" / "units.json") or {}
+    mech_spacing = sidecar.get("mech_spacing")
+    str_spacing = sidecar.get("str_spacing")
+    grid_scale = None
+    try:
+        if mech_spacing and str_spacing:
+            grid_scale = float(mech_spacing) / float(str_spacing)
+    except (TypeError, ValueError, ZeroDivisionError):
+        grid_scale = None
+
+    def _file(prefix: str) -> dict:
+        return {
+            "header_insunits": units.get(f"{prefix}_header"),
+            "header_units": units.get(f"{prefix}_header_units"),
+            "units": units.get(f"{prefix}_units"),
+            "source": units.get(f"{prefix}_source"),
+            "reason": units.get(f"{prefix}_reason"),
+        }
+
+    mech = _file("mech")
+    strc = _file("str")
+    overridden = [side for f, side in ((mech, "mech"), (strc, "str"))
+                  if f.get("source") == "override"]
+    if overridden:
+        reason = ("the units of "
+                  + " and ".join(overridden)
+                  + " were set by hand")
+    elif grid_scale is not None and units.get("expected_scale") is not None:
+        try:
+            rel = abs(grid_scale / float(units["expected_scale"]) - 1.0)
+        except (TypeError, ValueError, ZeroDivisionError):
+            rel = None
+        reason = ("the grid spacing and the drawings' $INSUNITS headers agree"
+                  if rel is not None and rel <= 0.02 else
+                  "the grid spacing and the drawings' $INSUNITS headers "
+                  "disagree")
+    else:
+        reason = "the drawings' $INSUNITS headers were used"
+
+    return {
+        "mech": mech,
+        "str": strc,
+        "grid_spacing": {"mech": mech_spacing, "str": str_spacing},
+        "grid_scale": grid_scale,
+        "expected_scale": units.get("expected_scale"),
+        "mm_per_unit": units.get("mm_per_unit"),
+        "reason": reason,
+    }
+
+
 def _overlay_section(payload: dict | None) -> dict:
     """What stage 7 did, without the multi-thousand-entry handle lists."""
     if not payload:
@@ -826,8 +979,47 @@ def _overlay_section(payload: dict | None) -> dict:
     keep = ("failures", "renamed_resources", "dropped", "exploded",
             "import_method", "mech_entities", "str_entities_imported",
             "str_entities_total", "by_type_str", "warnings", "qa_grid",
-            "style", "source_layers")
+            "style", "source_layers", "units")
     return {k: payload[k] for k in keep if k in payload}
+
+
+def _mismatch_section(payload: dict | None) -> dict:
+    """The MECH⇄STR mismatch result, as ``report.json["mismatch"]`` (§4)."""
+    if not payload:
+        return {}
+    findings = payload.get("findings") or []
+    systematic = [f for f in findings if f.get("kind") == "SYSTEMATIC_OFFSET"]
+    policy = payload.get("policy") or {}
+    summary = payload.get("summary") or {}
+    if not summary and findings:
+        try:
+            from core.mismatch.model import summarize
+            summary = summarize(findings)
+        except Exception:
+            summary = {}
+    return {
+        "enabled": bool(payload.get("enabled", policy.get("enabled", True))),
+        "status": payload.get("status", "unknown"),
+        "reason": str(payload.get("reason") or ""),
+        "policy_hash": payload.get("policy_hash"),
+        "units": payload.get("units") or {},
+        "source_docs": payload.get("source_docs"),
+        "features": payload.get("features") or {},
+        "coverage": payload.get("coverage") or {},
+        "family_coverage": payload.get("family_coverage") or {},
+        # the offset rules: what each found, and the clusters
+        "offset_rules": payload.get("offset_rules") or {},
+        "offset_clusters": payload.get("offset_clusters") or [],
+        # what each drawing contained, and what became geometry
+        "inventory": payload.get("inventory") or {},
+        "summary": summary,
+        "systematic": systematic,
+        "fit_context": payload.get("fit_context") or {},
+        "top": findings[:10],
+        "warnings": list(payload.get("warnings") or []),
+        "timings_s": payload.get("timings_s") or {},
+        "truncated": bool(payload.get("truncated", False)),
+    }
 
 
 def _build_report(job_id: str, dxf_path: Path, *, root: Path | None = None,
@@ -887,12 +1079,51 @@ def _build_report(job_id: str, dxf_path: Path, *, root: Path | None = None,
         }
         report["fit"] = _fit_section(transform)
 
+    report["units"] = _units_section(job_id, transform, d)
+
     overlay_report = _load_json(d / "stages" / overlay.REPORT_NAME)
     if overlay_report is not None:
         report["overlay"] = _overlay_section(overlay_report)
 
+    mismatch_report = _load_json(d / "stages" / "mismatch.json")
+    if mismatch_report is not None:
+        report["mismatch"] = _mismatch_section(mismatch_report)
+
     report["roles"] = _manifest_section(job_id)
     report["counts"] = counts if counts is not None else _empty_counts()
+
+    # ── the two statuses, side by side ────────────────────────────────
+    # The *overlay's* status (did the superimposition happen?) and the
+    # *mismatch check's* status (what did the comparison conclude?) are
+    # different things and are kept apart — a drawing can be perfectly
+    # superimposed while the check compared nothing.
+    overlay_section = report.get("overlay") or {}
+    dropped = int(overlay_section.get("dropped") or 0)
+    if not overlay_section:
+        overlay_status = "failed"          # the overlay stage produced nothing
+    elif dropped:
+        overlay_status = "degraded"        # it wrote the drawing, but dropped
+    else:
+        overlay_status = "ok"
+    mismatch_section = report.get("mismatch") or {}
+    # The intra-drawing findings live in the *findings* payload — the
+    # mismatch stage only knows about the cross-drawing check.
+    findings_payload = _load_json(d / "out" / "findings.json") or {}
+    other_warnings = int(findings_payload.get("other_warnings_count") or 0)
+    parts = []
+    if overlay_status != "ok":
+        parts.append(f"the overlay was {overlay_status}")
+    if mismatch_section.get("reason"):
+        parts.append(str(mismatch_section["reason"]))
+    report["status"] = {
+        "overlay": overlay_status,
+        # the CROSS-DRAWING check's status, and nothing else's
+        "mismatch": mismatch_section.get("status", "unknown"),
+        # the intra-drawing findings — a separate count, never part of the
+        # headline above
+        "other_warnings": other_warnings,
+        "reason": " — ".join(parts),
+    }
 
     preview = preview or {}
     report["extents"] = preview.get("extents", {})
@@ -906,10 +1137,16 @@ def _build_report(job_id: str, dxf_path: Path, *, root: Path | None = None,
              "path": f"out/{img['name']}",
              "world_extents": img.get("world_extents"),
              "png_w": img.get("png_w"), "png_h": img.get("png_h"),
+             "mtext_skipped": img.get("mtext_skipped", 0),
              "rendered": img.get("rendered", True)}
             for img in preview.get("images", [])
         ],
         "meta": f"out/{PREVIEW_META}" if preview.get("meta") else None,
+        # MTEXT that could not be drawn — reported, never silently discarded
+        "mtext_entities": int(preview.get("mtext_entities", 0)),
+        "mtext_drawn": bool(preview.get("mtext_drawn", False)),
+        "mtext_not_drawn": int(preview.get("mtext_not_drawn", 0)),
+        "mtext_skipped": int(preview.get("mtext_skipped", 0)),
         "outlier_rule": (
             f"an entity is reported when its box lies more than "
             f"{OUTLIER_DIAGONALS:g} x the MECH grid diagonal away from the MECH "

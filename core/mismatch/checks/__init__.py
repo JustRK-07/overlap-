@@ -38,13 +38,14 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .. import geom
 from ..classify import Classifier
 from ..features import Feature, FeatureSet
 from ..model import EntityRef, Finding
 from ..policy import MismatchPolicy
 
-__all__ = ["Env", "CHECKS", "polygon_of", "ref_of", "describe", "extent_along",
-           "unit_of", "overlap", "TOL_EFF_FLOOR_MM"]
+__all__ = ["Env", "CHECKS", "polygon_of", "footprint_bbox", "ref_of", "describe",
+           "extent_along", "unit_of", "overlap", "TOL_EFF_FLOOR_MM"]
 
 #: The four checks, in the order §1.3 lists them and in the order they run.
 CHECKS = ("bolts", "support", "containment", "clash")
@@ -69,14 +70,30 @@ def polygon_of(f: Feature) -> np.ndarray:
     """The ``(N, 2)`` ring a footprint-ish feature actually occupies.
 
     A rect is its four corners (in the world-mapped order, so the winding is
-    counter-clockwise), a polygon its flattened ring.  Anything else is
-    empty.
+    counter-clockwise), a polygon its flattened ring, a **band** its rectangle
+    (centreline length × 2·half-width).  Anything else is empty.
     """
     if f.kind == "rect":
         return np.asarray(f.corners(), dtype=float)
     if f.kind == "polygon":
         return np.asarray(f.ring(), dtype=float)
+    if f.kind == "band":
+        return geom.rect_corners(f.centre(), (f.ux, f.uy), f.length(), 2.0 * f.hw)
     return np.zeros((0, 2), dtype=float)
+
+
+def footprint_bbox(f: Feature) -> tuple:
+    """The bbox of a feature's **body**.
+
+    :meth:`Feature.bbox` reports a band's *centreline* — the support check
+    measures the distance to the centreline, so it needs that.  The clash
+    check needs the band's actual rectangle.
+    """
+    if f.kind == "band":
+        ring = geom.rect_corners(f.centre(), (f.ux, f.uy), f.length(), 2.0 * f.hw)
+        return (float(ring[:, 0].min()), float(ring[:, 1].min()),
+                float(ring[:, 0].max()), float(ring[:, 1].max()))
+    return f.bbox()
 
 
 def ref_of(f: Feature, family: str) -> EntityRef:
@@ -118,7 +135,7 @@ def overlap(lo1, hi1, lo2, hi2) -> float:
 
 @dataclass
 class Env:
-    """Everything a check needs, plus the coverage counter it fills in."""
+    """Everything a check needs, plus the coverage counters it fills in."""
 
     policy: MismatchPolicy
     mm: float                                       # mm per drawing unit
@@ -128,6 +145,22 @@ class Env:
     fit: object | None = None                       # FitContext | None
     grid_spacing_mm: float | None = None            # median MECH grid spacing
     coverage: dict = field(default_factory=dict)
+    #: Per-family counts: ``{family: {extracted, eligible, matched, unmatched}}``.
+    family_coverage: dict = field(default_factory=dict)
+    #: How many rule legs had items on **both** sides — the number the
+    #: status is decided on.
+    covered_pairs: int = 0
+    #: How many rule legs the policy has.
+    total_pairs: int = 0
+    #: What each offset rule found — pairs, ambiguous and unmatched counts.
+    rule_notes: dict = field(default_factory=dict)
+    #: The two drawings and the matrices they are read through — an offset
+    #: rule may select by **layer**, and a layer is a property of the
+    #: drawing, not of the classified features.
+    mech_doc: object = None
+    str_doc: object = None
+    mech_root: object = None
+    str_root: object = None
 
     def __post_init__(self) -> None:
         self.mm = float(self.mm) or 1.0
@@ -135,6 +168,13 @@ class Env:
         self.str_by_family = self.str.by_family()
         self.coverage = {name: {"items": 0, "matched": 0, "unmatched": 0}
                          for name in CHECKS}
+        self.family_coverage = {}
+        for fam, items in list(self.mech_by_family.items()) + \
+                list(self.str_by_family.items()):
+            c = self.family_coverage.setdefault(
+                fam, {"extracted": 0, "eligible": 0, "matched": 0,
+                      "unmatched": 0})
+            c["extracted"] += len(items)
 
     # ── units ────────────────────────────────────────────────────────
     def u(self, mm_value) -> float:
@@ -170,3 +210,35 @@ class Env:
         c["items"] += int(items)
         c["matched"] += int(matched)
         c["unmatched"] += int(items) - int(matched)
+    def track_pair(self, check: str, mech_fam: str, str_fam: str,
+                   n_mech: int, n_str: int,
+                   matched_mech: int = 0, matched_str: int | None = None) -> None:
+        """One rule leg: ``mech_fam`` items against ``str_fam`` items.
+
+        A leg with an **empty side** was never really checked — the two
+        drawings had nothing to compare — so its items are *extracted* but
+        not *eligible*, and the leg does not count towards the coverage the
+        status is decided on.  That distinction is the whole point: a rule
+        that never compared anything must not be able to report ``passed``.
+
+        ``matched_mech`` / ``matched_str`` are how many items of each side
+        found a counterpart.  They default to the same number, which is
+        right for every rule that pairs one item with one item.
+        """
+        n_mech = int(n_mech or 0)
+        n_str = int(n_str or 0)
+        matched_mech = int(matched_mech or 0)
+        matched_str = (matched_mech if matched_str is None
+                       else int(matched_str or 0))
+        covered = bool(n_mech) and bool(n_str)
+        if covered:
+            self.covered_pairs += 1
+        for fam, n, matched in ((mech_fam, n_mech, matched_mech),
+                                (str_fam, n_str, matched_str)):
+            c = self.family_coverage.setdefault(
+                fam, {"extracted": 0, "eligible": 0, "matched": 0,
+                      "unmatched": 0})
+            if covered:
+                c["eligible"] += n
+                c["matched"] += matched
+        self.track(check, n_mech, matched_mech)

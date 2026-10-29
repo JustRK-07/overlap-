@@ -203,7 +203,9 @@ button:disabled {
   margin: 0;
   padding: 0;
   display: grid;
-  grid-template-columns: repeat(9, 1fr);
+  /* 11 steps: let the rail wrap evenly instead of leaving two tiles
+     stranded under the first two (the old fixed 9-column grid). */
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
   gap: 4px;
   font-size: 11px;
 }
@@ -427,13 +429,13 @@ button:disabled {
 .diag-readout {
   font-size: 0.8em;
 }
-#analyze-table, #issues-table {
+#analyze-table, #findings-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.85em;
   margin-top: 0.4em;
 }
-#analyze-table th, #issues-table th {
+#analyze-table th, #findings-table th {
   background: #f8fafc;
   text-align: left;
   padding: 6px 10px;
@@ -441,12 +443,12 @@ button:disabled {
   font-weight: 600;
   color: #475569;
 }
-#analyze-table td, #issues-table td {
+#analyze-table td, #findings-table td {
   padding: 4px 10px;
   border-bottom: 1px solid #f1f5f9;
   font-variant-numeric: tabular-nums;
 }
-#analyze-table code, #issues-table code {
+#analyze-table code, #findings-table code {
   background: #f1f5f9;
   padding: 1px 6px;
   border-radius: 3px;
@@ -467,6 +469,52 @@ button:disabled {
   vertical-align: middle;
   margin-right: 6px;
 }
+/* Findings panel (PLAN_MISMATCH §4) */
+.findings-coverage {
+  margin: 0.4em 0 0.6em;
+  font-size: 0.85em;
+}
+.findings-warn {
+  color: #b91c1c;
+  font-weight: 600;
+}
+.findings-ok {
+  color: #15803d;
+  font-weight: 600;
+}
+.findings-preview-wrap {
+  position: relative;
+  overflow: hidden;
+  max-width: 100%;
+  margin: 0.6em 0;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #fff;
+}
+.findings-preview-wrap img {
+  display: block;
+  width: 100%;
+  height: auto;
+  transform-origin: center center;
+  transition: transform 0.15s ease-out;
+}
+.findings-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+#findings-table td {
+  vertical-align: top;
+}
+#findings-table tbody tr[data-idx] {
+  cursor: pointer;
+}
+#findings-table tbody tr[data-idx]:hover {
+  background: #f1f5f9;
+}
+
 /* Severity badges — same palette as the depth strip */
 .severity {
   display: inline-block;

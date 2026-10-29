@@ -391,10 +391,11 @@ def test_summary_and_message_templates():
     fs = [_finding("CLASH", "CRITICAL"), _finding("CLASH", "INFO"),
           _finding(kind="NOPE", severity="INFO")]
     s = M.summarize(fs)
-    assert s["total"] == 3 and s["by_severity"] == {"CRITICAL": 1, "WARNING": 0, "INFO": 2}
+    assert s["total"] == 3 and s["by_severity"] == {"CRITICAL": 1, "WARNING": 0,
+                                                       "INFO": 2, "REVIEW": 0}
     assert s["by_kind"] == {"CLASH": 2, "NOPE": 1}
     assert set(M.KINDS) >= {"CLASH", "MISSING_HOLE", "SYSTEMATIC_OFFSET"}
-    assert M.SEVERITIES == ("CRITICAL", "WARNING", "INFO")
+    assert M.SEVERITIES == ("CRITICAL", "WARNING", "INFO", "REVIEW")
     msg = M.format_message("BOLT_HOLE_OFFSET", mech_block="B", mech_index=3,
                            magnitude=6.0, tolerance=1.5, str_block="P")
     assert "6.0 mm" in msg and "1.5 mm" in msg and "{n_bolts}" not in msg
@@ -419,6 +420,7 @@ import ezdxf                                                   # noqa: E402
 from core.grid import walk_world                                # noqa: E402
 from core.mismatch import geom                                  # noqa: E402
 from core.mismatch import features as FT                        # noqa: E402
+from core.mismatch.checks import Env                            # noqa: E402
 from core.mismatch.classify import Classifier, normalize_layer  # noqa: E402
 from ezdxf.math import Matrix44                                 # noqa: E402
 
@@ -769,6 +771,161 @@ def test_unpaired_segment_assumed_width():
     assert not [f for f in fs3.features if f.kind == "band"]
 
 
+# ── A2/A3/A4 — regressions found in the 2026-10-25 review ──────────────────
+
+def test_member_rect_drawn_short_edge_first_yields_a_full_length_band():
+    """A2: a member rectangle's band must span its LONG side.
+
+    ``rect_from_corners`` takes ``u`` from the *first drawn edge*, so a rect
+    whose polyline starts on its short side comes back with ``w < h``.  The
+    band conversion then projected a segment built along the rect's own axis
+    onto the *long* axis, which collapses it to a point: a zero-length band
+    whose normal is the zero vector, so ``SUPPORT_OFF_MEMBER`` could never
+    fire on it and it won band selection, masking real defects nearby.
+    """
+    doc = _new_doc()
+    msp = doc.modelspace()
+    # 5000 x 200, drawn SHORT edge first — the first edge is the 200 mm side.
+    _poly(msp, [(-100.0, -2500.0), (100.0, -2500.0),
+                (100.0, 2500.0), (-100.0, 2500.0)],
+         layer="FRAME-STEEL", closed=True)
+
+    fs = _extract(doc, source="STR")
+    bands = [f for f in fs.features if f.kind == "band"]
+    assert len(bands) == 1, [(f.kind, f.a, f.b) for f in fs.features]
+
+    b = bands[0]
+    assert b.length() == pytest.approx(5000.0), (
+        "the band must span the long side of the member rectangle")
+    assert b.size_mm["len"] == pytest.approx(5000.0)
+    assert b.hw == pytest.approx(100.0)
+    # the band's axis is the long axis, and it is a real unit vector
+    assert b.ux == pytest.approx(0.0, abs=1e-9)
+    assert b.uy == pytest.approx(1.0)
+    assert b.families == ("str_member",)
+
+
+def test_member_rect_drawn_long_edge_first_is_unchanged():
+    """The A2 fix must be a no-op for the long-edge-first drawing order."""
+    doc = _new_doc()
+    msp = doc.modelspace()
+    _poly(msp, [(-2500.0, -100.0), (2500.0, -100.0),
+                (2500.0, 100.0), (-2500.0, 100.0)],
+         layer="FRAME-STEEL", closed=True)
+
+    fs = _extract(doc, source="STR")
+    bands = [f for f in fs.features if f.kind == "band"]
+    assert len(bands) == 1
+    b = bands[0]
+    assert b.length() == pytest.approx(5000.0)
+    assert b.hw == pytest.approx(100.0)
+    assert b.ux == pytest.approx(1.0)
+    assert b.uy == pytest.approx(0.0, abs=1e-9)
+
+
+def test_env_search_radius_cap_is_in_millimetres():
+    """A3: the grid-spacing cap must be applied in mm, once.
+
+    ``FitContext.median_spacing_mm`` is already in millimetres; the detector
+    used to multiply it by ``mm`` again, so on a metre drawing the cap was
+    1000× too loose and the checks searched a thousand times further.
+    """
+    fs = FT.FeatureSet(source="STR")
+    env = Env(policy=DEFAULT_POLICY, mm=1000.0, mech=fs, str=fs,
+              clf=Classifier(DEFAULT_POLICY), grid_spacing_mm=6000.0)
+    # 0.25 x 6000 mm = 1500 mm = 1.5 drawing units at 1000 mm per unit
+    assert env.search_mm(1_000_000.0) == pytest.approx(1500.0)
+    assert env.search_u(1_000_000.0) == pytest.approx(1.5)
+    # a radius below the cap is untouched
+    assert env.search_mm(100.0) == pytest.approx(100.0)
+    # with no grid spacing there is no cap at all
+    env2 = Env(policy=DEFAULT_POLICY, mm=1000.0, mech=fs, str=fs,
+               clf=Classifier(DEFAULT_POLICY))
+    assert env2.search_mm(1_000_000.0) == pytest.approx(1_000_000.0)
+
+
+def test_detect_does_not_convert_the_grid_spacing_twice(monkeypatch):
+    """A3: the value `detect()` hands to `Env` must already be in mm.
+
+    This is the call-site half of A3: `FitContext.median_spacing_mm` is
+    already millimetres, and `detect()` used to multiply it by `mm` again.
+    The difference only shows on a metre drawing, so the MECH document here
+    is in metres.
+    """
+    import core.mismatch as MM
+    from core.mismatch import checks as checks_mod
+    from core.transform2d import Affine2D
+
+    seen = {}
+    real_env = checks_mod.Env
+
+    class _SpyEnv(real_env):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            seen["grid_spacing_mm"] = kwargs.get("grid_spacing_mm")
+            seen["mm"] = kwargs.get("mm")
+
+    monkeypatch.setattr(checks_mod, "Env", _SpyEnv)
+
+    # a MECH drawing in metres ($INSUNITS = 6)
+    mech = _new_doc(insunits=6)
+    mech.modelspace().add_line((0, 0), (1000, 0), dxfattribs={"layer": "X"})
+    str_doc = _new_doc(insunits=6)
+    str_doc.modelspace().add_line((0, 0), (1000, 0), dxfattribs={"layer": "X"})
+
+    # transform.json's `median_spacing` is in MECH drawing units: 6000 m.
+    fit_ctx = {"median_spacing": 6000.0, "rms_residual": 0.0,
+               "correspondences": [], "quality": {"status": "ok"}}
+
+    MM.detect(mech, str_doc, Affine2D(), fit_ctx=fit_ctx)
+
+    assert seen["mm"] == 1000.0, "the MECH document must be read as metres"
+    # 6000 m of grid spacing == 6 000 000 mm.  The cap is that number, NOT
+    # 6 000 000 × 1000.
+    assert seen["grid_spacing_mm"] == pytest.approx(6_000_000.0)
+
+
+def test_clash_with_members_detects_a_band_overlap():
+    """A4: ``clash_with_members=True`` must actually test the members.
+
+    ``str_member`` features are *bands*, and ``polygon_of()`` returned an
+    empty array for anything that was not a rect or a polygon — so the bands
+    were silently skipped and the flag never found a clash.
+    """
+    from core.mismatch.checks import clash as clash_mod
+
+    # a STR beam drawn as two parallel lines 200 mm apart
+    str_doc = _new_doc()
+    for y in (100.0, 300.0):
+        str_doc.modelspace().add_line((-2500.0, y), (2500.0, y),
+                                      dxfattribs={"layer": "FRAME-STEEL"})
+    # a MECH equipment rectangle sitting on top of the beam
+    mech_doc = _new_doc()
+    _poly(mech_doc.modelspace(), [(-500.0, 150.0), (500.0, 150.0),
+                                  (500.0, 250.0), (-500.0, 250.0)],
+         layer="EQUIPMENT", closed=True)
+
+    pol = DEFAULT_POLICY.to_dict()
+    pol["clash_with_members"] = True
+    policy = MismatchPolicy.from_dict(pol)
+
+    mech_fs = _extract(mech_doc, source="MECH", policy=policy)
+    str_fs = _extract(str_doc, source="STR", policy=policy)
+    env = Env(policy=policy, mm=1.0, mech=mech_fs, str=str_fs,
+              clf=Classifier(policy))
+
+    bands = [f for f in str_fs.features if f.kind == "band"]
+    assert bands, "the STR beam must produce a band"
+
+    findings = clash_mod.run(env)
+    clashes = [f for f in findings if f.kind == "CLASH"]
+    assert clashes, (
+        "a band overlapping the equipment must be reported as a CLASH when "
+        "clash_with_members is enabled")
+    assert clashes[0].severity == "CRITICAL"
+    assert clashes[0].magnitude_mm is not None and clashes[0].magnitude_mm > 0.0
+
+
 # ── geometry helpers ──────────────────────────────────────────────────────
 
 def _square(cx, cy, side, deg=0.0):
@@ -923,3 +1080,68 @@ def test_layer_zero_inherits_insert_layer():
     assert clf.candidates("NONSENSE-LAYER", ()) == frozenset()
     # two distinct keys: the prefixed and bare names share one cache slot
     assert clf.prefilter_cache_size() == 2
+
+# ── the two §6.2 unit tests the plan names ────────────────────────────────
+
+def test_kabsch_rigid_exact():
+    """§6.2: the rigid fit must recover an exact rotation + translation.
+
+    The bolt-pattern fit (§1.3 A.3) is Kabsch, so its correctness has to
+    be pinned directly — not only through the synthetic pattern cases.
+    """
+    angle = math.radians(23.0)
+    R = np.asarray([[math.cos(angle), -math.sin(angle)],
+                    [math.sin(angle), math.cos(angle)]])
+    t = np.asarray([120.0, -45.0])
+    src = np.asarray([[0.0, 0.0], [10.0, 0.0], [0.0, 7.0], [13.0, -4.0]])
+    dst = src @ R.T + t
+
+    R_fit, t_fit, rms = geom.kabsch_rigid(src, dst)
+
+    assert rms == pytest.approx(0.0, abs=1e-9)
+    assert np.allclose(R_fit, R, atol=1e-9)
+    assert np.allclose(t_fit, t, atol=1e-9)
+    # a rigid fit does not scale
+    assert abs(float(np.linalg.det(R_fit)) - 1.0) < 1e-12
+
+
+def test_fit_uncertainty_inflates_tolerance():
+    """§6.2: the fit's own uncertainty widens the tolerance.
+
+    §3 of the plan: ``tol_eff = hypot(tol, k_fit · sigma_at(p))``.  A
+    finding that is inside the fit's own error bar must not be reported
+    as a defect — and the whole §3 machinery was untested because every
+    detection test ran against a *perfect* transform.
+    """
+    from core.mismatch.context import FitContext
+
+    # a fit with a 5 mm RMS residual at the inliers
+    payload = {
+        "rms_residual": 5.0,
+        "median_spacing": 6000.0,
+        "correspondences": [
+            {"mech": [0.0, 0.0], "loo_residual": 5.0, "inlier": True},
+            {"mech": [6000.0, 0.0], "loo_residual": 5.0, "inlier": True},
+            {"mech": [0.0, 6000.0], "loo_residual": 5.0, "inlier": True},
+            {"mech": [6000.0, 6000.0], "loo_residual": 5.0, "inlier": True},
+        ],
+        "quality": {"status": "ok"},
+    }
+
+    uncertain = FitContext.from_transform_json(payload, mm_per_unit=1.0,
+                                               k_fit=3.0)
+    perfect = FitContext.from_transform_json(
+        {"rms_residual": 0.0, "correspondences": [], "quality": {"status": "ok"}},
+        mm_per_unit=1.0, k_fit=3.0)
+
+    point = (3000.0, 3000.0)
+    assert uncertain.sigma_at(point) > 0.0
+    # the effective tolerance is wider than the bare one …
+    assert uncertain.tol_eff(1.0, point) > 1.0
+    # … and it is wider than it would be for a perfect fit
+    assert uncertain.tol_eff(1.0, point) > perfect.tol_eff(1.0, point)
+    # the documented formula
+    assert uncertain.tol_eff(1.0, point) == pytest.approx(
+        math.hypot(1.0, 3.0 * uncertain.sigma_at(point)))
+    # a perfect fit does not widen it at all
+    assert perfect.tol_eff(1.0, point) == pytest.approx(1.0)

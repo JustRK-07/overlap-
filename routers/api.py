@@ -25,10 +25,15 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from jobs import (create_job, create_job_legacy, load_job, job_dir,
-                  normalize_options, save_job)
+                  normalize_options, save_job, update_status)
 import pipelines
 
 router = APIRouter(prefix="/api/v1/overlay", tags=["overlay"])
+
+#: The capabilities probe lives at ``/api/v1/capabilities`` — outside the
+#: overlay prefix — so the UI can ask what the server can do before a job
+#: exists.
+capabilities_router = APIRouter(prefix="/api/v1", tags=["overlay"])
 
 ALLOWED_EXTS = {".dwg", ".dxf"}
 MAX_UPLOAD_MB = 200
@@ -38,14 +43,17 @@ MAX_UPLOAD_MB = 200
 # Job options (PLAN.md step 9)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Five user-facing knobs, all validated here (400 on a bad value) and
+# Four user-facing knobs, all validated here (400 on a bad value) and
 # persisted verbatim in `job.options` (the shape lives in jobs.py —
 # `DEFAULT_OPTIONS` + `normalize_options`). The two readers are:
 #
-#   core.fit.FitOptions.from_job   — flat keys `fit_model` / `allow_weak_fit`
-#                                    (aliases `model` / `force`)
+#   core.fit.FitOptions.from_job   — flat keys `fit_model` / `force`
+#                                    (aliases `model`)
 #   core.overlay.OverlayStyle      — flat keys, or the `options["overlay"]`
 #                                    sub-dict, which wins over the flat ones
+#
+# The units of each drawing are NOT an option: they are resolved from the
+# grid at the axes step and recorded per file in `job.unit_overrides`.
 #
 # See README.md §"Options".
 
@@ -101,11 +109,10 @@ def resolve_options(
     *,
     color_mode: str = "original",
     fit_model: str = "similarity",
-    allow_weak_fit: bool = False,
     str_lineweight=None,
     qa_grid: bool = True,
 ) -> dict:
-    """Validate the five options and return the ``job.options`` shape.
+    """Validate the four options and return the ``job.options`` shape.
 
     Raises ``HTTPException(400)`` with a message naming the offending
     field and listing what is accepted.
@@ -128,7 +135,6 @@ def resolve_options(
     return normalize_options({
         "color_mode": mode,
         "fit_model": model,
-        "allow_weak_fit": _parse_bool(allow_weak_fit, False, field="allow_weak_fit"),
         "str_lineweight": _parse_lineweight(str_lineweight),
         "qa_grid": _parse_bool(qa_grid, True, field="qa_grid"),
     })
@@ -143,6 +149,129 @@ def set_option(job, key: str, value) -> None:
     job.options = normalize_options({**(job.options or {}), key: value})
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Units
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _unit_choices() -> list[str]:
+    from core.units import UNIT_CHOICES
+    return list(UNIT_CHOICES)
+
+
+def resolve_unit_overrides(job_id: str, body: dict) -> dict:
+    """The per-file unit overrides in a request body, keyed by file id.
+
+    The body may key them by **role** (``"mech"`` / ``"str"``) — which is
+    what the browser knows — or by file id.  Roles are resolved to file ids
+    here so that everything downstream speaks one language.
+
+    Raises ``HTTPException(400)`` naming the offending field.
+    """
+    from core.roles import ROLES, resolve_inputs
+    from core.units import UNIT_CHOICES, normalise_unit
+
+    raw = body.get("units")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise HTTPException(
+            400,
+            "units must be an object, e.g. {\"mech\": \"mm\", \"str\": \"mm\"}; "
+            f"got {type(raw).__name__}",
+        )
+
+    by_role: dict[str, str] = {}
+    try:
+        for entry in resolve_inputs(job_id):
+            by_role.setdefault(entry.role, entry.file_id)
+    except Exception:
+        pass
+
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        unit = normalise_unit(value)
+        if not unit:
+            raise HTTPException(
+                400,
+                f"units.{key} must be one of {' | '.join(UNIT_CHOICES)}; "
+                f"got {value!r}",
+            )
+        file_id = key
+        if key in ROLES:
+            file_id = by_role.get(key, key)
+        out[file_id] = unit
+    return out
+
+
+def apply_unit_overrides(job, overrides: dict) -> None:
+    """Record the units on the job and save it."""
+    from jobs import normalize_unit_overrides, save_job
+
+    job.unit_overrides = normalize_unit_overrides(overrides)
+    save_job(job)
+
+
+#: Where the axes step records the two grid spacings it measured.
+UNITS_SIDECAR = "axes/units.json"
+
+
+def _write_units_sidecar(job_id: str, mech_spacing, str_spacing) -> None:
+    """Remember the measured grid spacings so the units can be re-checked.
+
+    The spacings are a property of the *drawings*, not of the answer: they
+    are measured once at the axes step and reused, so confirming the units
+    never re-reads a 15 MB drawing.
+    """
+    from core import fit as fit_mod
+    fit_mod.write_grid_spacings(job_dir(job_id), mech_spacing, str_spacing)
+
+
+def _read_units_sidecar(job_id: str) -> tuple[float | None, float | None]:
+    path = job_dir(job_id) / UNITS_SIDECAR
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None, None
+    return data.get("mech_spacing"), data.get("str_spacing")
+
+
+def _units_decision(job_id: str, *, mech_grid=None, str_grid=None):
+    """The grid-vs-header decision for a job, or ``None`` when it cannot be made.
+
+    A drawing that cannot be read, or a job with no confirmed grid
+    convention yet, simply has no decision to report — the pipeline
+    carries on and the fit's own gates have the last word.
+    """
+    from core import fit as fit_mod
+
+    mech_spacing, str_spacing = _read_units_sidecar(job_id)
+    try:
+        return fit_mod.units_decision(
+            job_id, mech_grid=mech_grid, str_grid=str_grid,
+            mech_spacing=mech_spacing, str_spacing=str_spacing)
+    except Exception:
+        return None
+
+
+
+
+def _safe_upload_name(raw: str | None, fallback: str) -> str:
+    """The name an upload is stored under — **never** a path.
+
+    ``UploadFile.filename`` is the raw ``Content-Disposition`` value and
+    Starlette does not sanitise it, so ``/etc/cron.d/evil.dxf`` and
+    ``../../evil.dxf`` both arrive intact.  ``Path(raw).name`` keeps only
+    the last component, so the file always lands inside the job's
+    ``uploads/`` directory.
+    """
+    name = Path(raw or "").name.strip()
+    if not name or name in (".", ".."):
+        return fallback
+    return name
+
+
 @router.post("")
 async def create_overlay(
     drawing_a: UploadFile = File(..., alias="drawing_a"),
@@ -153,7 +282,6 @@ async def create_overlay(
     fit_model: str = Form("similarity"),
     # Declared `str`, not `bool`: FastAPI/pydantic would answer 422 for a
     # bad token, and the option contract here is a 400 that names the field.
-    allow_weak_fit: str = Form("false"),
     str_lineweight: str = Form(""),
     qa_grid: str = Form("true"),
 ):
@@ -167,7 +295,6 @@ async def create_overlay(
     options = resolve_options(
         color_mode=color_mode,
         fit_model=fit_model,
-        allow_weak_fit=allow_weak_fit,
         str_lineweight=str_lineweight,
         qa_grid=qa_grid,
     )
@@ -203,11 +330,15 @@ async def create_overlay(
         if f.size and f.size > body_limit:
             raise HTTPException(413, f"{f.filename} exceeds {MAX_UPLOAD_MB} MB limit")
 
-    # Create job + persist uploads
+    # Create job + persist uploads.  The recorded name and the written
+    # name are the same sanitised value — the cleaner looks the file up
+    # by the name in job.json.
+    name_a = _safe_upload_name(drawing_a.filename, "a.dxf")
+    name_b = _safe_upload_name(drawing_b.filename, "b.dxf")
     job = create_job_legacy(
-        drawing_a_name=drawing_a.filename or "a.dxf",
+        drawing_a_name=name_a,
         drawing_a_size=drawing_a.size or 0,
-        drawing_b_name=drawing_b.filename or "b.dxf",
+        drawing_b_name=name_b,
         drawing_b_size=drawing_b.size or 0,
         clean_version=clean_version,
         enabled_checks=checks,
@@ -215,8 +346,8 @@ async def create_overlay(
     )
 
     d = job_dir(job.job_id) / "uploads"
-    (d / drawing_a.filename).write_bytes(await drawing_a.read())
-    (d / drawing_b.filename).write_bytes(await drawing_b.read())
+    (d / name_a).write_bytes(await drawing_a.read())
+    (d / name_b).write_bytes(await drawing_b.read())
 
     # Spawn pipeline worker thread — DON'T await it; let it run in background
     threading.Thread(
@@ -251,7 +382,6 @@ async def upload_n_files(
     axes: str = Form(""),                      # space-separated, e.g. "A B C 1 2 3"
     color_mode: str = Form("original"),
     fit_model: str = Form("similarity"),
-    allow_weak_fit: str = Form("false"),   # str, not bool — see create_overlay
     str_lineweight: str = Form(""),
     qa_grid: str = Form("true"),
 ):
@@ -267,9 +397,8 @@ async def upload_n_files(
       - The legacy `POST ""` endpoint is preserved for the 2-file flow.
       - For now, `prefix`/`axes` are job-level (shared by every pair).
         Per-pair axes can be added later by extending the form fields.
-      - The stage options (`color_mode`, `fit_model`, `allow_weak_fit`,
-        `str_lineweight`, `qa_grid`) are job-level too — every pair runs
-        with them.
+      - The stage options (`color_mode`, `fit_model`, `str_lineweight`,
+        `qa_grid`) are job-level too — every pair runs with them.
     """
     # FastAPI form fields don't accept list[str] — split the comma-
     # separated `roles` string ourselves.
@@ -279,7 +408,6 @@ async def upload_n_files(
     options = resolve_options(
         color_mode=color_mode,
         fit_model=fit_model,
-        allow_weak_fit=allow_weak_fit,
         str_lineweight=str_lineweight,
         qa_grid=qa_grid,
     )
@@ -319,8 +447,11 @@ async def upload_n_files(
     if str_count < 1:
         raise HTTPException(400, "at least one file must be role=str")
 
-    # No duplicate filenames (the cleaner uses them as keys).
-    names = [f.filename or f"file_{i}.dxf" for i, f in enumerate(files)]
+    # No duplicate filenames (the cleaner uses them as keys).  The name is
+    # reduced to its last path component — the raw filename is untrusted
+    # input and must never reach the filesystem.
+    names = [_safe_upload_name(f.filename, f"file_{i}.dxf")
+             for i, f in enumerate(files)]
     if len(set(names)) != len(names):
         raise HTTPException(400, "duplicate filenames in upload")
 
@@ -471,7 +602,7 @@ def _maybe_run_pairs_after_cleaning(
             prefix=prefix,
             axes=list(axes),
             # The job-level options (color_mode / fit_model /
-            # allow_weak_fit / str_lineweight / qa_grid) are job-wide —
+            # str_lineweight / qa_grid) are job-wide —
             # every pair runs with them.
             options=job.options or None,
         )
@@ -546,7 +677,22 @@ async def get_axes(job_id: str):
     policy_path = job_dir(job_id) / "stages" / "clean_policy.json"
     if policy_path.exists():
         payload["clean_policy"] = json.loads(policy_path.read_text())
+
+    # The units each drawing claims, so the UI can pre-fill the selectors.
+    # The conflict itself can only be decided once the grid convention is
+    # known — that is what the POST /axes response carries.
+    try:
+        from core.roles import units_for_pair
+        mech_u, str_u = units_for_pair(job_id)
+        payload["units"] = {
+            "mech": mech_u.to_dict(),
+            "str": str_u.to_dict(),
+            "choices": _unit_choices(),
+        }
+    except Exception:
+        pass
     return JSONResponse(content=payload)
+
 
 
 @router.post("/{job_id}/policy")
@@ -622,13 +768,15 @@ _UNKNOWN_AXIS_STATUS = {
 
 
 def _scan_axes(path: Path, prefix: str, suffixes: list[str]):
-    """(label occurrences, grid verdict per label) for one cleaned drawing.
+    """(label occurrences, grid verdict per label, grid result) for one drawing.
 
     ``found`` is exactly what :func:`core.axes.find_axes` returns — the
     first TEXT/MTEXT/ATTRIB occurrence of ``prefix + suffix`` in world
     coordinates — so the legacy `pairs` deltas keep their meaning.
     ``status`` adds :func:`core.grid.detect_grid`'s verdict for the same
     suffix: which gridline (if any) the label's occurrences voted for.
+    ``result`` is the :class:`core.grid.GridResult` itself — the axes step
+    measures the grid spacing from it to check the drawings' units.
 
     The document is read once. Grid detection is advisory: if it raises
     (an exotic DXF), the label positions still come back and the status
@@ -644,7 +792,7 @@ def _scan_axes(path: Path, prefix: str, suffixes: list[str]):
         status = {s: {**_UNKNOWN_AXIS_STATUS,
                       "reasons": [f"could not read the drawing: {exc}"]}
                   for s in suffixes}
-        return found, status
+        return found, status, None
 
     occs = grid.label_occurrences(doc, prefix, suffixes)
     found = [
@@ -658,7 +806,7 @@ def _scan_axes(path: Path, prefix: str, suffixes: list[str]):
     try:
         result = grid.detect_grid(doc, prefix, suffixes)
     except Exception:                              # noqa: BLE001 — advisory only
-        return found, {s: dict(_UNKNOWN_AXIS_STATUS) for s in suffixes}
+        return found, {s: dict(_UNKNOWN_AXIS_STATUS) for s in suffixes}, None
 
     status = {}
     for sfx in suffixes:
@@ -679,7 +827,7 @@ def _scan_axes(path: Path, prefix: str, suffixes: list[str]):
             "dir": None if ax.dir is None else [ax.dir.x, ax.dir.y],
             "length": ax.length,
         }
-    return found, status
+    return found, status, result
 
 
 @router.post("/{job_id}/axes")
@@ -712,8 +860,8 @@ async def apply_axes(job_id: str, body: dict):
         raise HTTPException(500, str(e))
 
     # Match in each (a = MECH, b = STR) + the per-label grid verdict.
-    found_a, status_a = _scan_axes(mech_path, prefix, axes)
-    found_b, status_b = _scan_axes(str_path, prefix, axes)
+    found_a, status_a, grid_a = _scan_axes(mech_path, prefix, axes)
+    found_b, status_b, grid_b = _scan_axes(str_path, prefix, axes)
 
     # Build paired list (matched by suffix)
     pairs = []
@@ -775,6 +923,31 @@ async def apply_axes(job_id: str, body: dict):
         "problems": problems,
     }
 
+    # ── the units ───────────────────────────────────────────────────────
+    # The grid spacing of each drawing, measured from the grids we have
+    # just detected, is what says what scale the two drawings really
+    # share.  The drawings' own $INSUNITS headers may say otherwise.
+    from core import fit as fit_mod
+    mech_spacing = fit_mod.median_spacing(grid_a) if grid_a is not None else None
+    str_spacing = fit_mod.median_spacing(grid_b) if grid_b is not None else None
+    if mech_spacing is not None and str_spacing is not None:
+        _write_units_sidecar(job_id, mech_spacing, str_spacing)
+
+    # An override in the body answers the question straight away.
+    overrides = resolve_unit_overrides(job_id, body)
+    if overrides:
+        apply_unit_overrides(job, overrides)
+
+    decision = _units_decision(job_id, mech_grid=grid_a, str_grid=grid_b)
+    if decision is not None:
+        result["units"] = decision.to_dict()
+        if decision.conflict:
+            # The job stays at awaiting_axes: the pipeline may not run on a
+            # scale nobody has confirmed.
+            update_status(job_id, state="awaiting_axes", current_step=7,
+                          step_name="Choosing the drawing units",
+                          message=decision.message)
+
     # Persist for fit.py to read
     (job_dir(job_id) / "axes" / "convention.json").write_text(json.dumps(result, indent=2))
     return JSONResponse(content=result)
@@ -786,14 +959,18 @@ async def confirm_axes(job_id: str, request: Request):
 
     Optional JSON body::
 
-        {"force": true}
+        {"force": true, "units": {"mech": "mm", "str": "mm"}}
 
     ``force`` maps to :class:`core.fit.FitOptions`' ``force``, i.e. every
-    fit quality gate (too few inliers, a bad leave-one-out residual, a
-    scale that contradicts ``$INSUNITS``) becomes a warning and the fit
-    is written with ``quality.status == "forced"``. It is the same knob
-    as the upload form's `allow_weak_fit`; because it is also a sensible
-    thing to flip *after* seeing the axes report, it can be set here too.
+    fit quality gate (too few inliers, a bad leave-one-out residual) becomes
+    a warning and the fit is written with ``quality.status == "forced"``.
+    It is a sensible thing to flip *after* seeing the axes report, so it
+    can be set here.
+
+    ``units`` sets the units of each drawing by hand — the answer to the
+    question the axes step asks when the grid spacing and the drawings'
+    ``$INSUNITS`` headers disagree.  The drawings themselves are never
+    modified; the answer is recorded in ``job.json``.
 
     The body is optional — a POST with no body keeps the job's options as
     they were. A non-JSON body is a 400 rather than a silent no-op.
@@ -805,22 +982,40 @@ async def confirm_axes(job_id: str, request: Request):
         raise HTTPException(400, f"Job is in state {job.state!r}, not awaiting_axes")
 
     raw = await request.body()
+    body: dict = {}
     if raw.strip():
         try:
             body = json.loads(raw)
         except json.JSONDecodeError as e:
             raise HTTPException(400, f"body must be JSON: {e}") from None
         if not isinstance(body, dict):
-            raise HTTPException(400, "body must be a JSON object, e.g. {\"force\": true}")
-        if "force" in body:
-            force = _parse_bool(body["force"], False, field="force")
-            # `force` and `allow_weak_fit` are aliases of the same knob in
-            # core.fit; write both so a hand-edited job.json can't have
-            # them disagree (FitOptions takes whichever key it finds
-            # first, which would otherwise be a silent surprise).
-            set_option(job, "force", force)
-            set_option(job, "allow_weak_fit", force)
-            save_job(job)
+            raise HTTPException(
+                400,
+                "body must be a JSON object, e.g. {\"force\": true} or "
+                "{\"units\": {\"mech\": \"mm\", \"str\": \"mm\"}}")
+    if "force" in body:
+        force = _parse_bool(body["force"], False, field="force")
+        set_option(job, "force", force)
+        save_job(job)
+
+    # ── the units ───────────────────────────────────────────────────────
+    # Set them first: the answer changes the reading of the headers, and
+    # the check below is what decides whether the pipeline may resume.
+    overrides = resolve_unit_overrides(job_id, body)
+    if overrides:
+        apply_unit_overrides(job, overrides)
+
+    decision = _units_decision(job_id)
+    if decision is not None and decision.conflict:
+        # The two readings still disagree: the job stays exactly where it
+        # is, and the user is told what to decide.
+        update_status(job_id, state="awaiting_axes", current_step=7,
+                      step_name="Choosing the drawing units",
+                      message=decision.message)
+        raise HTTPException(
+            409,
+            decision.message,
+        )
 
     # Spawn worker for stages 6-9
     threading.Thread(
@@ -829,6 +1024,7 @@ async def confirm_axes(job_id: str, request: Request):
         daemon=True,
     ).start()
     return {"status": "resuming", "options": job.options}
+
 
 
 @router.get("/{job_id}/download")
@@ -864,6 +1060,363 @@ def _serve(job_id: str, name: str, media_type: str):
     if not path.exists():
         raise HTTPException(404, f"No {name} yet: {path}")
     return FileResponse(str(path), media_type=media_type)
+
+
+# ── the DWG export (PLAN_MISMATCH step 8c) ────────────────────────────────
+
+@capabilities_router.get("/capabilities")
+async def capabilities():
+    """What this server can do.  Never returns a path."""
+    from core import export_dwg
+
+    return {
+        "dwg_export": export_dwg.available(),
+        "dwg_versions": export_dwg.versions(),
+    }
+
+
+@router.get("/{job_id}/download.dwg")
+async def download_dwg(job_id: str, variant: str = "superimposed",
+                       version: str = "R2018",
+                       pair_id: str | None = None):
+    """The superimposed (or annotated) drawing as a DWG.
+
+    Needs the ODA File Converter.  The DXF download is unaffected when it
+    is missing — this endpoint answers 501 with the reason.
+    """
+    from core import export_dwg
+
+    if variant not in ("superimposed", "annotated"):
+        raise HTTPException(
+            400,
+            f"variant must be superimposed or annotated; got {variant!r}",
+        )
+    known = export_dwg.versions()
+    if version not in known:
+        raise HTTPException(
+            400, f"version must be one of {known}; got {version!r}")
+
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+
+    root = _findings_root(job_id, pair_id)
+    name = "superimposed_annotated.dxf" if variant == "annotated" \
+        else "superimposed.dxf"
+    src = root / name
+    if not src.exists():
+        raise HTTPException(404, f"No {variant} DXF yet: {src}")
+
+    if not export_dwg.available():
+        return JSONResponse(status_code=501,
+                            content={"detail": export_dwg.UNAVAILABLE_MESSAGE,
+                                     "available": False})
+
+    out = root / f"{variant}_{version}.dwg"
+    if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+        result = export_dwg.export(src, out, version=version)
+        if not result.ok:
+            raise HTTPException(502, result.message)
+
+    return FileResponse(str(out), filename=f"{variant}_{version}.dwg",
+                        media_type="image/vnd.dwg")
+
+
+# ── the findings (PLAN_MISMATCH §4) ───────────────────────────────────────
+
+def _findings_root(job_id: str, pair_id: str | None = None) -> Path:
+    """The directory the findings artefacts live in.
+
+    The legacy single-pair layout is ``jobs/<id>/out/``; a multi-pair job
+    puts them under ``jobs/<id>/out/pairs/<pair_id>/out/``.  With no
+    ``pair_id`` the *active* pair wins, exactly as :func:`download` does.
+    """
+    if pair_id is not None:
+        from core.pair_runner import pair_root
+        return pair_root(job_id, _safe_pair_id(pair_id)) / "out"
+    legacy = job_dir(job_id) / "out"
+    pairs_root = job_dir(job_id) / "out" / "pairs"
+    job = load_job(job_id)
+    if pairs_root.exists() and job is not None:
+        active = job.active_pair_id or (job.pairs[0].pair_id if job.pairs else None)
+        if active and (pairs_root / active / "out" / "findings.json").exists():
+            return pairs_root / active / "out"
+    return legacy
+
+
+def _load_findings(job_id: str, pair_id: str | None = None) -> tuple[Path, dict]:
+    """``(path, payload)`` — 404 when the findings have not been written."""
+    path = _findings_root(job_id, pair_id) / "findings.json"
+    if not path.exists():
+        raise HTTPException(404, f"No findings yet: {path}")
+    try:
+        payload = json.loads(path.read_text())
+    except Exception as e:
+        raise HTTPException(500, f"findings.json is unreadable: {e}")
+    return path, payload
+
+
+@router.get("/{job_id}/findings")
+async def list_findings(
+    job_id: str,
+    pair_id: str | None = None,
+    severity: str | None = None,
+    kind: str | None = None,
+    origin: str | None = None,
+    min_magnitude_mm: float | None = None,
+    bbox: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+):
+    """The findings, filtered.
+
+    ``severity`` is a comma-separated list (``CRITICAL,WARNING``),
+    ``kind`` a single kind, ``origin`` one of ``mismatch`` / ``spotcheck``
+    / ``all``.  ``bbox`` is ``x0,y0,x1,y1`` in MECH world units.
+    """
+    from core.mismatch.model import KINDS, ORIGINS, SEVERITIES
+
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+
+    _path, payload = _load_findings(job_id, pair_id)
+
+    # ── validate the filters ──────────────────────────────────────────
+    severities = None
+    if severity:
+        severities = [s.strip().upper() for s in severity.split(",") if s.strip()]
+        bad = [s for s in severities if s not in SEVERITIES]
+        if bad:
+            raise HTTPException(
+                400,
+                f"severity must be one of {' | '.join(SEVERITIES)}; "
+                f"got {bad!r}",
+            )
+    if kind and kind not in KINDS and not kind.startswith("SPOT_"):
+        raise HTTPException(
+            400,
+            f"kind must be one of {' | '.join(KINDS)}; got {kind!r}",
+        )
+    origin_filter = None
+    if origin:
+        origin_filter = origin.strip().lower()
+        if origin_filter not in tuple(ORIGINS) + ("all",):
+            raise HTTPException(
+                400,
+                f"origin must be one of {' | '.join(ORIGINS)} | all; "
+                f"got {origin!r}",
+            )
+    if limit < 1 or limit > 5000:
+        raise HTTPException(400, f"limit must be between 1 and 5000; got {limit}")
+    if offset < 0:
+        raise HTTPException(400, f"offset must not be negative; got {offset}")
+
+    box = None
+    if bbox:
+        parts = [p.strip() for p in bbox.split(",")]
+        if len(parts) != 4:
+            raise HTTPException(
+                400, f"bbox must be x0,y0,x1,y1; got {bbox!r}")
+        try:
+            box = tuple(float(p) for p in parts)
+        except ValueError:
+            raise HTTPException(
+                400, f"bbox must be four numbers; got {bbox!r}")
+
+    # ── filter ────────────────────────────────────────────────────────
+    def _filtered(rows):
+        out = list(rows or [])
+        if severities:
+            out = [f for f in out if f.get("severity") in severities]
+        if kind:
+            out = [f for f in out if f.get("kind") == kind]
+        if origin_filter and origin_filter != "all":
+            out = [f for f in out if f.get("origin") == origin_filter]
+        if min_magnitude_mm is not None:
+            out = [f for f in out
+                   if (f.get("magnitude_mm") or 0.0) >= float(min_magnitude_mm)]
+        if box:
+            x0, y0, x1, y1 = box
+            def _inside(f):
+                loc = f.get("location") or []
+                if len(loc) != 2:
+                    return False
+                return (min(x0, x1) <= loc[0] <= max(x0, x1)
+                        and min(y0, y1) <= loc[1] <= max(y0, y1))
+            out = [f for f in out if _inside(f)]
+        return out
+
+    # The cross-drawing (MECH vs STR) findings and the intra-drawing ones
+    # are two different things and are served as two lists.  The *status*
+    # is the cross-drawing check's alone.
+    items = _filtered(payload.get("findings"))
+    others = _filtered(payload.get("other_warnings"))
+
+    total = len(items)
+    page = items[offset:offset + limit]
+    other_page = others[offset:offset + limit]
+
+    return {
+        "job_id": job_id,
+        "pair_id": pair_id,
+        "status": payload.get("status", "unknown"),
+        "reason": payload.get("reason", ""),
+        "units": payload.get("units") or {},
+        # the summary is UNFILTERED — it describes the whole run
+        "summary": payload.get("summary") or {},
+        "coverage": payload.get("coverage") or {},
+        "family_coverage": payload.get("family_coverage") or {},
+        "warnings": list(payload.get("warnings") or []),
+        "total": total,
+        "returned": len(page),
+        "items": page,
+        # the intra-drawing findings: a separate list, with its own count
+        "other_warnings": other_page,
+        "other_warnings_count": int(payload.get("other_warnings_count") or 0),
+        "other_warnings_total": len(others),
+        "other_warnings_returned": len(other_page),
+    }
+
+
+@router.get("/{job_id}/findings.csv")
+async def findings_csv(job_id: str, pair_id: str | None = None):
+    """The findings as CSV."""
+    root = _findings_root(job_id, pair_id)
+    path = root / "findings.csv"
+    if not path.exists():
+        raise HTTPException(404, f"No findings.csv yet: {path}")
+    return FileResponse(str(path), filename="findings.csv",
+                        media_type="text/csv")
+
+
+@router.get("/{job_id}/findings.docx")
+async def findings_docx(job_id: str, pair_id: str | None = None):
+    """The findings report as DOCX."""
+    root = _findings_root(job_id, pair_id)
+    path = root / "findings.docx"
+    if not path.exists():
+        raise HTTPException(404, f"No findings.docx yet: {path}")
+    return FileResponse(
+        str(path), filename="findings.docx",
+        media_type=("application/vnd.openxmlformats-officedocument"
+                    ".wordprocessingml.document"),
+    )
+
+
+@router.get("/{job_id}/findings.json")
+async def findings_json(job_id: str, pair_id: str | None = None):
+    """The findings report as JSON — the file the UI's button downloads."""
+    root = _findings_root(job_id, pair_id)
+    path = root / "findings.json"
+    if not path.exists():
+        raise HTTPException(404, f"No findings.json yet: {path}")
+    return FileResponse(str(path), filename="findings.json",
+                        media_type="application/json")
+
+
+@router.get("/{job_id}/findings/{fid}")
+async def get_finding(job_id: str, fid: str):
+    """One finding, by its id (``MM-0001``) or its content hash (uid)."""
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+    _path, payload = _load_findings(job_id)
+    for f in payload.get("findings") or []:
+        if f.get("id") == fid or f.get("uid") == fid:
+            return f
+    raise HTTPException(404, f"No such finding: {fid}")
+
+
+@router.get("/{job_id}/mismatch/policy")
+async def get_mismatch_policy(job_id: str, pair_id: str | None = None):
+    """The resolved mismatch policy and its hash."""
+    from core.mismatch.policy import load_policy
+
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+    root = _findings_root(job_id, pair_id).parent
+    try:
+        pol = load_policy(job_id, pair_root=root)
+    except Exception as e:
+        raise HTTPException(400, f"mismatch policy is invalid: {e}")
+    return {"policy": pol.to_dict(), "policy_hash": pol.policy_hash}
+
+
+@router.put("/{job_id}/mismatch/policy")
+async def put_mismatch_policy(job_id: str, body: dict):
+    """Replace the mismatch policy.  An invalid policy is a 400.
+
+    A **partial** document is merged over the currently resolved policy, so
+    ``{"enabled": false}`` turns the check off without having to restate
+    every family and tolerance.
+    """
+    from core.mismatch.policy import (MismatchPolicy, PolicyError,
+                                      load_policy, policy_hash)
+
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "the request body must be a JSON object")
+    payload = body.get("policy") if isinstance(body.get("policy"), dict) else body
+
+    try:
+        current = load_policy(job_id, pair_root=job_dir(job_id))
+    except Exception as e:
+        raise HTTPException(400, f"the current mismatch policy is invalid: {e}")
+
+    merged = {**current.to_dict(), **payload}
+    try:
+        pol = MismatchPolicy.from_dict(merged)
+    except PolicyError as e:
+        raise HTTPException(400, f"mismatch policy is invalid: {e}")
+    except Exception as e:
+        raise HTTPException(400, f"mismatch policy is invalid: {e}")
+
+    path = job_dir(job_id) / "mismatch_policy.json"
+    path.write_text(json.dumps(pol.to_dict(), indent=2))
+    return {"ok": True, "policy": pol.to_dict(),
+            "policy_hash": policy_hash(pol.to_dict()),
+            "path": str(path)}
+
+
+@router.post("/{job_id}/mismatch/rerun")
+async def rerun_mismatch(job_id: str, pair_id: str | None = None):
+    """Re-run the mismatch check (and the findings merge) for one pair.
+
+    No refit: the grid transform is reused.  The whole chain runs in a
+    threadpool — mismatch → spotcheck dedupe → findings → re-render → the
+    report refresh.
+    """
+    from starlette.concurrency import run_in_threadpool
+
+    job = load_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"No such job: {job_id}")
+    if pair_id is not None:
+        _safe_pair_id(pair_id)
+
+    def _work() -> dict:
+        import core.findings as findings_mod
+        import core.mismatch as mismatch_mod
+        import core.package as package_mod
+        import core.spotcheck as spotcheck_mod
+
+        pair_dir = None
+        if pair_id is not None:
+            from core.pair_runner import pair_root
+            pair_dir = pair_root(job_id, _safe_pair_id(pair_id)) / "cleaned"
+
+        mismatch_mod.run(job_id, pair_dir=pair_dir)
+        spotcheck_mod.run(job_id, pair_dir=pair_dir)
+        findings_mod.run(job_id, pair_dir=pair_dir)
+        package_mod.run(job_id, pair_dir=pair_dir)
+        return {"status": "rerun"}
+
+    await run_in_threadpool(_work)
+    return {"status": "rerun", "job_id": job_id, "pair_id": pair_id}
 
 
 @router.get("/{job_id}/preview.png")
@@ -963,6 +1516,12 @@ async def analyze(job_id: str, pair_id: str | None = None):
     job = load_job(job_id)
     if job is None:
         raise HTTPException(404, f"No such job: {job_id}")
+
+    # `pair_id` is a URL query parameter — untrusted.  It reaches
+    # `core.analyze._pair_artifact_root`, which joins it onto the job
+    # directory, so it must be sanitised before it gets there.
+    if pair_id is not None:
+        pair_id = _safe_pair_id(pair_id)
 
     from core.analyze import analyze_pair
 
@@ -1196,6 +1755,13 @@ async def get_pair_artifact(job_id: str, pair_id: str, artifact: str):
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "out",
         ),
+        "findings.json":               ("application/json", "out"),
+        "findings.csv":                ("text/csv", "out"),
+        "findings.docx":               (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "out",
+        ),
+        "mismatch.json":               ("application/json", "stages"),
     }
     if artifact not in valid:
         raise HTTPException(

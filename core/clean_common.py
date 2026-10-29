@@ -29,6 +29,7 @@ Public API:
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 from .clean_policy import DEFAULT_POLICY, CleaningPolicy
 
@@ -72,15 +73,16 @@ ANNOT_TYPES_V2 = {
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _compile_label_re(policy: CleaningPolicy) -> re.Pattern:
-    """Compile the label-regex from a policy. Cached for repeated use."""
-    # `re.compile` is cheap but the regex is identical across calls
-    # within a single cleaning pass — keep a per-policy cache via
-    # function attribute.
-    if getattr(_compile_label_re, "_cache_policy", None) is not policy:
-        _compile_label_re._cache_pattern = re.compile(policy.label_regex)
-        _compile_label_re._cache_policy = policy
-    return _compile_label_re._cache_pattern
+@lru_cache(maxsize=32)
+def _compile_label_re(pattern: str) -> re.Pattern:
+    """Compile (and cache) a label regex.
+
+    Keyed on the *pattern string*, not on the policy object: a policy whose
+    ``label_regex`` is replaced in place must not serve a stale pattern, and
+    ``lru_cache`` is thread-safe — the old function-attribute cache could
+    hand one concurrent job the other job's regex.
+    """
+    return re.compile(pattern)
 
 
 def _is_protected(entity, protected: set[str] | None) -> bool:
@@ -144,7 +146,8 @@ def _is_grid_label(entity, *, policy: CleaningPolicy = DEFAULT_POLICY) -> bool:
         return False
     try:
         txt = _label_text(entity)
-        return txt is not None and bool(_compile_label_re(policy).match(txt.strip()))
+        return txt is not None and bool(
+            _compile_label_re(policy.label_regex).match(txt.strip()))
     except Exception:
         return False
 
@@ -294,19 +297,22 @@ def _strip_triangles_in(container,
             t = e.dxftype()
             if t == "HATCH":
                 stripped_any = False
+                # ezdxf 1.4.4: `BoundaryPaths` has no `remove()`; the paths
+                # live in its `.paths` list.  A `PolylinePath` carries
+                # `.vertices`, an `EdgePath` carries `.edges`.
+                from ezdxf.entities.boundary_paths import EdgePath, LineEdge
                 for path in list(e.paths):
                     try:
-                        verts = path.vertices if hasattr(path, "vertices") else []
-                        if len(verts) == 3:
-                            try:
-                                e.paths.remove(path)
-                                stripped_any = True
-                            except Exception:
-                                try:
-                                    path.vertices = []
-                                    stripped_any = True
-                                except Exception:
-                                    pass
+                        if isinstance(path, EdgePath):
+                            is_tri = (len(path.edges) == 3
+                                      and all(isinstance(ed, LineEdge)
+                                              for ed in path.edges))
+                        else:
+                            is_tri = len(path.vertices) == 3
+                        if not is_tri:
+                            continue
+                        e.paths.paths.remove(path)
+                        stripped_any = True
                     except Exception:
                         pass
                 if stripped_any:

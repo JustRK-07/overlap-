@@ -185,7 +185,11 @@ def test_mismatch_synthetic_defects(preset, workdir):
     assert not extra, [f.id + "/" + f.kind for f in extra]
 
     for f, e in matched:
-        assert SEVERITY_RANK.get(f.severity, 99) >= SEVERITY_RANK[e.severity], \
+        # the finding must be AT LEAST as severe as the expectation.  The
+        # old inequality was the other way round, which made the check
+        # vacuous for the 12 CRITICAL expectations (rank >= 0 always holds)
+        # — severity was effectively untested across the whole subsystem.
+        assert SEVERITY_RANK.get(f.severity, 99) <= SEVERITY_RANK[e.severity], \
             (e.case, e.severity, f.severity)
         assert any(_dist(f.location, c) <= LOC_TOL_MM
                    for c in _loc_candidates(e, pair)), (e.case, f.location,
@@ -217,7 +221,8 @@ def test_each_defect_detected(preset, workdir):
         where = f"{f.id} {e.case}/{e.kind}"
 
         assert f.kind == e.kind, where
-        assert SEVERITY_RANK.get(f.severity, 99) >= SEVERITY_RANK[e.severity], \
+        # at least as severe as the expectation (see the note above)
+        assert SEVERITY_RANK.get(f.severity, 99) <= SEVERITY_RANK[e.severity], \
             (where, e.severity, f.severity)
 
         assert any(_dist(f.location, c) <= LOC_TOL_MM

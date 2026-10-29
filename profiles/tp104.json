@@ -1,0 +1,185 @@
+{
+  "name": "tp104",
+  "description": "The TP-104 STR drawing is a Tekla export: every block sits on layer 0 and is named '<prefix><id> - <id>'. The prefixes are stable, the block names are not, so the rules match on the prefix. The geometry of a 'Part-' block is a set of LINE primitives (never a closed polyline), so the part is read as the oriented bounding box of those primitives and its family follows from the shape of that box.",
+  "match": {
+    "_comment": "A drawing matches this profile when it has blocks with all of these prefixes. Only a Tekla export has Connection-/Mark-/StraightDimension-, so a synthetic fixture never matches it.",
+    "prefixes": [
+      "Connection-",
+      "Mark-",
+      "StraightDimension-"
+    ],
+    "min_inserts": 5
+  },
+  "prefixes": {
+    "Part-": {
+      "kind": "geometry",
+      "shape": "obb",
+      "_comment": "A part is read as the oriented bounding box of its LINE/CIRCLE/ARC primitives. Long and thin is a member, small is a plate, and a part that is a circle is a circular section. The rules are tried in order; the last one has no conditions, so it is the fallback.",
+      "rules": [
+        {
+          "family": "str_member",
+          "min_aspect": 3.0,
+          "min_long_mm": 500.0
+        },
+        {
+          "family": "str_circle_section",
+          "round": true,
+          "max_aspect": 1.6
+        },
+        {
+          "family": "str_plate"
+        }
+      ]
+    },
+    "Bolt-": {
+      "kind": "geometry",
+      "family": "str_bolt",
+      "_comment": "The STR's bolt symbols. Inventoried as their own family and left unpaired until a rule uses them."
+    },
+    "Connection-": {
+      "kind": "geometry",
+      "family": "str_connection",
+      "_comment": "Connection nodes. Inventoried as their own family and left unpaired until a rule uses them."
+    },
+    "Line-": {
+      "kind": "geometry",
+      "shape": "obb",
+      "rules": [
+        {
+          "family": "str_member",
+          "min_aspect": 3.0,
+          "min_long_mm": 500.0
+        },
+        {
+          "family": "str_plate"
+        }
+      ]
+    },
+    "Mark-": {
+      "kind": "annotation"
+    },
+    "Text-": {
+      "kind": "annotation"
+    },
+    "StraightDimension-": {
+      "kind": "annotation"
+    },
+    "SectionMark-": {
+      "kind": "annotation"
+    },
+    "Unknown-": {
+      "kind": "annotation"
+    },
+    "GridLine-": {
+      "kind": "grid"
+    },
+    "ReferenceModel-": {
+      "kind": "reference"
+    }
+  },
+  "families": {
+    "str_member": {
+      "src": "STR",
+      "feature": [
+        "band"
+      ],
+      "layer_regex": null,
+      "block_regex": null,
+      "block_prefixes": [
+        "Part-",
+        "Line-"
+      ],
+      "size_min_mm": 500.0,
+      "size_max_mm": null,
+      "size_key": "len"
+    },
+    "str_plate": {
+      "src": "STR",
+      "feature": [
+        "rect",
+        "polygon"
+      ],
+      "layer_regex": null,
+      "block_regex": null,
+      "block_prefixes": [
+        "Part-",
+        "Line-"
+      ],
+      "size_min_mm": 0.0,
+      "size_max_mm": 20000.0,
+      "size_key": "w"
+    },
+    "str_circle_section": {
+      "src": "STR",
+      "feature": [
+        "circle"
+      ],
+      "layer_regex": null,
+      "block_regex": null,
+      "block_prefixes": [
+        "Part-"
+      ],
+      "size_min_mm": 3.0,
+      "size_max_mm": 2000.0,
+      "size_key": "r"
+    },
+    "str_bolt": {
+      "src": "STR",
+      "feature": [
+        "circle"
+      ],
+      "layer_regex": null,
+      "block_regex": null,
+      "block_prefixes": [
+        "Bolt-"
+      ],
+      "size_min_mm": 3.0,
+      "size_max_mm": 40.0,
+      "size_key": "r"
+    },
+    "str_connection": {
+      "src": "STR",
+      "feature": [
+        "insert",
+        "point"
+      ],
+      "layer_regex": null,
+      "block_regex": null,
+      "block_prefixes": [
+        "Connection-"
+      ],
+      "size_min_mm": 0.0,
+      "size_max_mm": null,
+      "size_key": "w"
+    }
+  },
+  "offset_rules": [
+    {
+      "name": "R1",
+      "mech_selector": {
+        "layers": [
+          "MAIN OBJECT",
+          "Chute",
+          "Belt",
+          "Sheeting",
+          "handrail"
+        ],
+        "families": []
+      },
+      "str_selector": {
+        "layers": [],
+        "families": [
+          "str_member",
+          "str_plate"
+        ]
+      },
+      "method": "edge_to_edge",
+      "search_mm": 25.0,
+      "tolerance_mm": 5.0,
+      "warn_mm": 5.0,
+      "critical_mm": 15.0,
+      "min_overlap_mm": 300.0,
+      "needs_review": true
+    }
+  ]
+}

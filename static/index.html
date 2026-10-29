@@ -74,12 +74,6 @@
               </select>
             </label>
           </div>
-          <label class="check">
-            <input type="checkbox" name="allow_weak_fit" id="allow-weak-fit">
-            <span>Allow weak fit <span class="muted">— accept the transform even when the quality
-              gates complain (too few inliers, a bad leave-one-out residual, a scale that
-              contradicts $INSUNITS). The result is marked <code>forced</code>.</span></span>
-          </label>
         </div>
 
         <div class="checks-group">
@@ -227,6 +221,40 @@
       <div id="axes-results" class="hidden">
         <h3>Results</h3>
         <div id="axes-summary"></div>
+
+        <!-- Units — shown when the grid spacing and the drawings' $INSUNITS
+             headers disagree, and always available so a header can be
+             corrected by hand. -->
+        <div id="units-block" class="hidden" style="margin-top: 0.8em;">
+          <h3>Drawing units</h3>
+          <p id="units-message" class="muted"></p>
+          <div class="form-row" style="margin: 6px 0 0;">
+            <label>MECH drawing units:
+              <select id="mech-units" class="select-base">
+                <option value="mm">mm</option>
+                <option value="cm">cm</option>
+                <option value="m">m</option>
+                <option value="in">in</option>
+                <option value="ft">ft</option>
+              </select>
+            </label>
+            <label>STR drawing units:
+              <select id="str-units" class="select-base">
+                <option value="mm">mm</option>
+                <option value="cm">cm</option>
+                <option value="m">m</option>
+                <option value="in">in</option>
+                <option value="ft">ft</option>
+              </select>
+            </label>
+            <button id="apply-units-btn" type="button">Use these units</button>
+          </div>
+          <p class="muted" style="margin-top: 0.5em;">
+            The drawings themselves are never modified — the units you choose are
+            recorded with the job.
+          </p>
+        </div>
+
         <button id="confirm-axes-btn" type="button" class="primary hidden">Continue →</button>
       </div>
 
@@ -275,6 +303,11 @@
         <a id="download-annotated-link" href="#" download="superimposed_annotated.dxf">⬇ Annotated DXF (with spot-check clouds)</a>
         <a id="download-docx-link" href="#" download="spotcheck.docx">⬇ Spot-check DOCX</a>
         <a id="download-spotcheck-json-link" href="#" download="spotcheck.json">⬇ Spot-check JSON</a>
+        <a id="download-findings-json-link" href="#" download="findings.json">⬇ Findings JSON</a>
+        <a id="download-findings-csv-link" href="#" download="findings.csv">⬇ Findings CSV</a>
+        <a id="download-findings-docx-link" href="#" download="findings.docx">⬇ Findings DOCX</a>
+        <a id="download-dwg-link" href="#" download="superimposed_R2018.dwg"
+           class="secondary" title="DWG export needs the ODA File Converter">⬇ Superimposed DWG</a>
       </div>
       <div class="download-row">
         <a id="preview-link" href="#" target="_blank">🖼 Preview — full extents</a>
@@ -311,25 +344,56 @@
         <tbody id="analyze-tbody"></tbody>
       </table>
 
-      <details id="analyze-issues-details" style="margin-top: 1em;">
-        <summary style="cursor: pointer; font-weight: 600;">Issues panel
-          (<span id="analyze-issues-count">0</span>)
+      <details id="findings-details" open style="margin-top: 1em;">
+        <summary style="cursor: pointer; font-weight: 600;">Findings
+          (<span id="findings-count">0</span>)
         </summary>
-        <table id="issues-table">
+
+        <div id="findings-controls" class="analyze-controls">
+          <label class="strategy-label">
+            Kind:
+            <select id="findings-kind-select" class="select-base">
+              <option value="">All kinds</option>
+            </select>
+          </label>
+          <label class="strategy-label">
+            <input type="checkbox" id="findings-include-info" /> include INFO
+          </label>
+          <label class="strategy-label">
+            <input type="checkbox" id="findings-include-systematic" /> include systematic
+          </label>
+          <span id="findings-summary" class="muted"></span>
+          <button id="findings-reset-zoom" class="secondary hidden">Reset zoom</button>
+          <button id="findings-copy-coords" class="secondary hidden">Copy coords</button>
+        </div>
+
+        <div id="findings-coverage" class="findings-coverage"></div>
+
+        <div id="findings-preview-wrap" class="findings-preview-wrap hidden">
+          <img id="findings-preview" alt="overlay preview" />
+          <svg id="findings-overlay" class="findings-overlay"></svg>
+        </div>
+
+        <table id="findings-table">
           <thead>
             <tr>
               <th>ID</th>
-              <th>Type</th>
+              <th>Kind</th>
               <th>Severity</th>
               <th>X (MECH)</th>
               <th>Y (MECH)</th>
-              <th>Distance (u)</th>
-              <th>Note</th>
+              <th>Offset (mm)</th>
+              <th>|local| (mm)</th>
+              <th>Tol (mm)</th>
+              <th>Ratio</th>
+              <th>MECH ref</th>
+              <th>STR ref</th>
+              <th>Message</th>
             </tr>
           </thead>
-          <tbody id="issues-tbody"></tbody>
+          <tbody id="findings-tbody"></tbody>
         </table>
-        <button id="issues-show-more" class="secondary hidden" style="margin-top: 0.5em;">
+        <button id="findings-show-more" class="secondary hidden" style="margin-top: 0.5em;">
           Show more
         </button>
       </details>

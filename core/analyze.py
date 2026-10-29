@@ -140,6 +140,28 @@ def normalize_depth(residual: float, mech_diag: float) -> float:
 # Pair roots
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _mech_mm_per_unit(transform: dict | None) -> float:
+    """How many millimetres one MECH drawing unit is worth.
+
+    Read from ``transform.json``'s ``units.mech`` (the MECH drawing's
+    ``$INSUNITS`` code).  A drawing that declares no units is assumed to
+    be in millimetres.
+    """
+    code = ((transform or {}).get("units") or {}).get("mech") or 0
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return 1.0
+    if code <= 0:
+        return 1.0
+    try:
+        import ezdxf
+        factor = float(ezdxf.units.conversion_factor(code, 4))  # 4 == mm
+    except Exception:
+        return 1.0
+    return factor if factor > 0.0 else 1.0
+
+
 def _pair_artifact_root(job_id: str, pair_id: str | None) -> Path:
     """Resolve the artifact root for a pair.
 
@@ -167,7 +189,10 @@ def _cleaned_dir(job_id: str, pair_id: str | None) -> Path:
 # Issue-to-intersection radius for hotspot aggregation. Issues within this
 # many mm of an intersection's MECH coordinate count toward that
 # intersection's severity tally.
-HOTSPOT_RADIUS = 2000.0
+#: 2000 mm — how close an issue has to be to an intersection to count as
+#: "near" it.  It is divided by the MECH drawing's mm-per-unit before it
+#: is used, so a metre-scale MECH does not make every issue a hotspot.
+HOTSPOT_RADIUS_MM = 2000.0
 
 
 def analyze_pair(job_id: str, pair_id: str | None = None) -> dict:
@@ -234,6 +259,11 @@ def analyze_pair(job_id: str, pair_id: str | None = None) -> dict:
     issues = spotcheck.get("issues", []) or []
     sev_breakdown = dict(Counter(i.get("severity", "INFO") for i in issues))
 
+    # The hotspot radius is 2000 mm; the coordinates are in the MECH
+    # drawing's units, so it has to be scaled.  `transform.json` carries
+    # the MECH drawing's $INSUNITS code.
+    hotspot_radius = HOTSPOT_RADIUS_MM / max(_mech_mm_per_unit(transform), 1e-9)
+
     hotspots: list[dict] = []
     for ix in intersections:
         nd = ix["normalized_depth"]
@@ -245,7 +275,7 @@ def analyze_pair(job_id: str, pair_id: str | None = None) -> dict:
                 i for i in issues
                 if math.hypot(float(i.get("mech_x", 0.0)) - ix["mech"][0],
                               float(i.get("mech_y", 0.0)) - ix["mech"][1])
-                   < HOTSPOT_RADIUS
+                   < hotspot_radius
             ]
             if len(nearby) < 3:
                 continue
@@ -254,7 +284,7 @@ def analyze_pair(job_id: str, pair_id: str | None = None) -> dict:
                 i for i in issues
                 if math.hypot(float(i.get("mech_x", 0.0)) - ix["mech"][0],
                               float(i.get("mech_y", 0.0)) - ix["mech"][1])
-                   < HOTSPOT_RADIUS
+                   < hotspot_radius
             ]
         hotspots.append({
             "intersection": ix["label"],

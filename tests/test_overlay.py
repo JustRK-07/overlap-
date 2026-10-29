@@ -383,14 +383,135 @@ def test_run_writes_output_and_report(fx_synth_job):
     assert any(k.startswith("overlay:") for k in audit)
 
 
+def _swallows_everything(handler) -> bool:
+    """Does this handler do nothing but `pass`?
+
+    A docstring-only body counts as swallowing too — the exception is
+    discarded either way.
+    """
+    body = [n for n in handler.body
+            if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+    if not body:
+        return True
+    return all(isinstance(n, ast.Pass) for n in body)
+
+
 def test_no_bare_except_in_overlay():
-    """PLAN.md step 6: no `except: pass` anywhere in the module."""
+    """PLAN.md step 6: no `except: pass` anywhere in the module.
+
+    The old check only rejected a *docstring-only* body, so
+    ``except Exception: pass`` — the exact pattern the plan lists as a
+    defect — passed.  It also raised a false positive on a
+    docstring-only handler.
+    """
     tree = ast.parse((ROOT / "core" / "overlay.py").read_text())
     handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)]
-    assert handlers, "the module has no except clause at all"
     for node in handlers:
-        body = [n for n in node.body
-                if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
-        assert body, f"bare except at line {node.lineno}: {ast.dump(node.body[0])}"
+        assert not _swallows_everything(node), (
+            f"a handler that swallows everything at line {node.lineno}: "
+            f"{ast.dump(node.body[0])}")
         assert node.type is not None or node.name is not None, \
             f"bare except at line {node.lineno}"
+
+
+def test_the_bare_except_check_actually_catches_one():
+    """The check itself must be able to fail — otherwise it proves nothing."""
+    docstring_only = "try:\n    pass\nexcept Exception:\n    " + chr(34) * 3 + chr(34) * 3 + "\n"
+    sources = (
+        "try:\n    pass\nexcept:\n    pass\n",
+        "try:\n    pass\nexcept Exception:\n    pass\n",
+        docstring_only,
+    )
+    for source in sources:
+        tree = ast.parse(source)
+        handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)]
+        assert handlers
+        assert any(_swallows_everything(h) for h in handlers), (
+            f"the check missed: {source!r}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A1 — the handle set must be built once, not once per modelspace entity
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _CountingList(list):
+    """A list that counts how many times it is iterated."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.iter_calls = 0
+
+    def __iter__(self):
+        self.iter_calls += 1
+        return list.__iter__(self)
+
+
+def test_str_block_names_builds_the_handle_set_once():
+    """`_str_block_names` must not rebuild `set(str_entity_handles)` per entity.
+
+    The set used to be constructed inside the comprehension's *condition*, so
+    it was rebuilt for every modelspace entity — O(N²) on the overlay's
+    critical path (14.8 s for 20 000 entities, measured).
+    """
+    doc = ezdxf.new("R2018")
+    doc.blocks.new("Part-X")
+    for i in range(40):
+        doc.modelspace().add_blockref("Part-X", (i * 10.0, 0.0))
+
+    report = overlay.OverlayReport()
+    report.str_entity_handles = _CountingList(
+        e.dxf.handle for e in doc.modelspace() if e.dxftype() == "INSERT")
+
+    names = overlay._str_block_names(doc, report)
+
+    assert "Part-X" in names, "the STR block name must still be found"
+    assert report.str_entity_handles.iter_calls <= 2, (
+        f"the handle list was iterated {report.str_entity_handles.iter_calls} "
+        "times — the set must be built once, outside the comprehension")
+
+
+def test_run_uses_the_fitted_model_for_the_drop_budget(fx_synth_job, monkeypatch):
+    """A9: the drop budget must follow the model that was actually fitted.
+
+    `OverlayOptions.for_model("affine")` allows 1 % of the imported entities
+    to be dropped; the diagnostic affine model cannot transform an INSERT
+    under a skew, so a handful of drops is expected.  The stage used to
+    always use the similarity default (0 %) and fail on the first drop.
+    """
+    from jobs import job_dir
+    job_id, pair = fx_synth_job(synth.HARD)
+    d = job_dir(job_id)
+    (d / "cleaned").mkdir(parents=True, exist_ok=True)
+    for src, dst in ((pair.mech_path, "zz_plant_clean.dxf"),
+                     (pair.str_path, "aa_frame_clean.dxf")):
+        shutil.copyfile(src, d / "cleaned" / dst)
+
+    captured = {}
+    real = overlay.overlay_docs
+
+    def spy(*args, **kwargs):
+        captured["options"] = kwargs.get("options")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(overlay, "overlay_docs", spy)
+
+    # an affine transform — the diagnostic model
+    (d / "transform.json").write_text(json.dumps({
+        "model": "affine",
+        "matrix": [[1.0, 0.1, 0.0], [0.05, 1.0, 0.0]],
+        "a": 1.0, "b": 0.1, "c": 0.05, "d": 1.0, "tx": 0.0, "ty": 0.0,
+    }))
+    run(job_id)
+    assert captured["options"] is not None, "run() must pass explicit options"
+    assert captured["options"].max_drop_ratio == 0.01, (
+        "an affine fit must get the 1 % drop budget that for_model() defines")
+
+    # the similarity default is unchanged
+    captured.clear()
+    (d / "transform.json").write_text(json.dumps({
+        "model": "similarity",
+        "matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        "a": 1.0, "b": 0.0, "c": 0.0, "d": 1.0, "tx": 0.0, "ty": 0.0,
+    }))
+    run(job_id)
+    assert captured["options"].max_drop_ratio == 0.0

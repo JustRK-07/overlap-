@@ -27,7 +27,10 @@ from pathlib import Path
 
 import requests
 
-API = os.environ.get("OVERLAY_URL", "http://127.0.0.1:8765")
+# run.sh starts uvicorn on 8000 — the old default (8765) made the
+# documented "./run.sh && python3 tests/smoke_test.py" sequence fail
+# at the health check.
+API = os.environ.get("OVERLAY_URL", "http://127.0.0.1:8000")
 ISGEC = Path(os.environ.get("ISGEC_DIR",
     "/home/rushabh/Desktop/Rushabh New Laptop Files/desktop/Rushabh/edi_sem_5/ISGEC"))
 TIMEOUT_SEC = 180
