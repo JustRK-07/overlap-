@@ -132,31 +132,39 @@ def build_payload(root: Path, *, job_id: str = "") -> dict:
     if mm_per_unit is None:
         mm_per_unit = None
 
-    status = str((native or {}).get("status", "error"))
+    from core.mismatch import status as status_mod
+
+    status = str((native or {}).get("status") or status_mod.FAILED)
+    reason = str((native or {}).get("reason") or "")
     warnings = list((native or {}).get("warnings") or [])
     coverage = dict((native or {}).get("coverage") or {})
+    family_coverage = dict((native or {}).get("family_coverage") or {})
 
-    if status == "disabled":
+    if status == status_mod.DISABLED:
         return {
-            "status": "disabled",
+            "status": status_mod.DISABLED,
             "generated_at": _now_iso(),
             "units": units,
             "summary": {},
             "coverage": coverage,
+            "family_coverage": family_coverage,
+            "reason": reason or "mismatch detection is disabled by policy",
             "warnings": warnings or ["mismatch detection is disabled by policy"],
             "truncated": False,
             "findings": [],
         }
 
-    if status == "error":
+    if status in (status_mod.FAILED, "error"):
         message = str((native or {}).get("message")
                       or "the mismatch check did not run")
         return {
-            "status": "error",
+            "status": status_mod.FAILED,
             "generated_at": _now_iso(),
             "units": units,
             "summary": {},
             "coverage": coverage,
+            "family_coverage": family_coverage,
+            "reason": reason or f"the mismatch check did not run: {message}",
             "warnings": warnings + [message],
             "truncated": False,
             "findings": [],
@@ -170,15 +178,43 @@ def build_payload(root: Path, *, job_id: str = "") -> dict:
     ranked, truncated = truncate(ranked, limit)
 
     from core.mismatch.model import finding_to_dict
+
+    # A stage output written before the status vocabulary existed says
+    # "ok", which cannot be trusted: it meant "no findings", not "the two
+    # drawings agree".  Treat it as what it can prove.
+    if status == "ok":
+        status = (status_mod.DISCREPANCIES_FOUND if ranked
+                  else status_mod.INSUFFICIENT_COVERAGE)
+        reason = reason or ("the mismatch check reported no status; its "
+                            "coverage cannot be verified")
+
+    # ── the two kinds of finding, kept apart ─────────────────────────
+    # The *status* is the cross-drawing (MECH vs STR) check's alone.  The
+    # spot-check and the intra-drawing checks look inside one drawing, so
+    # they say something different — and they must never be able to turn
+    # "insufficient_coverage" into "discrepancies_found".
+    cross = [f for f in ranked if f.origin == "mismatch"]
+    other = [f for f in ranked if f.origin != "mismatch"]
+
     return {
-        "status": "ok",
+        # the cross-drawing check's status, and nothing else's
+        "status": status,
         "generated_at": _now_iso(),
         "units": units,
-        "summary": summarize(ranked),
+        "summary": summarize(cross),
         "coverage": coverage,
+        "family_coverage": family_coverage,
+        # the offset rules: what each found, and the clusters
+        "offset_rules": dict((native or {}).get("offset_rules") or {}),
+        "offset_clusters": list((native or {}).get("offset_clusters") or []),
+        "reason": reason,
         "warnings": warnings,
         "truncated": bool(truncated),
-        "findings": [finding_to_dict(f) for f in ranked],
+        "findings": [finding_to_dict(f) for f in cross],
+        # the intra-drawing findings — a separate list, with its own count
+        "other_warnings": [finding_to_dict(f) for f in other],
+        "other_warnings_count": len(other),
+        "other_warnings_summary": summarize(other),
     }
 
 
@@ -193,6 +229,9 @@ def _build_docx(payload: dict, out_path: Path) -> None:
     p = doc.add_paragraph()
     p.add_run(f"Generated: {payload.get('generated_at', '')}\n").bold = True
     p.add_run(f"Status: {payload.get('status', 'unknown')}")
+    reason = str(payload.get("reason") or "")
+    if reason:
+        p.add_run(f"\n{reason}")
 
     summary = payload.get("summary") or {}
     by_sev = summary.get("by_severity") or {}
@@ -205,8 +244,11 @@ def _build_docx(payload: dict, out_path: Path) -> None:
     hdr = table.rows[0].cells
     hdr[0].text = "Parameter"
     hdr[1].text = "Value"
+    other_count = int(payload.get("other_warnings_count") or 0)
     rows = [
-        ("Total findings", str(summary.get("total", len(payload.get("findings", []))))),
+        ("Total findings (MECH vs STR)",
+         str(summary.get("total", len(payload.get("findings", []))))),
+        ("Other warnings (intra-drawing)", str(other_count)),
         ("Critical", str(by_sev.get("CRITICAL", 0))),
         ("Warning", str(by_sev.get("WARNING", 0))),
         ("Info", str(by_sev.get("INFO", 0))),
@@ -228,6 +270,22 @@ def _build_docx(payload: dict, out_path: Path) -> None:
             f"{units.get('mm_per_unit')} mm per drawing unit"
             + (" (assumed)" if units.get("assumed") else ""))
 
+    families = payload.get("family_coverage") or {}
+    if families:
+        doc.add_heading("Coverage by family", level=2)
+        cov = doc.add_table(rows=1, cols=5)
+        cov.style = "Light List"
+        hdr = cov.rows[0].cells
+        for i, name in enumerate(("family", "extracted", "eligible",
+                                  "matched", "unmatched")):
+            hdr[i].text = name
+        for name, counts in sorted(families.items()):
+            row = cov.add_row().cells
+            row[0].text = str(name)
+            for i, key in enumerate(("extracted", "eligible", "matched",
+                                     "unmatched"), start=1):
+                row[i].text = str((counts or {}).get(key, 0))
+
     coverage = payload.get("coverage") or {}
     if coverage:
         doc.add_heading("Coverage", level=2)
@@ -243,13 +301,13 @@ def _build_docx(payload: dict, out_path: Path) -> None:
             row[2].text = str((counts or {}).get("matched", 0))
             row[3].text = str((counts or {}).get("unmatched", 0))
 
-    findings = payload.get("findings") or []
-    doc.add_heading("Findings", level=1)
-    if not findings:
-        doc.add_paragraph("No findings.")
-    else:
+    def _finding_section(doc, heading: str, rows: list, empty: str) -> None:
+        doc.add_heading(heading, level=1)
+        if not rows:
+            doc.add_paragraph(empty)
+            return
         for sev in ("CRITICAL", "WARNING", "INFO"):
-            group = [f for f in findings if f.get("severity") == sev]
+            group = [f for f in rows if f.get("severity") == sev]
             if not group:
                 continue
             _severity_heading(doc, sev, len(group))
@@ -278,6 +336,15 @@ def _build_docx(payload: dict, out_path: Path) -> None:
                 if f.get("message"):
                     doc.add_paragraph(f"Message: {f['message']}")
 
+    _finding_section(doc, "Findings (MECH vs STR)",
+                     payload.get("findings") or [],
+                     "No discrepancies between the two drawings.")
+
+    other = payload.get("other_warnings") or []
+    _finding_section(doc, f"Other warnings (intra-drawing) — {len(other)}",
+                     other,
+                     "No intra-drawing warnings.")
+
     doc.save(str(out_path))
 
 
@@ -300,10 +367,12 @@ def run(job_id: str, *, pair_dir: Path | None = None) -> None:
     (out_dir / "findings.json").write_text(
         json.dumps(payload, indent=2, default=str))
 
-    # the CSV carries the same rows
+    # the CSV carries every row — the cross-drawing findings and the
+    # intra-drawing warnings alike (each row says which it is).
     from core.mismatch.model import Finding
     rows = []
-    for raw in payload.get("findings", []):
+    for raw in list(payload.get("findings") or []) + \
+            list(payload.get("other_warnings") or []):
         try:
             rows.append(Finding(
                 kind=raw.get("kind", ""),

@@ -311,7 +311,7 @@ def run(env: Env) -> list[Finding]:
             # it is recorded in the coverage and stays quiet: a
             # MISSING_COUNTERPART per bolt for a drawing that simply has no
             # counterpart family would drown the report (PLAN_MISMATCH §4).
-            env.track("bolts", len(bolts), 0)
+            env.track_pair("bolts", mech_fam, str_fam, len(bolts), len(holes))
             continue
         out += _pairing(env, bolts, holes, mech_fam, str_fam, holes_taken)
     if env.policy.checks.extra_hole:
@@ -330,12 +330,18 @@ def _pairing(env: Env, bolts, holes, mech_fam, str_fam, holes_taken) -> list[Fin
 
     findings: list[Finding] = []
     n_assigned = 0
+    n_bolts_matched = 0
+    n_holes_matched = 0
     for pattern in group_patterns(bolts, env.u(pol.search.pattern_eps)):
-        found, matched = _judge_pattern(env, pattern, holes, index, plates,
-                                        plate_index, mech_fam, str_fam, holes_taken)
+        found, matched, n_bolts, n_holes = _judge_pattern(
+            env, pattern, holes, index, plates, plate_index, mech_fam, str_fam,
+            holes_taken)
         findings += found
         n_assigned += matched
-    env.track("bolts", len(bolts), n_assigned)
+        n_bolts_matched += n_bolts
+        n_holes_matched += n_holes
+    env.track_pair("bolts", mech_fam, str_fam, len(bolts), len(holes),
+                   matched_mech=n_bolts_matched, matched_str=n_holes_matched)
     return findings
 
 
@@ -416,7 +422,8 @@ def _judge_pattern(env: Env, pattern, holes, index, plates, plate_index,
         else:
             findings += _plate_fallback(env, pattern, loose, mech_fam, plates,
                                         plate_index, r_mm)
-    return findings, len(pairs)
+    holes_used = {j for _i, j, _d in pairs}
+    return findings, len(pairs), len(assigned), len(holes_used)
 
 
 def _pattern_finding(env, pattern, pairs, holes, R, t, res, inliers,

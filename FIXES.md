@@ -3,6 +3,9 @@
 This file is the working ledger for the defects found in the review of
 `a29669b` and for the remaining `PLAN.md` / `PLAN_MISMATCH.md` work.
 
+> The `PLAN.md` / `PLAN_MISMATCH.md` referenced below now live in
+> [`docs/archive/`](docs/archive/) — they are historical.
+
 **How to read it.** Every row is a defect with a *root cause*, the *change* that
 fixes it, and a *verification* that proves the fix landed. A fix is only
 "done" when its verification is written and passing.
@@ -31,8 +34,9 @@ the unfixed code*. A fix with no test is not done — it is a hope.
 | **Test-suite hygiene defects** | **14** (D1–D14) |
 | **Test files the plans named but never had** | **8** — all written |
 | **Findings from the review left open** | **13 groups** — see **Part E** |
-| **Suite (synthetic)** | 389 passed / 24 skipped → **494 passed / 15 skipped** (509 collected) |
-| **Suite (real TP-104)** | 500 passed / 9 failed / 0 skipped → **509 passed / 0 failed / 0 skipped** |
+| **Suite (synthetic)** | 389 passed / 24 skipped → **509 passed / 5 skipped** (545 collected) |
+| **Suite (real TP-104)** | 500 passed / 9 failed / 0 skipped → **514 passed / 0 failed / 0 skipped** |
+| **False "ok" in the mismatch check** | fixed — see **Part G** |
 | **Perf** | the overlay's handle lookup 14.83 s → 0.004 s; the bolt check 74.5 s → 2.4 s |
 
 **Re-verify everything at any time:**
@@ -566,10 +570,67 @@ that no synthetic fixture can reach.
 | **Severity** | Medium (the fit is refused on an exact fit) |
 | **Symptom** | The MECH header says `$INSUNITS = 1` (**inch**) but the drawing is in **millimetres**.  The fit's unit prior therefore expects a scale of 0.0394 while the grid gives exactly 1.0, and the fit is refused. |
 | **Root cause** | A wrong header in the drawing — not a bug in the pipeline.  The gate is doing exactly its job: a header that disagrees with the grid is the first thing to check. |
-| **Decision** | **The gate stays.**  Weakening it ("an exact fit implies the header is wrong") is indistinguishable from the case the gate exists for — a genuinely unit-mismatched pair also fits exactly.  The designed escape hatch is `allow_weak_fit` (PLAN.md step 9), which downgrades the gate to a warning. |
-| **The transform** | with `allow_weak_fit`: scale **1.0**, rotation **0.0**, tx **208379.8605**, ty **−179584.5241**, rms **7.9e-07**, 12/12 inliers — **identical to the original ISGEC pipeline's own `transform.json`** (tx 208379.86046, ty −179584.52411, rms 2.3e-07). |
-| **Connected files** | `core/fit.py` (unchanged), `tests/conftest.py` — the TP-104 job fixture now sets `allow_weak_fit`, which is what a user does with this drawing. |
-| **Status** | **VERIFIED** |
+| **Decision** | **The gate stays.**  Weakening it ("an exact fit implies the header is wrong") is indistinguishable from the case the gate exists for — a genuinely unit-mismatched pair also fits exactly. |
+| **Resolution (2026-10-27)** | The escape hatch is no longer a blanket "accept a bad fit": the units are now **explicit**.  At the axes step the grid-derived scale (the ratio of the two drawings' median grid spacings — header-free, so immune to a wrong one) is compared with the header-derived one.  When they disagree the job **pauses at `awaiting_axes`** and offers the interpretation the geometry supports — for TP-104, *"grid spacing indicates both drawings are in mm"* — and the user confirms it as a per-file unit override recorded in `job.json`.  `allow_weak_fit` is **gone** (API, UI, README); `force` survives on `POST /{id}/axes/confirm` for the other gates.  The drawing itself is never modified. |
+| **The transform** | with the units confirmed as mm: scale **1.0**, rotation **0.0**, tx **208379.8605**, ty **−179584.5241**, rms **7.9e-07**, 12/12 inliers — **identical to the original ISGEC pipeline's own `transform.json`** (tx 208379.86046, ty −179584.52411, rms 2.3e-07).  `core/mismatch`'s `mm_per_unit` is now **1.0**, not 25.4. |
+| **Connected files** | `core/units.py` (new), `core/fit.py`, `core/roles.py`, `core/dxfio.py`, `core/mismatch/features.py`, `core/mismatch/__init__.py`, `core/overlay.py`, `core/package.py`, `routers/api.py`, `static/`, `jobs.py`, `tests/conftest.py`, `tests/test_units.py` (new) |
+| **Status** | **VERIFIED** — scoreboard A0/A1/A4 pass on the original TP-104 files |
+
+---
+
+---
+
+## Part G — the check stops saying "ok" when it did not check
+
+### G1 · the mismatch check reported "ok" for a drawing it never compared
+
+| | |
+|---|---|
+| **Severity** | High (a false clean bill) |
+| **Symptom** | The stage answered `ok` whenever it produced no findings.  A drawing with no recognisable structure produced no findings **because nothing was compared**, and "ok" reads as "the two drawings agree".  The TP-104 MECH drawing has no bolts, no saddles and no skids, so every rule leg had an empty side — and the report said `ok`. |
+| **Root cause** | One status meant two things: "the comparison agreed" and "there was no comparison". |
+| **Fix** | The check has its own vocabulary — `passed` / `discrepancies_found` / `insufficient_coverage` / `blocked` / `failed` / `disabled` — and **no rule having items on both sides means `insufficient_coverage`, never `passed`**.  A forced or untrusted fit is `blocked`.  The per-family counts (`extracted`, `eligible`, `matched`, `unmatched`) travel with the status, and the report shows the overlay's status and the check's status side by side with a one-line reason. |
+| **Connected files** | `core/mismatch/status.py` (new), `core/mismatch/__init__.py`, `core/mismatch/checks/__init__.py` (`Env.track_pair`), the four checks, `core/findings.py`, `core/package.py`, `routers/api.py`, `static/app.js`, `static/styles.css` |
+| **Follow-up (2026-10-27)** | The headline must be the **cross-drawing** check's alone.  The spot-check / `mech_intra` / `str_intra` findings look *inside* one drawing, so they say something different: they go into a separate list, `other_warnings`, with their own count, and they can never turn `insufficient_coverage` into `discrepancies_found`.  On TP-104 the headline reads `insufficient_coverage` with "N other warnings (intra-drawing)" beneath it.  A fit the user confirmed with `force` is `blocked` **always** — never `passed`, not even with zero findings. |
+| **Verification** | `tests/test_mismatch_status.py` — 18 tests: the six scenes (no STR entities, no counterpart, an exact match, a weak fit, a detector exception, all checks disabled), the forced-fit-always-blocks rule, the intra-drawing warnings never changing the headline, the vocabulary itself, and that the report, the DOCX and the API all carry the status and the reason. |
+| **Status** | **VERIFIED** — scoreboard A5 and B4 pass on the original TP-104 drawings |
+
+---
+
+---
+
+## Part H — the STR drawing is a Tekla export, not a CAD drawing
+
+### H1 · only 283 of 2275 STR blocks were recognised
+
+| | |
+|---|---|
+| **Severity** | High (most of the structure is invisible) |
+| **Symptom** | The TP-104 STR is a Tekla export: every INSERT sits on layer 0 and is named `Part-116860372-114953 - 114867`.  The families matched on layer and block-name **regexes**, so nothing matched — except the 283 circles inside the `Bolt-` blocks, whose name happens to contain "bolt".  The 1147 `Part-` blocks — the beams, plates and sections — were invisible to the checks. |
+| **Root cause** | A regex over a generated name.  The prefix is the stable part of it; the rest is an id. |
+| **Fix** | **Prefix matchers.**  A family may claim a block by prefix (`block_prefixes`), and a **profile** (`profiles/tp104.json`) says what each prefix means: `geometry` / `annotation` / `grid` / `reference`.  A `Part-` block is read as the **oriented bounding box** of its `LINE`/`CIRCLE`/`ARC` primitives — a CAD export draws a part as lines, never as a closed polyline — and the family follows from the shape of that box: long and thin is a **member**, small is a **plate**, a circle is a **circle section**.  Not every `Part-` is a beam.  `Mark-`/`Text-`/`StraightDimension-`/`SectionMark-`/`GridLine-`/`ReferenceModel-` are never geometry; `Bolt-`/`Connection-` are inventoried as their own families and left unpaired. |
+| **Connected files** | `core/mismatch/policy.py` (`Family.block_prefixes`, the `prefixes` section, `load_profile` / `apply_profile`), `core/mismatch/classify.py` (the prefix rules), `core/mismatch/features.py` (`_obb_feature`), `core/mismatch/__init__.py` (`build_inventory`), `core/package.py` (the report's inventory), `profiles/tp104.json` (new) |
+| **Verification** | `tests/test_tekla_profile.py` — 9 tests: a synthetic Tekla-style STR (layer 0, the same prefixes, LINE-only parts) classifies members / plates / circle sections / bolts; the annotation prefixes never become geometry; the inventory's per-prefix counts sum to the number of INSERTs. |
+| **Status** | **VERIFIED** — scoreboard A6 passes: the STR now contributes `str_member` 194, `str_plate` 935 and `str_bolt` 283, not 283 holes |
+
+---
+
+---
+
+## Part I — the offset check: "these two should line up"
+
+### I1 · nothing compared the two drawings' *positions*
+
+| | |
+|---|---|
+| **Severity** | High (the whole point of the superimposition is unchecked) |
+| **Symptom** | The four existing checks ask "is this bolt in that hole?".  Nothing asked "is this duct edge on the member it should be on?" — the drawing's *geometry* was never compared with the drawing's *geometry*, only item against item. |
+| **Root cause** | There was no check that measured a **distance between two drawings**. |
+| **Fix** | A fifth check, `core/mismatch/checks/offset.py`, driven by **pair rules** (`offset_rules` in the policy and in the profile).  A rule says which layers or families each side contributes, how far apart two items may be, and what that means.  Nothing is compared that no rule pairs.  Three things it refuses: the drawing's own grid control points (a circle on a grid intersection is the alignment, not an object), guessing (two equally good candidates are *ambiguous* and the item stays unpaired), and calling a width difference a position shift (two opposite edges offset by equal and opposite amounts are a width difference, reported with the width). |
+| **Evidence it had to respect** | (a) 11 MECH circles of r≈5 mm sit exactly on the grid intersections — the fit's own control points; excluded from every rule.  (b) No MECH hole has an STR hole within 56 mm, so `hole_centre` would find nothing here; the method is in the schema but is not enabled for TP-104.  (c) The STR members are LINE sets, so `edge_to_edge` compares segments: parallel within 0.5°, perpendicular offset ≤ `search_mm`, projected overlap ≥ max(`min_overlap_mm`, 30% of the shorter edge), nearest partner one-to-one.  (d) Many offsets are symmetric pairs — two MECH edges each ~5.6 mm inside the two STR edges of one member — and are classified `dimension_difference` with the width difference (11.2 mm), not a position shift. |
+| **Connected files** | `core/mismatch/checks/offset.py` (new), `core/mismatch/policy.py` (`OffsetRule`, the `offset_rules` section), `core/mismatch/classify.py`, `core/mismatch/context.py` (the grid labels, for the bay), `core/mismatch/model.py` (`dx_mm`/`dy_mm`/`x`/`y` in the JSON), `core/mismatch/__init__.py` (the inventory and the rule notes), `profiles/tp104.json` (rule R1) |
+| **Verification** | `tests/test_offset_check.py` — 18 tests: the exact offset at 1, 2, 5, 7.5 and 10 mm; an exact match is not reported; the severity bands; a rotated shape; a nested block; repeated identical objects are *ambiguous*, not resolved; the symmetric +5.6/−5.6 pair is a `dimension_difference` with an 11.2 mm width delta; grid-marker circles are never reported; the null test (the MECH drawing shifted a random 300–3000 mm away finds nothing); and that nothing is compared that no rule pairs. |
+| **Status** | **VERIFIED** — scoreboard B2 and B3 pass; on TP-104 rule R1 runs in 3.4 s |
 
 ---
 

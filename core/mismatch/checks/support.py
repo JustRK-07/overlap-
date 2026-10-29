@@ -125,7 +125,7 @@ def run(env: Env) -> list[Finding]:
         if not items:
             continue
         if not bands:
-            env.track("support", len(items), 0)
+            env.track_pair("support", mech_fam, str_fam, len(items), len(bands))
             continue
         index = GridIndex(np.asarray([b.bbox() for b in bands], dtype=float))
         n_matched = 0
@@ -137,7 +137,8 @@ def run(env: Env) -> list[Finding]:
                 got, matched = _rect_support(env, item, bands, index, mech_fam, str_fam)
             n_matched += 1 if matched else 0
             findings += got
-        env.track("support", len(items), n_matched)
+        env.track_pair("support", mech_fam, str_fam, len(items), len(bands),
+                       matched_mech=n_matched)
     return findings
 
 

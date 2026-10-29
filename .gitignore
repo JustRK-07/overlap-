@@ -1,6 +1,8 @@
 # Python
-__pycache__/
+__pycache__/         # any __pycache__ directory
+__pycache__          # ... and a stray file with that name
 *.py[cod]
+*.pyc
 *$py.class
 *.so
 .Python
@@ -20,8 +22,15 @@ env/
 *~
 
 # Runtime — job outputs and uploads
-jobs/[0-9a-f]*/
+jobs/*
 !jobs/.gitkeep
+
+# Big test fixtures — see tests/data/README.md for where they live
+tests/data/*
+!tests/data/README.md
+
+# Local archive of job outputs
+Archive.zip
 
 # Logs
 *.log

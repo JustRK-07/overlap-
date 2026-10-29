@@ -25,7 +25,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from jobs import (create_job, create_job_legacy, load_job, job_dir,
-                  normalize_options, save_job)
+                  normalize_options, save_job, update_status)
 import pipelines
 
 router = APIRouter(prefix="/api/v1/overlay", tags=["overlay"])
@@ -43,14 +43,17 @@ MAX_UPLOAD_MB = 200
 # Job options (PLAN.md step 9)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Five user-facing knobs, all validated here (400 on a bad value) and
+# Four user-facing knobs, all validated here (400 on a bad value) and
 # persisted verbatim in `job.options` (the shape lives in jobs.py —
 # `DEFAULT_OPTIONS` + `normalize_options`). The two readers are:
 #
-#   core.fit.FitOptions.from_job   — flat keys `fit_model` / `allow_weak_fit`
-#                                    (aliases `model` / `force`)
+#   core.fit.FitOptions.from_job   — flat keys `fit_model` / `force`
+#                                    (aliases `model`)
 #   core.overlay.OverlayStyle      — flat keys, or the `options["overlay"]`
 #                                    sub-dict, which wins over the flat ones
+#
+# The units of each drawing are NOT an option: they are resolved from the
+# grid at the axes step and recorded per file in `job.unit_overrides`.
 #
 # See README.md §"Options".
 
@@ -106,11 +109,10 @@ def resolve_options(
     *,
     color_mode: str = "original",
     fit_model: str = "similarity",
-    allow_weak_fit: bool = False,
     str_lineweight=None,
     qa_grid: bool = True,
 ) -> dict:
-    """Validate the five options and return the ``job.options`` shape.
+    """Validate the four options and return the ``job.options`` shape.
 
     Raises ``HTTPException(400)`` with a message naming the offending
     field and listing what is accepted.
@@ -133,7 +135,6 @@ def resolve_options(
     return normalize_options({
         "color_mode": mode,
         "fit_model": model,
-        "allow_weak_fit": _parse_bool(allow_weak_fit, False, field="allow_weak_fit"),
         "str_lineweight": _parse_lineweight(str_lineweight),
         "qa_grid": _parse_bool(qa_grid, True, field="qa_grid"),
     })
@@ -146,6 +147,114 @@ def set_option(job, key: str, value) -> None:
     after the job was created (and can therefore not be a form field).
     """
     job.options = normalize_options({**(job.options or {}), key: value})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Units
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _unit_choices() -> list[str]:
+    from core.units import UNIT_CHOICES
+    return list(UNIT_CHOICES)
+
+
+def resolve_unit_overrides(job_id: str, body: dict) -> dict:
+    """The per-file unit overrides in a request body, keyed by file id.
+
+    The body may key them by **role** (``"mech"`` / ``"str"``) — which is
+    what the browser knows — or by file id.  Roles are resolved to file ids
+    here so that everything downstream speaks one language.
+
+    Raises ``HTTPException(400)`` naming the offending field.
+    """
+    from core.roles import ROLES, resolve_inputs
+    from core.units import UNIT_CHOICES, normalise_unit
+
+    raw = body.get("units")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise HTTPException(
+            400,
+            "units must be an object, e.g. {\"mech\": \"mm\", \"str\": \"mm\"}; "
+            f"got {type(raw).__name__}",
+        )
+
+    by_role: dict[str, str] = {}
+    try:
+        for entry in resolve_inputs(job_id):
+            by_role.setdefault(entry.role, entry.file_id)
+    except Exception:
+        pass
+
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        unit = normalise_unit(value)
+        if not unit:
+            raise HTTPException(
+                400,
+                f"units.{key} must be one of {' | '.join(UNIT_CHOICES)}; "
+                f"got {value!r}",
+            )
+        file_id = key
+        if key in ROLES:
+            file_id = by_role.get(key, key)
+        out[file_id] = unit
+    return out
+
+
+def apply_unit_overrides(job, overrides: dict) -> None:
+    """Record the units on the job and save it."""
+    from jobs import normalize_unit_overrides, save_job
+
+    job.unit_overrides = normalize_unit_overrides(overrides)
+    save_job(job)
+
+
+#: Where the axes step records the two grid spacings it measured.
+UNITS_SIDECAR = "axes/units.json"
+
+
+def _write_units_sidecar(job_id: str, mech_spacing, str_spacing) -> None:
+    """Remember the measured grid spacings so the units can be re-checked.
+
+    The spacings are a property of the *drawings*, not of the answer: they
+    are measured once at the axes step and reused, so confirming the units
+    never re-reads a 15 MB drawing.
+    """
+    from core import fit as fit_mod
+    fit_mod.write_grid_spacings(job_dir(job_id), mech_spacing, str_spacing)
+
+
+def _read_units_sidecar(job_id: str) -> tuple[float | None, float | None]:
+    path = job_dir(job_id) / UNITS_SIDECAR
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None, None
+    return data.get("mech_spacing"), data.get("str_spacing")
+
+
+def _units_decision(job_id: str, *, mech_grid=None, str_grid=None):
+    """The grid-vs-header decision for a job, or ``None`` when it cannot be made.
+
+    A drawing that cannot be read, or a job with no confirmed grid
+    convention yet, simply has no decision to report — the pipeline
+    carries on and the fit's own gates have the last word.
+    """
+    from core import fit as fit_mod
+
+    mech_spacing, str_spacing = _read_units_sidecar(job_id)
+    try:
+        return fit_mod.units_decision(
+            job_id, mech_grid=mech_grid, str_grid=str_grid,
+            mech_spacing=mech_spacing, str_spacing=str_spacing)
+    except Exception:
+        return None
+
+
 
 
 def _safe_upload_name(raw: str | None, fallback: str) -> str:
@@ -173,7 +282,6 @@ async def create_overlay(
     fit_model: str = Form("similarity"),
     # Declared `str`, not `bool`: FastAPI/pydantic would answer 422 for a
     # bad token, and the option contract here is a 400 that names the field.
-    allow_weak_fit: str = Form("false"),
     str_lineweight: str = Form(""),
     qa_grid: str = Form("true"),
 ):
@@ -187,7 +295,6 @@ async def create_overlay(
     options = resolve_options(
         color_mode=color_mode,
         fit_model=fit_model,
-        allow_weak_fit=allow_weak_fit,
         str_lineweight=str_lineweight,
         qa_grid=qa_grid,
     )
@@ -275,7 +382,6 @@ async def upload_n_files(
     axes: str = Form(""),                      # space-separated, e.g. "A B C 1 2 3"
     color_mode: str = Form("original"),
     fit_model: str = Form("similarity"),
-    allow_weak_fit: str = Form("false"),   # str, not bool — see create_overlay
     str_lineweight: str = Form(""),
     qa_grid: str = Form("true"),
 ):
@@ -291,9 +397,8 @@ async def upload_n_files(
       - The legacy `POST ""` endpoint is preserved for the 2-file flow.
       - For now, `prefix`/`axes` are job-level (shared by every pair).
         Per-pair axes can be added later by extending the form fields.
-      - The stage options (`color_mode`, `fit_model`, `allow_weak_fit`,
-        `str_lineweight`, `qa_grid`) are job-level too — every pair runs
-        with them.
+      - The stage options (`color_mode`, `fit_model`, `str_lineweight`,
+        `qa_grid`) are job-level too — every pair runs with them.
     """
     # FastAPI form fields don't accept list[str] — split the comma-
     # separated `roles` string ourselves.
@@ -303,7 +408,6 @@ async def upload_n_files(
     options = resolve_options(
         color_mode=color_mode,
         fit_model=fit_model,
-        allow_weak_fit=allow_weak_fit,
         str_lineweight=str_lineweight,
         qa_grid=qa_grid,
     )
@@ -498,7 +602,7 @@ def _maybe_run_pairs_after_cleaning(
             prefix=prefix,
             axes=list(axes),
             # The job-level options (color_mode / fit_model /
-            # allow_weak_fit / str_lineweight / qa_grid) are job-wide —
+            # str_lineweight / qa_grid) are job-wide —
             # every pair runs with them.
             options=job.options or None,
         )
@@ -573,7 +677,22 @@ async def get_axes(job_id: str):
     policy_path = job_dir(job_id) / "stages" / "clean_policy.json"
     if policy_path.exists():
         payload["clean_policy"] = json.loads(policy_path.read_text())
+
+    # The units each drawing claims, so the UI can pre-fill the selectors.
+    # The conflict itself can only be decided once the grid convention is
+    # known — that is what the POST /axes response carries.
+    try:
+        from core.roles import units_for_pair
+        mech_u, str_u = units_for_pair(job_id)
+        payload["units"] = {
+            "mech": mech_u.to_dict(),
+            "str": str_u.to_dict(),
+            "choices": _unit_choices(),
+        }
+    except Exception:
+        pass
     return JSONResponse(content=payload)
+
 
 
 @router.post("/{job_id}/policy")
@@ -649,13 +768,15 @@ _UNKNOWN_AXIS_STATUS = {
 
 
 def _scan_axes(path: Path, prefix: str, suffixes: list[str]):
-    """(label occurrences, grid verdict per label) for one cleaned drawing.
+    """(label occurrences, grid verdict per label, grid result) for one drawing.
 
     ``found`` is exactly what :func:`core.axes.find_axes` returns — the
     first TEXT/MTEXT/ATTRIB occurrence of ``prefix + suffix`` in world
     coordinates — so the legacy `pairs` deltas keep their meaning.
     ``status`` adds :func:`core.grid.detect_grid`'s verdict for the same
     suffix: which gridline (if any) the label's occurrences voted for.
+    ``result`` is the :class:`core.grid.GridResult` itself — the axes step
+    measures the grid spacing from it to check the drawings' units.
 
     The document is read once. Grid detection is advisory: if it raises
     (an exotic DXF), the label positions still come back and the status
@@ -671,7 +792,7 @@ def _scan_axes(path: Path, prefix: str, suffixes: list[str]):
         status = {s: {**_UNKNOWN_AXIS_STATUS,
                       "reasons": [f"could not read the drawing: {exc}"]}
                   for s in suffixes}
-        return found, status
+        return found, status, None
 
     occs = grid.label_occurrences(doc, prefix, suffixes)
     found = [
@@ -685,7 +806,7 @@ def _scan_axes(path: Path, prefix: str, suffixes: list[str]):
     try:
         result = grid.detect_grid(doc, prefix, suffixes)
     except Exception:                              # noqa: BLE001 — advisory only
-        return found, {s: dict(_UNKNOWN_AXIS_STATUS) for s in suffixes}
+        return found, {s: dict(_UNKNOWN_AXIS_STATUS) for s in suffixes}, None
 
     status = {}
     for sfx in suffixes:
@@ -706,7 +827,7 @@ def _scan_axes(path: Path, prefix: str, suffixes: list[str]):
             "dir": None if ax.dir is None else [ax.dir.x, ax.dir.y],
             "length": ax.length,
         }
-    return found, status
+    return found, status, result
 
 
 @router.post("/{job_id}/axes")
@@ -739,8 +860,8 @@ async def apply_axes(job_id: str, body: dict):
         raise HTTPException(500, str(e))
 
     # Match in each (a = MECH, b = STR) + the per-label grid verdict.
-    found_a, status_a = _scan_axes(mech_path, prefix, axes)
-    found_b, status_b = _scan_axes(str_path, prefix, axes)
+    found_a, status_a, grid_a = _scan_axes(mech_path, prefix, axes)
+    found_b, status_b, grid_b = _scan_axes(str_path, prefix, axes)
 
     # Build paired list (matched by suffix)
     pairs = []
@@ -802,6 +923,31 @@ async def apply_axes(job_id: str, body: dict):
         "problems": problems,
     }
 
+    # ── the units ───────────────────────────────────────────────────────
+    # The grid spacing of each drawing, measured from the grids we have
+    # just detected, is what says what scale the two drawings really
+    # share.  The drawings' own $INSUNITS headers may say otherwise.
+    from core import fit as fit_mod
+    mech_spacing = fit_mod.median_spacing(grid_a) if grid_a is not None else None
+    str_spacing = fit_mod.median_spacing(grid_b) if grid_b is not None else None
+    if mech_spacing is not None and str_spacing is not None:
+        _write_units_sidecar(job_id, mech_spacing, str_spacing)
+
+    # An override in the body answers the question straight away.
+    overrides = resolve_unit_overrides(job_id, body)
+    if overrides:
+        apply_unit_overrides(job, overrides)
+
+    decision = _units_decision(job_id, mech_grid=grid_a, str_grid=grid_b)
+    if decision is not None:
+        result["units"] = decision.to_dict()
+        if decision.conflict:
+            # The job stays at awaiting_axes: the pipeline may not run on a
+            # scale nobody has confirmed.
+            update_status(job_id, state="awaiting_axes", current_step=7,
+                          step_name="Choosing the drawing units",
+                          message=decision.message)
+
     # Persist for fit.py to read
     (job_dir(job_id) / "axes" / "convention.json").write_text(json.dumps(result, indent=2))
     return JSONResponse(content=result)
@@ -813,14 +959,18 @@ async def confirm_axes(job_id: str, request: Request):
 
     Optional JSON body::
 
-        {"force": true}
+        {"force": true, "units": {"mech": "mm", "str": "mm"}}
 
     ``force`` maps to :class:`core.fit.FitOptions`' ``force``, i.e. every
-    fit quality gate (too few inliers, a bad leave-one-out residual, a
-    scale that contradicts ``$INSUNITS``) becomes a warning and the fit
-    is written with ``quality.status == "forced"``. It is the same knob
-    as the upload form's `allow_weak_fit`; because it is also a sensible
-    thing to flip *after* seeing the axes report, it can be set here too.
+    fit quality gate (too few inliers, a bad leave-one-out residual) becomes
+    a warning and the fit is written with ``quality.status == "forced"``.
+    It is a sensible thing to flip *after* seeing the axes report, so it
+    can be set here.
+
+    ``units`` sets the units of each drawing by hand — the answer to the
+    question the axes step asks when the grid spacing and the drawings'
+    ``$INSUNITS`` headers disagree.  The drawings themselves are never
+    modified; the answer is recorded in ``job.json``.
 
     The body is optional — a POST with no body keeps the job's options as
     they were. A non-JSON body is a 400 rather than a silent no-op.
@@ -832,22 +982,40 @@ async def confirm_axes(job_id: str, request: Request):
         raise HTTPException(400, f"Job is in state {job.state!r}, not awaiting_axes")
 
     raw = await request.body()
+    body: dict = {}
     if raw.strip():
         try:
             body = json.loads(raw)
         except json.JSONDecodeError as e:
             raise HTTPException(400, f"body must be JSON: {e}") from None
         if not isinstance(body, dict):
-            raise HTTPException(400, "body must be a JSON object, e.g. {\"force\": true}")
-        if "force" in body:
-            force = _parse_bool(body["force"], False, field="force")
-            # `force` and `allow_weak_fit` are aliases of the same knob in
-            # core.fit; write both so a hand-edited job.json can't have
-            # them disagree (FitOptions takes whichever key it finds
-            # first, which would otherwise be a silent surprise).
-            set_option(job, "force", force)
-            set_option(job, "allow_weak_fit", force)
-            save_job(job)
+            raise HTTPException(
+                400,
+                "body must be a JSON object, e.g. {\"force\": true} or "
+                "{\"units\": {\"mech\": \"mm\", \"str\": \"mm\"}}")
+    if "force" in body:
+        force = _parse_bool(body["force"], False, field="force")
+        set_option(job, "force", force)
+        save_job(job)
+
+    # ── the units ───────────────────────────────────────────────────────
+    # Set them first: the answer changes the reading of the headers, and
+    # the check below is what decides whether the pipeline may resume.
+    overrides = resolve_unit_overrides(job_id, body)
+    if overrides:
+        apply_unit_overrides(job, overrides)
+
+    decision = _units_decision(job_id)
+    if decision is not None and decision.conflict:
+        # The two readings still disagree: the job stays exactly where it
+        # is, and the user is told what to decide.
+        update_status(job_id, state="awaiting_axes", current_step=7,
+                      step_name="Choosing the drawing units",
+                      message=decision.message)
+        raise HTTPException(
+            409,
+            decision.message,
+        )
 
     # Spawn worker for stages 6-9
     threading.Thread(
@@ -856,6 +1024,7 @@ async def confirm_axes(job_id: str, request: Request):
         daemon=True,
     ).start()
     return {"status": "resuming", "options": job.options}
+
 
 
 @router.get("/{job_id}/download")
@@ -1056,41 +1225,57 @@ async def list_findings(
                 400, f"bbox must be four numbers; got {bbox!r}")
 
     # ── filter ────────────────────────────────────────────────────────
-    items = list(payload.get("findings") or [])
-    if severities:
-        items = [f for f in items if f.get("severity") in severities]
-    if kind:
-        items = [f for f in items if f.get("kind") == kind]
-    if origin_filter and origin_filter != "all":
-        items = [f for f in items if f.get("origin") == origin_filter]
-    if min_magnitude_mm is not None:
-        items = [f for f in items
-                 if (f.get("magnitude_mm") or 0.0) >= float(min_magnitude_mm)]
-    if box:
-        x0, y0, x1, y1 = box
-        def _inside(f):
-            loc = f.get("location") or []
-            if len(loc) != 2:
-                return False
-            return (min(x0, x1) <= loc[0] <= max(x0, x1)
-                    and min(y0, y1) <= loc[1] <= max(y0, y1))
-        items = [f for f in items if _inside(f)]
+    def _filtered(rows):
+        out = list(rows or [])
+        if severities:
+            out = [f for f in out if f.get("severity") in severities]
+        if kind:
+            out = [f for f in out if f.get("kind") == kind]
+        if origin_filter and origin_filter != "all":
+            out = [f for f in out if f.get("origin") == origin_filter]
+        if min_magnitude_mm is not None:
+            out = [f for f in out
+                   if (f.get("magnitude_mm") or 0.0) >= float(min_magnitude_mm)]
+        if box:
+            x0, y0, x1, y1 = box
+            def _inside(f):
+                loc = f.get("location") or []
+                if len(loc) != 2:
+                    return False
+                return (min(x0, x1) <= loc[0] <= max(x0, x1)
+                        and min(y0, y1) <= loc[1] <= max(y0, y1))
+            out = [f for f in out if _inside(f)]
+        return out
+
+    # The cross-drawing (MECH vs STR) findings and the intra-drawing ones
+    # are two different things and are served as two lists.  The *status*
+    # is the cross-drawing check's alone.
+    items = _filtered(payload.get("findings"))
+    others = _filtered(payload.get("other_warnings"))
 
     total = len(items)
     page = items[offset:offset + limit]
+    other_page = others[offset:offset + limit]
 
     return {
         "job_id": job_id,
         "pair_id": pair_id,
         "status": payload.get("status", "unknown"),
+        "reason": payload.get("reason", ""),
         "units": payload.get("units") or {},
         # the summary is UNFILTERED — it describes the whole run
         "summary": payload.get("summary") or {},
         "coverage": payload.get("coverage") or {},
+        "family_coverage": payload.get("family_coverage") or {},
         "warnings": list(payload.get("warnings") or []),
         "total": total,
         "returned": len(page),
         "items": page,
+        # the intra-drawing findings: a separate list, with its own count
+        "other_warnings": other_page,
+        "other_warnings_count": int(payload.get("other_warnings_count") or 0),
+        "other_warnings_total": len(others),
+        "other_warnings_returned": len(other_page),
     }
 
 
@@ -1117,6 +1302,17 @@ async def findings_docx(job_id: str, pair_id: str | None = None):
         media_type=("application/vnd.openxmlformats-officedocument"
                     ".wordprocessingml.document"),
     )
+
+
+@router.get("/{job_id}/findings.json")
+async def findings_json(job_id: str, pair_id: str | None = None):
+    """The findings report as JSON — the file the UI's button downloads."""
+    root = _findings_root(job_id, pair_id)
+    path = root / "findings.json"
+    if not path.exists():
+        raise HTTPException(404, f"No findings.json yet: {path}")
+    return FileResponse(str(path), filename="findings.json",
+                        media_type="application/json")
 
 
 @router.get("/{job_id}/findings/{fid}")

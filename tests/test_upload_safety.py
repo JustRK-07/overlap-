@@ -33,15 +33,6 @@ def fx_client(fx_isolated_jobs):
     return TestClient(fastapi_app)
 
 
-@pytest.fixture
-def fx_no_worker(monkeypatch):
-    """Stop the pipeline worker from touching the job."""
-    import pipelines
-    monkeypatch.setattr(pipelines, "resume_after_axes", lambda *a, **k: None)
-    monkeypatch.setattr(pipelines, "run_pipeline", lambda *a, **k: None)
-    return True
-
-
 def _fake_dxf() -> BytesIO:
     buf = BytesIO(b"\x00" * 64)
     buf.name = "x.dxf"

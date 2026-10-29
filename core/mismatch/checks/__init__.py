@@ -135,7 +135,7 @@ def overlap(lo1, hi1, lo2, hi2) -> float:
 
 @dataclass
 class Env:
-    """Everything a check needs, plus the coverage counter it fills in."""
+    """Everything a check needs, plus the coverage counters it fills in."""
 
     policy: MismatchPolicy
     mm: float                                       # mm per drawing unit
@@ -145,6 +145,22 @@ class Env:
     fit: object | None = None                       # FitContext | None
     grid_spacing_mm: float | None = None            # median MECH grid spacing
     coverage: dict = field(default_factory=dict)
+    #: Per-family counts: ``{family: {extracted, eligible, matched, unmatched}}``.
+    family_coverage: dict = field(default_factory=dict)
+    #: How many rule legs had items on **both** sides — the number the
+    #: status is decided on.
+    covered_pairs: int = 0
+    #: How many rule legs the policy has.
+    total_pairs: int = 0
+    #: What each offset rule found — pairs, ambiguous and unmatched counts.
+    rule_notes: dict = field(default_factory=dict)
+    #: The two drawings and the matrices they are read through — an offset
+    #: rule may select by **layer**, and a layer is a property of the
+    #: drawing, not of the classified features.
+    mech_doc: object = None
+    str_doc: object = None
+    mech_root: object = None
+    str_root: object = None
 
     def __post_init__(self) -> None:
         self.mm = float(self.mm) or 1.0
@@ -152,6 +168,13 @@ class Env:
         self.str_by_family = self.str.by_family()
         self.coverage = {name: {"items": 0, "matched": 0, "unmatched": 0}
                          for name in CHECKS}
+        self.family_coverage = {}
+        for fam, items in list(self.mech_by_family.items()) + \
+                list(self.str_by_family.items()):
+            c = self.family_coverage.setdefault(
+                fam, {"extracted": 0, "eligible": 0, "matched": 0,
+                      "unmatched": 0})
+            c["extracted"] += len(items)
 
     # ── units ────────────────────────────────────────────────────────
     def u(self, mm_value) -> float:
@@ -187,3 +210,35 @@ class Env:
         c["items"] += int(items)
         c["matched"] += int(matched)
         c["unmatched"] += int(items) - int(matched)
+    def track_pair(self, check: str, mech_fam: str, str_fam: str,
+                   n_mech: int, n_str: int,
+                   matched_mech: int = 0, matched_str: int | None = None) -> None:
+        """One rule leg: ``mech_fam`` items against ``str_fam`` items.
+
+        A leg with an **empty side** was never really checked — the two
+        drawings had nothing to compare — so its items are *extracted* but
+        not *eligible*, and the leg does not count towards the coverage the
+        status is decided on.  That distinction is the whole point: a rule
+        that never compared anything must not be able to report ``passed``.
+
+        ``matched_mech`` / ``matched_str`` are how many items of each side
+        found a counterpart.  They default to the same number, which is
+        right for every rule that pairs one item with one item.
+        """
+        n_mech = int(n_mech or 0)
+        n_str = int(n_str or 0)
+        matched_mech = int(matched_mech or 0)
+        matched_str = (matched_mech if matched_str is None
+                       else int(matched_str or 0))
+        covered = bool(n_mech) and bool(n_str)
+        if covered:
+            self.covered_pairs += 1
+        for fam, n, matched in ((mech_fam, n_mech, matched_mech),
+                                (str_fam, n_str, matched_str)):
+            c = self.family_coverage.setdefault(
+                fam, {"extracted": 0, "eligible": 0, "matched": 0,
+                      "unmatched": 0})
+            if covered:
+                c["eligible"] += n
+                c["matched"] += matched
+        self.track(check, n_mech, matched_mech)

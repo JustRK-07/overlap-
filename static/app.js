@@ -37,6 +37,13 @@
     axesResults: $("axes-results"),
     axesSummary: $("axes-summary"),
     confirmAxesBtn: $("confirm-axes-btn"),
+    // Drawing units — set by hand when the grid spacing and the drawings'
+    // $INSUNITS headers disagree.
+    unitsBlock: $("units-block"),
+    unitsMessage: $("units-message"),
+    mechUnits: $("mech-units"),
+    strUnits: $("str-units"),
+    applyUnitsBtn: $("apply-units-btn"),
     // Advanced policy panel
     policyPanel: $("policy-panel"),
     policyLabelRegex: $("policy-label-regex"),
@@ -58,7 +65,6 @@
     multiUploadStatus: $("multi-upload-status"),
     // Step 9 — stage options (shared by the legacy and N-file forms)
     fitModel: $("fit-model"),
-    allowWeakFit: $("allow-weak-fit"),
     strLineweight: $("str-lineweight"),
     qaGrid: $("qa-grid"),
     doneSection: $("done-section"),
@@ -111,6 +117,8 @@
   let fileA = null;
   let fileB = null;
   let chosenAxes = null;     // {prefix, axes, a_found, b_found, all_matched}
+  let unitsTouched = false;  // true once the user has chosen the units
+
 
   // ─────────────────────────────────────────────────────────────────────
   // Upload UI: drag/drop + click-to-browse
@@ -168,7 +176,6 @@
     const lineweight = els.strLineweight ? els.strLineweight.value.trim() : "";
     fd.append("color_mode", colorMode);
     fd.append("fit_model", els.fitModel ? els.fitModel.value : "similarity");
-    fd.append("allow_weak_fit", String(!!(els.allowWeakFit && els.allowWeakFit.checked)));
     fd.append("str_lineweight", lineweight);       // "" = as drawn
     fd.append("qa_grid", String(!(els.qaGrid && !els.qaGrid.checked)));
   }
@@ -386,7 +393,7 @@
       const r = await fetch(`${API}/${jobId}/axes`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prefix, axes }),
+        body: JSON.stringify({ prefix, axes, units: currentUnits() }),
       });
       if (!r.ok) {
         const j = await r.json().catch(() => ({}));
@@ -398,6 +405,56 @@
       els.axesSummary.innerHTML = `<p class="error">Scan failed: ${_esc(e.message)}</p>`;
     }
   }
+
+  // The units the user has chosen, or null when they have not touched them.
+  // Sending `null` matters: an untouched select must not be recorded as a
+  // deliberate override of the drawing's own header.
+  function currentUnits() {
+    if (!unitsTouched || !els.mechUnits || !els.strUnits) return null;
+    return { mech: els.mechUnits.value, str: els.strUnits.value };
+  }
+
+  // The units block: shown when the grid spacing and the drawings'
+  // $INSUNITS headers disagree, and whenever a unit has been set by hand.
+  function renderUnits(u) {
+    if (!u || !els.unitsBlock) return;
+    const conflict = !!u.conflict;
+    els.unitsBlock.classList.remove("hidden");
+    const mech = u.mech || {};
+    const str = u.str || {};
+    const suggestion = u.suggestion || {};
+    let msg = "";
+    if (conflict) {
+      msg = u.message || "The two drawings' units need to be confirmed.";
+      if (suggestion.mech) {
+        msg += ` Suggested: ${suggestion.message}.`;
+      }
+    } else {
+      msg = `Using ${mech.units || "?"} for the MECH drawing and ${str.units || "?"} for the STR drawing.`;
+      if (mech.header_units && mech.header_units !== mech.units) {
+        msg += ` (the MECH header says ${mech.header_units} — overridden by hand)`;
+      }
+      if (str.header_units && str.header_units !== str.units) {
+        msg += ` (the STR header says ${str.header_units} — overridden by hand)`;
+      }
+      msg += ".";
+    }
+    els.unitsMessage.innerHTML = conflict
+      ? `<span class="error">${_esc(msg)}</span>`
+      : `<span class="muted">${_esc(msg)}</span>`;
+    if (mech.units && els.mechUnits) els.mechUnits.value = mech.units;
+    if (str.units && els.strUnits) els.strUnits.value = str.units;
+  }
+
+  if (els.applyUnitsBtn) {
+    els.applyUnitsBtn.addEventListener("click", () => {
+      unitsTouched = true;
+      applyConvention();
+    });
+  }
+  [els.mechUnits, els.strUnits].forEach((sel) => {
+    if (sel) sel.addEventListener("change", () => { unitsTouched = true; });
+  });
 
   function renderAxesResult(j) {
     chosenAxes = j;
@@ -436,7 +493,13 @@
           ${j.problems.map(p => `<code>${_esc(p.suffix)}</code> (${_esc(p.source)}: ${_esc(p.status)})`).join(", ")}.
           The fit only uses the axes that resolved in both drawings.</p>` : ""}
     `;
-    if (j.all_matched) {
+
+    if (j.units) renderUnits(j.units);
+
+    // The pipeline may not run on a scale nobody has confirmed: the units
+    // have to be settled first.
+    const unitsOk = !(j.units && j.units.conflict);
+    if (j.all_matched && unitsOk) {
       els.confirmAxesBtn.classList.remove("hidden");
     } else {
       els.confirmAxesBtn.classList.add("hidden");
@@ -451,11 +514,21 @@
       if (els.policySaveBtn) {
         await savePolicy();
       }
-      await fetch(`${API}/${jobId}/axes/confirm`, { method: "POST" });
+      const r = await fetch(`${API}/${jobId}/axes/confirm`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ units: currentUnits() }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
       els.axesSection.classList.add("hidden");
     } catch (e) {
       els.confirmAxesBtn.disabled = false;
       els.confirmAxesBtn.textContent = "Continue →";
+      els.axesSummary.innerHTML =
+        `<p class="error">Could not continue: ${_esc(e.message)}</p>`;
     }
   });
 
@@ -693,25 +766,46 @@
         return;
       }
       const body = await r.json();
-      findingsCache = body.items || [];
+      // The table shows both kinds; the banner counts them apart.
+      findingsCache = (body.items || []).concat(body.other_warnings || []);
       findingsOffset = 0;
 
-      // the coverage banner — a family with 0 items was NOT checked
+      // the status banner — what the check actually concluded, and why.
+      // "passed" means the drawings really were compared and agreed; any
+      // other status says what stopped that.
+      const status = body.status || "unknown";
+      const reason = body.reason || "";
+      // The headline is the CROSS-DRAWING (MECH vs STR) check alone.  The
+      // intra-drawing findings are a separate list with their own count and
+      // never change the headline.
+      const otherCount = body.other_warnings_count || 0;
+      const statusMsg = status === "passed"
+        ? `<span class="findings-ok">✓ the two drawings were compared and agree</span>`
+        : `<span class="findings-warn"> ⚠ the MECH vs STR check was ${_esc(status)}</span>` +
+          (reason ? `<span class="muted"> — ${_esc(reason)}</span>` : "") +
+          (otherCount
+            ? `<span class="muted"> · ${otherCount} other warning(s) (intra-drawing)</span>`
+            : "");
+
+      // the coverage banner — a family that HAS items but had nothing to
+      // compare them with was not really checked.  A family with no items
+      // at all is simply absent from that drawing, which is not a warning.
+      const fam = body.family_coverage || {};
+      const zeros = Object.entries(fam)
+        .filter(([, c]) => (c.extracted || 0) > 0 && (c.eligible || 0) === 0)
+        .map(([name, c]) => `${name} (${c.extracted})`);
+      const parts = Object.entries(fam).map(
+        ([name, c]) => `${name} ${c.matched || 0}/${c.eligible || 0}`);
       const cov = body.coverage || {};
-      const zeros = Object.entries(cov)
-        .filter(([, c]) => (c.items || 0) === 0)
-        .map(([name]) => name);
-      const parts = Object.entries(cov).map(
+      const checkParts = Object.entries(cov).map(
         ([name, c]) => `${name} ${c.matched || 0}/${c.items || 0}`);
       els.findingsCoverage.innerHTML =
-        (parts.length ? `<span class="muted">checked: ${_esc(parts.join(" · "))}</span>` : "") +
+        statusMsg +
+        (parts.length ? `<span class="muted"> · compared: ${_esc(parts.join(" · "))}</span>` : "") +
+        (checkParts.length ? `<span class="muted"> · checked: ${_esc(checkParts.join(" · "))}</span>` : "") +
         (zeros.length
-          ? `<span class="findings-warn"> ⚠ ${_esc(zeros.join(", "))} matched no items — not checked</span>`
+          ? `<span class="findings-warn"> ⚠ ${_esc(zeros.join(", "))} had items but nothing to compare them with — not checked</span>`
           : "");
-      if (body.status !== "ok") {
-        els.findingsCoverage.innerHTML +=
-          `<span class="findings-warn"> ⚠ the mismatch check was ${_esc(body.status)}</span>`;
-      }
 
       // the kind filter
       const kinds = [...new Set(findingsCache.map((f) => f.kind))].sort();
@@ -720,11 +814,13 @@
         kinds.map((k) => `<option value="${_esc(k)}">${_esc(k)}</option>`).join("");
 
       const bySev = body.summary?.by_severity || {};
+      const others = body.other_warnings_count || 0;
       els.findingsSummary.textContent =
-        `${body.total} finding(s)` +
+        `${body.total} MECH-vs-STR finding(s)` +
         (bySev.CRITICAL ? ` · ${bySev.CRITICAL} critical` : "") +
         (bySev.WARNING ? ` · ${bySev.WARNING} warning` : "") +
-        (bySev.INFO ? ` · ${bySev.INFO} info` : "");
+        (bySev.INFO ? ` · ${bySev.INFO} info` : "") +
+        (others ? ` · ${others} other warning(s) (intra-drawing)` : "");
 
       // the preview + the world → pixel map (for the click-to-locate ring)
       await loadFindingsPreview();

@@ -292,8 +292,19 @@ def test_fit_stage_hard_pair(fit_job):
     assert t["mirrored"] is False
     assert t["quality"]["status"] == "ok"
     assert t["outliers"] == []
-    assert t["units"] == {"mech": STR_UNITS_MM, "str": STR_UNITS_M,
-                          "expected_scale": 1000.0}
+    assert t["units"]["mech"] == STR_UNITS_MM
+    assert t["units"]["str"] == STR_UNITS_M
+    assert t["units"]["expected_scale"] == 1000.0
+    # The units are recorded in full: what the header said, what was
+    # chosen, and why.
+    assert t["units"]["mech_units"] == "mm"
+    assert t["units"]["str_units"] == "m"
+    assert t["units"]["mech_header_units"] == "mm"
+    assert t["units"]["str_header_units"] == "m"
+    assert t["units"]["mech_source"] == "header"
+    assert t["units"]["str_source"] == "header"
+    assert t["units"]["mech_reason"]
+    assert t["units"]["mm_per_unit"] == 1.0
 
     aff = Affine2D.from_json(t)
     extent = t["median_spacing"] * 4

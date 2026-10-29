@@ -35,7 +35,12 @@ __all__ = [
     "Classifier",
     "normalize_layer",
     "LAYER_PREFIXES",
+    "RULE_CLAIMED",
 ]
+
+#: The pseudo-family an entity gets when an offset rule — but no family —
+#: claims it.  It keeps the entity alive through the layer prefilter.
+RULE_CLAIMED = "\x00rule"
 
 #: Display prefixes the overlay writes in front of a layer name.  They carry
 #: no meaning for matching and are stripped before a regex ever sees the
@@ -57,7 +62,8 @@ def normalize_layer(name) -> str:
 class Classifier:
     """Compiled view of a :class:`~core.mismatch.policy.MismatchPolicy`."""
 
-    __slots__ = ("policy", "_by_src", "_rules", "_cand_cache", "_srcs")
+    __slots__ = ("policy", "_by_src", "_rules", "_cand_cache", "_srcs",
+                 "_prefixes")
 
     def __init__(self, policy: MismatchPolicy | None = None) -> None:
         self.policy = policy if policy is not None else DEFAULT_POLICY
@@ -69,6 +75,55 @@ class Classifier:
             self._by_src[src] = tuple(f for f in fams if f.src == src)
         self._srcs = tuple(sorted(self._by_src))
         self._cand_cache: dict[tuple[str, tuple[str, ...]], frozenset] = {}
+        # The prefix rules, longest prefix first so "Part-" wins over "P".
+        self._prefixes: tuple[tuple[str, dict], ...] = tuple(sorted(
+            (self.policy.prefixes or {}).items(),
+            key=lambda kv: -len(kv[0])))
+
+    # ── the prefix rules ────────────────────────────────────────────
+    def prefix_rule(self, blocks: Iterable[str] | None):
+        """The rule for the first block name that has one, or ``None``.
+
+        The rules are keyed by the *prefix* of a block name: a Tekla
+        export names its blocks ``Part-116860372-114953 - 114867``, and
+        the prefix is the stable part of that.
+        """
+        for name in (blocks or ()):
+            low = str(name).lower()
+            for prefix, rule in self._prefixes:
+                if low.startswith(prefix.lower()):
+                    return rule
+        return None
+
+    def is_annotation(self, blocks: Iterable[str] | None) -> bool:
+        """Is this block annotation, grid or reference — never geometry?"""
+        rule = self.prefix_rule(blocks)
+        return bool(rule) and rule.get("kind") in ("annotation", "grid", "reference")
+
+    def rule_selects(self, source: str, layer: str, blocks: Iterable[str] | None) -> bool:
+        """Does an offset rule select this geometry?
+
+        A rule may select by layer or by family.  The family is not known
+        before the feature is classified, so this is the *layer* half —
+        it is what keeps a piece of geometry that no family recognises (a
+        rectangle on a layer nothing claims) alive for the rules that
+        name its layer.
+        """
+        for rule in getattr(self.policy, "offset_rules", ()) or ():
+            sel = rule.mech_selector if source == "MECH" else rule.str_selector
+            layers = [str(s).upper() for s in (sel.get("layers") or ())]
+            if not layers:
+                continue
+            if "*" in layers or str(layer or "").upper() in layers:
+                return True
+        return False
+
+    def obb_rule(self, blocks: Iterable[str] | None):
+        """The rule if this block's geometry is read as a bounding box."""
+        rule = self.prefix_rule(blocks)
+        if not rule or rule.get("shape") != "obb":
+            return None
+        return rule
 
     # ── lookups ────────────────────────────────────────────────────
     def sources(self) -> tuple[str, ...]:
@@ -136,6 +191,7 @@ class Classifier:
         chain, modelspace first) is tried against each block regex.  An
         empty result means *nothing in the policy can ever claim this
         entity* and the caller should skip it without reading geometry.
+
         """
         key = (normalize_layer(layer), tuple(blocks or ()))
         hit = self._cand_cache.get(key)
@@ -145,11 +201,19 @@ class Classifier:
             for fam, lre, bre in self._rules:
                 if lre is not None and lre.search(ln):
                     names.append(fam.name)
-                elif bre is not None:
+                    continue
+                if bre is not None:
                     for b in key[1]:
                         if bre.search(b):
                             names.append(fam.name)
                             break
+                    else:
+                        # a CAD export names its blocks "<prefix><id>";
+                        # the prefix is the stable part.
+                        for b in key[1]:
+                            if fam.claims_prefix(b):
+                                names.append(fam.name)
+                                break
             hit = frozenset(names)
             self._cand_cache[key] = hit
         return hit
@@ -162,6 +226,15 @@ class Classifier:
                layer, blocks: Iterable[str] | None = None,
                candidates: frozenset | None = None) -> tuple[str, ...]:
         """Every family of ``source`` that claims this feature, in policy order."""
+        # A prefix rule is **authoritative**: it says what this block is,
+        # so a CAD export's "Bolt-" is a bolt even when the default
+        # block regexes would call it a hole.
+        rule = self.prefix_rule(blocks)
+        if rule and rule.get("family"):
+            fam = self.family(rule["family"])
+            if fam is not None and fam.src == source \
+                    and fam.has_feature(feature_type) and fam.size_ok(size_mm or {}):
+                return (fam.name,)
         cands = self.candidates(layer, blocks) if candidates is None else candidates
         if not cands:
             return ()

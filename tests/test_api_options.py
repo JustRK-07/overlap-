@@ -2,16 +2,20 @@
 """test_api_options.py — PLAN.md step 9: job.options, the preview routes
 and the pair-artifact whitelist.
 
-Five knobs reach the pipeline through `job.options`:
+Four knobs reach the pipeline through `job.options`:
 
     color_mode  ∈ {original, contrast}   default original
     fit_model   ∈ {similarity, affine}   default similarity
-    allow_weak_fit  bool                 default false  → FitOptions.force
     str_lineweight  int (1/100 mm) or "" default unset
     qa_grid     bool                    default true
 
 Both upload endpoints accept them, `POST /{id}/axes/confirm` can flip
 `force` after the fact, and a bad value is a 400 that never creates a job.
+
+`allow_weak_fit` is **gone**: the units question is answered explicitly
+(a per-file unit override recorded in `job.json`), so there is no blanket
+"accept a bad fit" escape hatch at upload time.  `force` still exists on
+`POST /{id}/axes/confirm` for the other quality gates.
 """
 from __future__ import annotations
 
@@ -42,20 +46,6 @@ def fx_client(fx_isolated_jobs):
     `jobs.job_dir`, so the monkeypatch still applies.
     """
     return TestClient(fastapi_app)
-
-
-@pytest.fixture
-def fx_no_worker(monkeypatch):
-    """Stop the pipeline workers from touching the job.
-
-    Otherwise the background thread races the assertions: it does its own
-    load_job → save_job and rewrites job.json (and the job's `state`)
-    between the POST and the check.
-    """
-    import pipelines
-    monkeypatch.setattr(pipelines, "resume_after_axes", lambda *a, **k: None)
-    monkeypatch.setattr(pipelines, "run_pipeline", lambda *a, **k: None)
-    return True
 
 
 def _fake_file(name: str, nbytes: int = 256) -> BytesIO:
@@ -95,7 +85,6 @@ def test_options_persisted_legacy_upload(fx_client, fx_isolated_jobs, fx_no_work
         fx_client,
         color_mode="contrast",
         fit_model="affine",
-        allow_weak_fit="true",
         str_lineweight="50",
         qa_grid="false",
     )
@@ -106,7 +95,6 @@ def test_options_persisted_legacy_upload(fx_client, fx_isolated_jobs, fx_no_work
     # The response echoes the resolved options.
     assert opts["color_mode"] == "contrast"
     assert opts["fit_model"] == "affine"
-    assert opts["allow_weak_fit"] is True
     assert opts["str_lineweight"] == 50
     assert opts["qa_grid"] is False
 
@@ -114,7 +102,6 @@ def test_options_persisted_legacy_upload(fx_client, fx_isolated_jobs, fx_no_work
     stored = load_job(body["job_id"]).options
     assert stored["color_mode"] == "contrast"
     assert stored["fit_model"] == "affine"
-    assert stored["allow_weak_fit"] is True
     assert stored["str_lineweight"] == 50
     assert stored["qa_grid"] is False
 
@@ -130,7 +117,6 @@ def test_options_defaults_legacy_upload(fx_client, fx_no_worker):
     opts = r.json()["options"]
     assert opts["color_mode"] == "original"
     assert opts["fit_model"] == "similarity"
-    assert opts["allow_weak_fit"] is False
     assert opts["str_lineweight"] is None
     assert opts["qa_grid"] is True
     for key, val in DEFAULT_OPTIONS.items():
@@ -144,7 +130,7 @@ def test_options_shape_matches_stage_readers(fx_client, fx_no_worker):
     reads either the flat keys or the `overlay` sub-dict. Both must
     describe the same run.
     """
-    r = _upload2(fx_client, color_mode="contrast", allow_weak_fit="true",
+    r = _upload2(fx_client, color_mode="contrast",
                  str_lineweight="35", qa_grid="false")
     job = load_job(r.json()["job_id"])
 
@@ -154,13 +140,13 @@ def test_options_shape_matches_stage_readers(fx_client, fx_no_worker):
     fit = FitOptions.from_job(job)
     style = OverlayStyle.from_job(job)
     assert fit.model == "similarity"
-    assert fit.force is True
+    assert fit.force is False          # `force` is set at /axes/confirm
     assert style.color_mode == "contrast"
     assert style.str_lineweight == 35
     assert style.qa_grid is False
 
     # And the derived namespaces say the same thing.
-    assert job.options["fit"] == {"model": "similarity", "force": True}
+    assert job.options["fit"] == {"model": "similarity", "force": False}
     assert job.options["overlay"]["color_mode"] == "contrast"
 
 
@@ -170,7 +156,6 @@ def test_n_file_upload_options_persisted(fx_client, fx_isolated_jobs, fx_no_work
         fx_client,
         color_mode="contrast",
         fit_model="similarity",
-        allow_weak_fit="true",
         str_lineweight="70",
         qa_grid="false",
         prefix="TP104-",
@@ -184,7 +169,6 @@ def test_n_file_upload_options_persisted(fx_client, fx_isolated_jobs, fx_no_work
     stored = load_job(body["job_id"]).options
     assert stored["color_mode"] == "contrast"
     assert stored["fit_model"] == "similarity"
-    assert stored["allow_weak_fit"] is True
     assert stored["str_lineweight"] == 70
     assert stored["qa_grid"] is False
 
@@ -201,7 +185,8 @@ def test_bad_color_mode_400(fx_client, fx_isolated_jobs, value, fx_no_worker):
     assert "color_mode" in detail
     assert "contrast" in detail and "original" in detail
     # Nothing was created for a rejected request.
-    assert not list(fx_isolated_jobs.iterdir())
+    assert not list(fx_isolated_jobs.iterdir()), (
+        f"a rejected request left {list(fx_isolated_jobs.iterdir())} behind")
 
 
 def test_blank_color_mode_uses_the_default(fx_client, fx_no_worker):
@@ -230,11 +215,12 @@ def test_enum_values_are_case_and_space_insensitive(fx_client, pair, fx_no_worke
     assert r.json()["options"]["fit_model"] == fit_model.strip().lower()
 
 
-@pytest.mark.parametrize("value", ["maybe", "2.5", "tru"])
-def test_bad_allow_weak_fit_400(fx_client, value, fx_no_worker):
+@pytest.mark.parametrize("value", ["maybe", "2.5", "tru", "true"])
+def test_allow_weak_fit_is_no_longer_an_option(fx_client, value, fx_no_worker):
+    """`allow_weak_fit` is gone — the form field is simply ignored."""
     r = _upload2(fx_client, allow_weak_fit=value)
-    assert r.status_code == 400, r.text
-    assert "allow_weak_fit" in r.json()["detail"]
+    assert r.status_code == 200, r.text
+    assert "allow_weak_fit" not in r.json()["options"]
 
 
 @pytest.mark.parametrize("value", ["sometimes", "3"])
@@ -245,7 +231,6 @@ def test_bad_qa_grid_400(fx_client, value, fx_no_worker):
 
 
 @pytest.mark.parametrize("field, value", [
-    ("allow_weak_fit", "1"), ("allow_weak_fit", "yes"), ("allow_weak_fit", "OFF"),
     ("qa_grid", "false"), ("qa_grid", "no"), ("qa_grid", "0"),
 ])
 def test_bool_tokens_accepted(fx_client, field, value, fx_no_worker):
@@ -282,7 +267,7 @@ def test_bad_color_mode_400_on_n_file_upload(fx_client, fx_no_worker):
 
 def test_confirm_with_force_sets_option(fx_client, fx_isolated_jobs, fx_no_worker):
     """POST /axes/confirm {"force": true} → FitOptions.force for this run."""
-    r = _upload2(fx_client, allow_weak_fit="false")
+    r = _upload2(fx_client)
     job_id = r.json()["job_id"]
 
     job = load_job(job_id)
@@ -297,9 +282,6 @@ def test_confirm_with_force_sets_option(fx_client, fx_isolated_jobs, fx_no_worke
     from core.fit import FitOptions
     opts = load_job(job_id).options
     assert opts["force"] is True
-    # `allow_weak_fit` is the upload-time alias of the same knob — both
-    # are written so they can't disagree.
-    assert opts["allow_weak_fit"] is True
     assert opts["fit"]["force"] is True
     assert FitOptions.from_job(load_job(job_id)).force is True
 

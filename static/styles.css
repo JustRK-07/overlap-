@@ -478,6 +478,10 @@ button:disabled {
   color: #b91c1c;
   font-weight: 600;
 }
+.findings-ok {
+  color: #15803d;
+  font-weight: 600;
+}
 .findings-preview-wrap {
   position: relative;
   overflow: hidden;

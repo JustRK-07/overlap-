@@ -49,10 +49,8 @@ def mm_per_unit(doc) -> float:
         code = 0
     if code <= 0:
         return 1.0
-    try:
-        factor = float(ezdxf.units.conversion_factor(code, 4))  # 4 == mm
-    except Exception:
-        return 1.0
+    from .units import mm_per_unit_of_code
+    factor = mm_per_unit_of_code(code)
     if not (factor > 0.0) or factor != factor:      # not finite / NaN
         return 1.0
     return factor

@@ -1039,12 +1039,194 @@ def _rect_from_loop(lst, path, ring, ctx: _Ctx) -> Feature | None:
 
 # ── the walk ────────────────────────────────────────────────────────────────
 
+def _obb_points(items: list) -> tuple[list, list, float]:
+    """The local points, candidate angles and the largest circle radius.
+
+    Only ``LINE``, ``CIRCLE`` and ``ARC`` count — a CAD export draws its
+    parts as lines, and a polyline in the same block is a different thing
+    (a closed outline), not part of the box.
+    """
+    pts: list[tuple[float, float]] = []
+    angles: list[float] = [0.0]
+    r_max = 0.0
+    for it in items:
+        e = it.entity
+        t = e.dxftype()
+        try:
+            if t == "LINE":
+                a = (float(e.dxf.start.x), float(e.dxf.start.y))
+                b = (float(e.dxf.end.x), float(e.dxf.end.y))
+                pts.append(a)
+                pts.append(b)
+                ang = math.atan2(b[1] - a[1], b[0] - a[0])
+                angles.append(ang)
+            elif t == "CIRCLE":
+                c = (float(e.dxf.center.x), float(e.dxf.center.y))
+                r = float(e.dxf.radius)
+                pts.append((c[0] - r, c[1] - r))
+                pts.append((c[0] + r, c[1] + r))
+                r_max = max(r_max, r)
+            elif t == "ARC":
+                c = (float(e.dxf.center.x), float(e.dxf.center.y))
+                r = float(e.dxf.radius)
+                pts.append((c[0] - r, c[1] - r))
+                pts.append((c[0] + r, c[1] + r))
+                r_max = max(r_max, r)
+        except Exception:
+            continue
+    return pts, angles, r_max
+
+
+def _oriented_box(pts: list, angles: list):
+    """The minimum-area rectangle over the candidate orientations.
+
+    ``(centre, u, long, short)`` in the block's own coordinates.
+    """
+    if not pts:
+        return None
+    best = None
+    for ang in angles:
+        c, s = math.cos(ang), math.sin(ang)
+        us = [c * x + s * y for x, y in pts]
+        vs = [-s * x + c * y for x, y in pts]
+        u0, u1 = min(us), max(us)
+        v0, v1 = min(vs), max(vs)
+        w, h = u1 - u0, v1 - v0
+        area = w * h
+        if best is None or area < best[0] - 1e-12:
+            cu = 0.5 * (u0 + u1)
+            cv = 0.5 * (v0 + v1)
+            # back to the block's own frame
+            cx = c * cu - s * cv
+            cy = s * cu + c * cv
+            ux, uy = c, s
+            best = (area, (cx, cy), (ux, uy), w, h)
+    if best is None:
+        return None
+    _area, centre, u, w, h = best
+    return centre, u, w, h
+
+
+def _rule_matches(rule: dict, long_mm: float, short_mm: float,
+                  round_shape: bool) -> bool:
+    """Does a shape rule accept this box?"""
+    aspect = (long_mm / short_mm) if short_mm > 1e-9 else float("inf")
+    if "min_aspect" in rule and aspect < float(rule["min_aspect"]):
+        return False
+    if "max_aspect" in rule and aspect > float(rule["max_aspect"]):
+        return False
+    if "min_long_mm" in rule and long_mm < float(rule["min_long_mm"]):
+        return False
+    if "max_long_mm" in rule and long_mm > float(rule["max_long_mm"]):
+        return False
+    if "round" in rule and bool(rule["round"]) != bool(round_shape):
+        return False
+    return True
+
+
+def _obb_feature(items: list, ctx: _Ctx, rule: dict):
+    """One feature for a block, read as the oriented box of its primitives."""
+    it0 = items[0]
+    clf = ctx.clf
+    chain = it0.chain
+    pts, angles, r_max = _obb_points(items)
+    if not pts:
+        ctx.fs.skip("obb_empty")
+        return None
+    box = _oriented_box(pts, angles)
+    if box is None:
+        return None
+    centre, u, w, h = box
+    long_mm = max(w, h) * ctx.mm
+    short_mm = min(w, h) * ctx.mm
+    round_shape = bool(r_max) and abs(2.0 * r_max * ctx.mm - short_mm) <=         0.25 * max(short_mm, 1e-9)
+
+    # Which family does this shape belong to?  The rules are tried in
+    # order; the last one without conditions is the fallback.
+    family = None
+    for r in (rule.get("rules") or ()):
+        if _rule_matches(r, long_mm, short_mm, round_shape):
+            family = r.get("family")
+            break
+    if not family:
+        ctx.fs.skip("obb_unmatched")
+        return None
+    fam = clf.family(family)
+    if fam is None:
+        ctx.fs.skip("obb_unknown_family")
+        return None
+
+    # Map the box into world space: the centre through the INSERT's
+    # matrix, the box's own axis rotated with it.
+    m = it0.m
+    wc = m.transform((centre[0], centre[1], 0.0))
+    ax = m.transform((centre[0] + u[0], centre[1] + u[1], 0.0))
+    wux = ax[0] - wc[0]
+    wuy = ax[1] - wc[1]
+    norm = math.hypot(wux, wuy) or 1.0
+    wux, wuy = wux / norm, wuy / norm
+    scale = math.hypot(m[0, 0], m[1, 0]) or 1.0
+
+    handles = tuple(getattr(it0, "handles", ()) or ())
+    feat = Feature(kind="rect", source=ctx.source,
+                   handle=handles[-1] if handles else "",
+                   insert_chain=chain, block=chain[-1] if chain else "",
+                   root_block=chain[0] if chain else "",
+                   layer=it0.inherited_layer or "0", own_layer=None,
+                   cx=float(wc[0]), cy=float(wc[1]), ux=wux, uy=wuy,
+                   w=float(w * scale), h=float(h * scale),
+                   size_mm={"w": float(long_mm), "h": float(short_mm)})
+
+    if "band" in fam.features:
+        # A member is a band: a centreline with a half-width.
+        half = 0.5 * float(short_mm) * scale
+        length = float(long_mm) * scale
+        feat.kind = "band"
+        feat.ux, feat.uy = wux, wuy
+        feat.a = (float(wc[0]) - 0.5 * length * wux,
+                  float(wc[1]) - 0.5 * length * wuy)
+        feat.b = (float(wc[0]) + 0.5 * length * wux,
+                  float(wc[1]) + 0.5 * length * wuy)
+        feat.hw = half
+        feat.size_mm = {"len": length}
+    elif "circle" in fam.features:
+        feat.kind = "circle"
+        feat.r = float(r_max) * scale
+        feat.size_mm = {"r": float(r_max) * ctx.mm}
+    else:
+        feat.size_mm = {"w": float(long_mm), "h": float(short_mm)}
+
+    feat.families = (family,)
+    if not fam.size_ok(feat.size_mm):
+        feat.families = ()
+        ctx.fs.skip("obb_size")
+        return None
+    return feat
+
+
 def _emit_group(doc, items: list, ctx: _Ctx) -> None:
     """Extract and map one block instance (a run of identical WorldItems)."""
     it0 = items[0]
     clf = ctx.clf
     chain = it0.chain
     block_name = chain[-1] if chain else ""
+
+    # ── a block whose geometry is read as a bounding box ─────────────
+    # A CAD export draws a part as a set of lines, not as a polyline, so
+    # the per-entity extraction sees loose segments and never a shape.
+    # The profile says so: read the block as the oriented bounding box of
+    # its primitives.
+    obb_rule = clf.obb_rule(chain)
+    if obb_rule is not None:
+        feat = _obb_feature(items, ctx, obb_rule)
+        if feat is not None:
+            ctx.fs.features.append(feat)
+        return
+
+    # ── annotation, grid and reference blocks are never geometry ────
+    if clf.is_annotation(chain):
+        ctx.fs.skip("annotation")
+        return
 
     # 1 — layer prefilter, one dict lookup per entity
     survivors = []
@@ -1114,23 +1296,31 @@ def _handle_of(e) -> str:
 
 # ── public API ──────────────────────────────────────────────────────────────
 
-def mm_per_unit_of(doc) -> tuple[float, bool]:
-    """``(mm_per_unit, assumed)`` from ``$INSUNITS`` (PLAN_MISMATCH key 2).
+def mm_per_unit_of(doc, unit=None) -> tuple[float, bool]:
+    """``(mm_per_unit, assumed)`` for a document (PLAN_MISMATCH key 2).
 
-    ``$INSUNITS == 0`` (unitless) is assumed to be millimetres and the flag
-    is raised so the caller can warn ``units_assumed_mm``.
+    ``unit`` is the units the drawing is *known* to be in — the user's
+    override.  When it is given it wins over the header, because the
+    header is exactly the thing an override exists to correct.  The
+    drawing itself is never modified.
+
+    With no override, ``$INSUNITS`` is read from the header.
+    ``$INSUNITS == 0`` (unitless) is assumed to be millimetres and the
+    flag is raised so the caller can warn ``units_assumed_mm``.
     """
+    if unit is not None:
+        from .. import units as units_mod
+        name = units_mod.normalise_unit(unit)
+        if name:
+            return units_mod.MM_PER_UNIT[name], False
     try:
         code = int(doc.header.get("$INSUNITS", 0))
     except Exception:
         code = 0
     if code == 0:
         return 1.0, True
-    try:
-        import ezdxf
-        f = float(ezdxf.units.conversion_factor(code, 4))   # 4 == millimetres
-    except Exception:
-        return 1.0, True
+    from .. import units as units_mod
+    f = units_mod.mm_per_unit_of_code(code)
     if not math.isfinite(f) or f <= 0.0:
         return 1.0, True
     return f, False
@@ -1192,6 +1382,8 @@ def extract(doc, *, source: str, policy: MismatchPolicy | None = None,
     # A segment only ever survives extraction to become part of a band; if
     # it never found a partner and was too short to be a member on its own,
     # it is not a feature of any family and must not reach the checks.
+    # A feature with no family is normally dropped — nothing can use it.
+    # An offset rule may still select it by its layer, so it stays.
     fs.features = [f for f in fs.features if f.families]
     fs.features.sort(key=Feature.sort_key)
     return fs

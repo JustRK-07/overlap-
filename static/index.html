@@ -74,12 +74,6 @@
               </select>
             </label>
           </div>
-          <label class="check">
-            <input type="checkbox" name="allow_weak_fit" id="allow-weak-fit">
-            <span>Allow weak fit <span class="muted">— accept the transform even when the quality
-              gates complain (too few inliers, a bad leave-one-out residual, a scale that
-              contradicts $INSUNITS). The result is marked <code>forced</code>.</span></span>
-          </label>
         </div>
 
         <div class="checks-group">
@@ -227,6 +221,40 @@
       <div id="axes-results" class="hidden">
         <h3>Results</h3>
         <div id="axes-summary"></div>
+
+        <!-- Units — shown when the grid spacing and the drawings' $INSUNITS
+             headers disagree, and always available so a header can be
+             corrected by hand. -->
+        <div id="units-block" class="hidden" style="margin-top: 0.8em;">
+          <h3>Drawing units</h3>
+          <p id="units-message" class="muted"></p>
+          <div class="form-row" style="margin: 6px 0 0;">
+            <label>MECH drawing units:
+              <select id="mech-units" class="select-base">
+                <option value="mm">mm</option>
+                <option value="cm">cm</option>
+                <option value="m">m</option>
+                <option value="in">in</option>
+                <option value="ft">ft</option>
+              </select>
+            </label>
+            <label>STR drawing units:
+              <select id="str-units" class="select-base">
+                <option value="mm">mm</option>
+                <option value="cm">cm</option>
+                <option value="m">m</option>
+                <option value="in">in</option>
+                <option value="ft">ft</option>
+              </select>
+            </label>
+            <button id="apply-units-btn" type="button">Use these units</button>
+          </div>
+          <p class="muted" style="margin-top: 0.5em;">
+            The drawings themselves are never modified — the units you choose are
+            recorded with the job.
+          </p>
+        </div>
+
         <button id="confirm-axes-btn" type="button" class="primary hidden">Continue →</button>
       </div>
 

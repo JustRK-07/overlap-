@@ -91,6 +91,9 @@ class FitContext:
     k_fit: float = 3.0
     mm_per_unit: float = 1.0
     outliers: tuple = ()
+    #: The label of every correspondence ("A-1"), in the same order as
+    #: :attr:`points` — so a finding can say which grid bay it is in.
+    labels: tuple = ()
 
     # ── construction ────────────────────────────────────────────────
     @classmethod
@@ -112,7 +115,7 @@ class FitContext:
             t = getattr(t, "__dict__", None) or {}
         mm = float(mm_per_unit) or 1.0
 
-        pts, loo = [], []
+        pts, loo, labels = [], [], []
         for c in t.get("correspondences") or ():
             if not isinstance(c, dict) or not c.get("inlier", True):
                 continue
@@ -126,6 +129,7 @@ class FitContext:
                 continue
             pts.append((float(m[0]), float(m[1])))
             loo.append(abs(float(r)) * mm)          # already MECH drawing units
+            labels.append(str(c.get("label") or ""))
         quality = t.get("quality") or {}
         return cls(
             points=np.asarray(pts, dtype=float).reshape(-1, 2),
@@ -137,6 +141,7 @@ class FitContext:
             k_fit=float(k_fit),
             mm_per_unit=mm,
             outliers=tuple(str(o) for o in (t.get("outliers") or ())),
+            labels=tuple(labels),
         )
 
     # ── the uncertainty field ───────────────────────────────────────

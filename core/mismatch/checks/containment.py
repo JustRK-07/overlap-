@@ -87,7 +87,8 @@ def run(env: Env) -> list[Finding]:
         outlines = [f for f in env.str_by_family.get(str_fam, ())
                     if f.kind in ("rect", "polygon")]
         if not foots or not outlines:
-            env.track("containment", len(foots), 0)
+            env.track_pair("containment", mech_fam, str_fam, len(foots),
+                           len(outlines))
             continue
         index = GridIndex(np.asarray([o.bbox() for o in outlines], dtype=float))
         n_matched = 0
@@ -96,7 +97,8 @@ def run(env: Env) -> list[Finding]:
             got, matched = _footprint(env, foot, outlines, index, mech_fam, str_fam)
             n_matched += 1 if matched else 0
             findings += got
-        env.track("containment", len(foots), n_matched)
+        env.track_pair("containment", mech_fam, str_fam, len(foots),
+                       len(outlines), matched_mech=n_matched)
     return findings
 
 

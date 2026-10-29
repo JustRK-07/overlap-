@@ -23,6 +23,8 @@ from pathlib import Path
 
 from jobs import job_dir, load_job
 
+from . import units
+
 ROLES = ("mech", "str", "other")
 MANIFEST_NAME = "files.json"
 
@@ -178,6 +180,92 @@ def first_of_each(entries: list[FileEntry]) -> tuple[FileEntry | None, FileEntry
     """(first mech, first str) in manifest order (upload order, not name order)."""
     mech = next((e for e in entries if e.role == "mech"), None)
     strc = next((e for e in entries if e.role == "str"), None)
+    return mech, strc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Units
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _header_insunits(d: Path, entry: FileEntry) -> int | None:
+    """The ``$INSUNITS`` of one file: the manifest's, else the file's own header.
+
+    The manifest records it at clean time, so this is normally a dict
+    lookup.  The file is only opened for a job whose manifest predates
+    that (or was hand-written).
+    """
+    if entry.insunits is not None:
+        try:
+            return int(entry.insunits)
+        except (TypeError, ValueError):
+            return None
+    for rel in (entry.cleaned, entry.converted):
+        p = d / rel
+        if not p.exists():
+            continue
+        try:
+            from .dxfio import read_internal
+            doc = read_internal(str(p))
+            return int(doc.header.get("$INSUNITS", 0) or 0)
+        except Exception:
+            continue
+    return None
+
+
+def effective_units(job_id: str) -> dict[str, units.FileUnits]:
+    """The units of every file of the job.
+
+    The user's override wins over the ``$INSUNITS`` header — that is the
+    whole point of the override.  Nothing here writes to a drawing: the
+    answer lives in ``job.json`` and every stage reads it from there.
+    """
+    job = load_job(job_id)
+    overrides = dict(getattr(job, "unit_overrides", None) or {}) if job else {}
+    d = job_dir(job_id)
+    out: dict[str, units.FileUnits] = {}
+    try:
+        entries = resolve_inputs(job_id)
+    except Exception:
+        entries = []
+    for entry in entries:
+        code = _header_insunits(d, entry)
+        header_name = units.unit_name(code) if code else None
+        override = units.normalise_unit(overrides.get(entry.file_id))
+        chosen = override or header_name or "mm"
+        if override:
+            source = "override"
+            reason = (f"the drawing's $INSUNITS header says "
+                      f"{header_name or 'nothing'} but the units were set to "
+                      f"{override} by hand")
+        else:
+            source = "header"
+            reason = (f"the drawing's $INSUNITS header says {header_name}"
+                      if header_name else
+                      "the drawing declares no units; millimetres were assumed")
+        out[entry.file_id] = units.FileUnits(
+            file_id=entry.file_id,
+            role=entry.role,
+            name=chosen,
+            header_code=code,
+            header_name=header_name,
+            override=override,
+            source=source,
+            reason=reason,
+        )
+    return out
+
+
+def units_for_pair(job_id: str) -> tuple[units.FileUnits, units.FileUnits]:
+    """(mech, str) effective units for the job's first MECH / first STR."""
+    per_file = effective_units(job_id)
+    entries = resolve_inputs(job_id)
+    mech_e, str_e = first_of_each(entries)
+    mech = per_file.get(mech_e.file_id) if mech_e else None
+    strc = per_file.get(str_e.file_id) if str_e else None
+    if mech is None:
+        mech = units.FileUnits(role="mech")
+    if strc is None:
+        strc = units.FileUnits(role="str")
     return mech, strc
 
 

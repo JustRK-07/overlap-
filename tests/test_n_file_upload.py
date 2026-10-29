@@ -144,7 +144,7 @@ def test_upload_rejects_too_many_files(fx_client):
     assert "16" in r.json()["detail"]
 
 
-def test_upload_accepts_two_files_creates_one_pair(fx_client):
+def test_upload_accepts_two_files_creates_one_pair(fx_client, fx_no_worker):
     """Happy path: 2 files (mech+str) → 1 pair queued."""
     files = [
         ("files", ("mech.dxf", _fake_file("mech.dxf"), "application/dxf")),
@@ -165,7 +165,7 @@ def test_upload_accepts_two_files_creates_one_pair(fx_client):
     assert body["pairs"][0]["status"] == "queued"
 
 
-def test_upload_three_files_creates_cross_product(fx_client):
+def test_upload_three_files_creates_cross_product(fx_client, fx_no_worker):
     """3 files (1 MECH + 2 STR) → 2 pairs."""
     files = [
         ("files", ("m.dxf",  _fake_file("m.dxf"),  "application/dxf")),
@@ -183,7 +183,7 @@ def test_upload_three_files_creates_cross_product(fx_client):
     assert body["pair_count"] == 2
 
 
-def test_upload_other_files_included_in_pair_count(fx_client):
+def test_upload_other_files_included_in_pair_count(fx_client, fx_no_worker):
     """`other`-role files are uploaded but don't form pairs."""
     files = [
         ("files", ("m.dxf",  _fake_file("m.dxf"),  "application/dxf")),

@@ -74,7 +74,7 @@ def test_the_stage_writes_the_diagnostic_json(fx_synth_job):
     path = d / "stages" / "mismatch.json"
     assert path.exists(), "the stage must write stages/mismatch.json"
     payload = json.loads(path.read_text())
-    assert payload["status"] == "ok"
+    assert payload["status"] == "discrepancies_found"
     assert payload["source_docs"] == "converted"
     assert payload["policy_hash"]
     assert payload["units"]["mm_per_unit"] == 1.0
@@ -95,12 +95,12 @@ def test_the_stage_is_not_fatal(fx_synth_job, monkeypatch):
     mismatch_mod.run(job_id)          # must NOT raise
 
     findings = json.loads((d / "out" / "findings.json").read_text())
-    assert findings["status"] == "error"
+    assert findings["status"] == "failed"
     assert "detector exploded" in findings["message"]
     assert findings["findings"] == [], "an error must not look like zero findings"
 
     diag = json.loads((d / "stages" / "mismatch.json").read_text())
-    assert diag["status"] == "error"
+    assert diag["status"] == "failed"
 
 
 def test_a_disabled_policy_says_disabled_not_zero(fx_synth_job):
@@ -204,7 +204,7 @@ def test_the_findings_are_written(fx_synth_job):
     assert (out / "findings.docx").exists()
 
     payload = json.loads((out / "findings.json").read_text())
-    assert payload["status"] == "ok"
+    assert payload["status"] == "discrepancies_found"
     assert "summary" in payload and "coverage" in payload
     assert payload["generated_at"]
 
@@ -228,7 +228,7 @@ def test_the_report_carries_a_mismatch_section(fx_synth_job):
                 "features", "coverage", "summary", "systematic",
                 "fit_context", "top", "warnings", "timings_s", "truncated"):
         assert key in section, f"report['mismatch'] is missing {key}"
-    assert section["status"] == "ok"
+    assert section["status"] == "discrepancies_found"
 
 
 def test_the_spotcheck_json_has_a_superseded_key(fx_synth_job):
@@ -272,7 +272,7 @@ def test_the_pipeline_runs_the_mismatch_and_findings_stages(fx_synth_job):
     assert (d / "out" / "findings.csv").exists()
 
     report = json.loads((d / "out" / "report.json").read_text())
-    assert report["mismatch"]["status"] == "ok"
+    assert report["mismatch"]["status"] == "discrepancies_found"
     assert report["mismatch"]["summary"]["total"] >= 1
 
 
@@ -299,4 +299,4 @@ def test_a_failed_mismatch_stage_does_not_fail_the_job(fx_synth_job,
     job = load_job(job_id)
     assert job.state == "done", job.error
     findings = json.loads((d / "out" / "findings.json").read_text())
-    assert findings["status"] == "error"
+    assert findings["status"] == "failed"

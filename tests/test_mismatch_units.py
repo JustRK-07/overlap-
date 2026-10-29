@@ -391,10 +391,11 @@ def test_summary_and_message_templates():
     fs = [_finding("CLASH", "CRITICAL"), _finding("CLASH", "INFO"),
           _finding(kind="NOPE", severity="INFO")]
     s = M.summarize(fs)
-    assert s["total"] == 3 and s["by_severity"] == {"CRITICAL": 1, "WARNING": 0, "INFO": 2}
+    assert s["total"] == 3 and s["by_severity"] == {"CRITICAL": 1, "WARNING": 0,
+                                                       "INFO": 2, "REVIEW": 0}
     assert s["by_kind"] == {"CLASH": 2, "NOPE": 1}
     assert set(M.KINDS) >= {"CLASH", "MISSING_HOLE", "SYSTEMATIC_OFFSET"}
-    assert M.SEVERITIES == ("CRITICAL", "WARNING", "INFO")
+    assert M.SEVERITIES == ("CRITICAL", "WARNING", "INFO", "REVIEW")
     msg = M.format_message("BOLT_HOLE_OFFSET", mech_block="B", mech_index=3,
                            magnitude=6.0, tolerance=1.5, str_block="P")
     assert "6.0 mm" in msg and "1.5 mm" in msg and "{n_bolts}" not in msg

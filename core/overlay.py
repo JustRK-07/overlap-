@@ -109,6 +109,7 @@ class OverlayReport:
     import_method: str = "xref"
     warnings: list[str] = field(default_factory=list)
     layers: "LayerReport | None" = None      # filled by apply_source_layers
+    units: dict = field(default_factory=dict)  # the units each drawing is in
 
     @property
     def dropped(self) -> int:
@@ -143,6 +144,7 @@ class OverlayReport:
             "warnings": list(self.warnings),
             "style": (self.layers.style if self.layers else None),
             "source_layers": (self.layers.to_dict() if self.layers else None),
+            "units": dict(self.units),
         }
 
 
@@ -977,6 +979,85 @@ def draw_qa_grid(doc, transform_json, grid_mech, grid_str, *, spacing=None) -> d
     }
 
 
+def _stamp_output_header(doc, job_id: str, report=None) -> None:
+    """Write the *resolved* units and the real extents into the header.
+
+    The MECH drawing's own ``$INSUNITS`` header is not necessarily right:
+    the TP-104 MECH claims **inches** and is drawn in **millimetres**.
+    The pipeline already trusts the grid over that header — the fit is
+    solved on the grid's intersections, the unit prior is checked against
+    the grid-derived scale, and the units the user confirms are recorded
+    per file — but the exported drawing was still carrying the MECH's raw
+    header, so a CAD program opening it would have scaled the whole
+    drawing by 25.4.
+
+    Nothing is rescaled: the geometry keeps the coordinates it was drawn
+    with.  Only the **declaration** changes, to the units the geometry is
+    actually in.
+
+    The extents are recomputed as well.  The header's came from the MECH
+    drawing before the STR was mapped into it, and they did not even
+    bound the MECH's own geometry.
+
+    Both the HEADER variables *and* the modelspace layout variables are
+    written.  ezdxf recomputes ``$EXTMIN``/``$EXTMAX``/``$LIMMIN``/
+    ``$LIMMAX`` from the layout's own ``dxf.extmin``/``dxf.extmax``/
+    ``dxf.limmin``/``dxf.limmax`` every time the document is written
+    (``Drawing.update_all``), so setting the HEADER alone is not enough:
+    the save overwrites it with the layout's sentinel ``1e+20`` and the
+    exported drawing ends up declaring that it has no extents at all.
+
+    Call this *after* the last geometry has been drawn — the QA grid
+    counts towards the extents.
+    """
+    from core.units import UNIT_CODES
+
+    def _warn(message: str) -> None:
+        if report is not None:
+            report.warnings.append(message)
+
+    try:
+        from core.roles import units_for_pair
+        mech_u, _str_u = units_for_pair(job_id)
+    except Exception as exc:            # noqa: BLE001 — advisory only
+        _warn(f"the output header was not stamped with the resolved units: {exc}")
+        return
+    code = UNIT_CODES.get(mech_u.name)
+    if not code:
+        _warn(f"the resolved unit {mech_u.name!r} has no DXF unit code — "
+              "the output header was left alone")
+        return
+    header = doc.header
+    header["$INSUNITS"] = code
+    # 1 = metric, 0 = imperial — the unit decides it, not the source file.
+    header["$MEASUREMENT"] = 1 if mech_u.name in ("mm", "cm", "m") else 0
+
+    try:
+        from ezdxf import bbox
+        ext = bbox.extents(doc.modelspace(), fast=True)
+    except Exception as exc:                # noqa: BLE001 — advisory only
+        _warn(f"the output extents were not stamped: {exc}")
+        return
+    if not ext.has_data:
+        _warn("the output extents were not stamped — the modelspace has no "
+              "geometry to measure")
+        return
+
+    extmin = (ext.extmin.x, ext.extmin.y, ext.extmin.z)
+    extmax = (ext.extmax.x, ext.extmax.y, ext.extmax.z)
+    header["$EXTMIN"] = extmin
+    header["$EXTMAX"] = extmax
+    header["$LIMMIN"] = extmin
+    header["$LIMMAX"] = extmax
+
+    # The layout variables are what ezdxf writes the HEADER from.
+    msp = doc.modelspace()
+    msp.dxf.extmin = extmin
+    msp.dxf.extmax = extmax
+    msp.dxf.limmin = extmin
+    msp.dxf.limmax = extmax
+
+
 def run(job_id: str, *, pair_dir: Path | None = None,
         options: OverlayOptions | None = None,
         style: OverlayStyle | None = None) -> None:
@@ -1009,6 +1090,18 @@ def run(job_id: str, *, pair_dir: Path | None = None,
     report = overlay_docs(mech_doc, _read_internal(str(str_path)), affine,
                           options=options)
 
+    # The units each drawing was interpreted in.  The overlay itself is
+    # unit-agnostic — everything it draws is in MECH drawing units — but
+    # the audit trail has to say what those units *are*, because a reader
+    # of the delivered drawing needs to know.
+    try:
+        from core.roles import units_for_pair
+        mech_u, str_u = units_for_pair(job_id)
+        report.units = {"mech": mech_u.to_dict(), "str": str_u.to_dict()}
+    except Exception as exc:            # noqa: BLE001 — advisory only
+        report.warnings.append(
+            f"the drawing units were not recorded in the overlay report: {exc}")
+
     style = style or OverlayStyle.from_job(load_job(job_id))
     report.layers = apply_source_layers(mech_doc, report, style)
 
@@ -1022,6 +1115,11 @@ def run(job_id: str, *, pair_dir: Path | None = None,
                 "qa_grid was requested but grid_mech.json / grid_str.json are "
                 "missing (no fit stage output for this pair) — no QA geometry "
                 "was drawn")
+
+    # The exported drawing must declare the units it is **actually** in, and
+    # the extents that bound the geometry that is **actually** exported —
+    # so this runs after the QA grid has been drawn.
+    _stamp_output_header(mech_doc, job_id, report)
 
     out_dir = root / "out"
     out_dir.mkdir(exist_ok=True)

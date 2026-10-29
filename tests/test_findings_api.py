@@ -63,6 +63,17 @@ def fx_findings_job(fx_synth_job):
 
 # ── the list ───────────────────────────────────────────────────────────────
 
+def test_the_findings_json_is_downloadable(fx_client, fx_findings_job):
+    """The UI's "Findings JSON" button must have a route to download."""
+    job_id, _d = fx_findings_job
+    r = fx_client.get(f"/api/v1/overlay/{job_id}/findings.json")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("application/json")
+    body = r.json()
+    assert body["status"]
+    assert "findings" in body
+
+
 def test_the_findings_list(fx_client, fx_findings_job):
     """The envelope the plan specifies."""
     job_id, _d = fx_findings_job
@@ -72,7 +83,7 @@ def test_the_findings_list(fx_client, fx_findings_job):
     for key in ("job_id", "pair_id", "status", "units", "summary",
                 "coverage", "warnings", "total", "returned", "items"):
         assert key in body, f"the response is missing {key}"
-    assert body["status"] == "ok"
+    assert body["status"] == "discrepancies_found"
     assert body["total"] == len(body["items"])
     assert body["total"] >= 1
     # the summary is UNFILTERED
@@ -231,7 +242,7 @@ def test_the_mismatch_can_be_re_run(fx_client, fx_findings_job):
     assert r.json()["status"] == "rerun"
 
     after = json.loads((d / "stages" / "mismatch.json").read_text())
-    assert after["status"] == "ok"
+    assert after["status"] == "discrepancies_found"
     assert len(after["findings"]) == len(before["findings"])
 
 

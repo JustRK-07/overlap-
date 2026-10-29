@@ -913,6 +913,65 @@ def _fit_section(transform: dict | None) -> dict:
     }
 
 
+def _units_section(job_id: str, transform: dict | None, root: Path) -> dict:
+    """The units of each drawing: the header, the choice, and the reason.
+
+    ``transform.json`` carries what the fit decided; the ``axes/units.json``
+    sidecar carries the grid spacing the axes step measured.  Together
+    they answer the three questions a reader of the report has: what the
+    drawings *claimed*, what was *used*, and *why*.
+    """
+    units = dict((transform or {}).get("units") or {})
+    sidecar = _load_json(root / "axes" / "units.json") or {}
+    mech_spacing = sidecar.get("mech_spacing")
+    str_spacing = sidecar.get("str_spacing")
+    grid_scale = None
+    try:
+        if mech_spacing and str_spacing:
+            grid_scale = float(mech_spacing) / float(str_spacing)
+    except (TypeError, ValueError, ZeroDivisionError):
+        grid_scale = None
+
+    def _file(prefix: str) -> dict:
+        return {
+            "header_insunits": units.get(f"{prefix}_header"),
+            "header_units": units.get(f"{prefix}_header_units"),
+            "units": units.get(f"{prefix}_units"),
+            "source": units.get(f"{prefix}_source"),
+            "reason": units.get(f"{prefix}_reason"),
+        }
+
+    mech = _file("mech")
+    strc = _file("str")
+    overridden = [side for f, side in ((mech, "mech"), (strc, "str"))
+                  if f.get("source") == "override"]
+    if overridden:
+        reason = ("the units of "
+                  + " and ".join(overridden)
+                  + " were set by hand")
+    elif grid_scale is not None and units.get("expected_scale") is not None:
+        try:
+            rel = abs(grid_scale / float(units["expected_scale"]) - 1.0)
+        except (TypeError, ValueError, ZeroDivisionError):
+            rel = None
+        reason = ("the grid spacing and the drawings' $INSUNITS headers agree"
+                  if rel is not None and rel <= 0.02 else
+                  "the grid spacing and the drawings' $INSUNITS headers "
+                  "disagree")
+    else:
+        reason = "the drawings' $INSUNITS headers were used"
+
+    return {
+        "mech": mech,
+        "str": strc,
+        "grid_spacing": {"mech": mech_spacing, "str": str_spacing},
+        "grid_scale": grid_scale,
+        "expected_scale": units.get("expected_scale"),
+        "mm_per_unit": units.get("mm_per_unit"),
+        "reason": reason,
+    }
+
+
 def _overlay_section(payload: dict | None) -> dict:
     """What stage 7 did, without the multi-thousand-entry handle lists."""
     if not payload:
@@ -920,7 +979,7 @@ def _overlay_section(payload: dict | None) -> dict:
     keep = ("failures", "renamed_resources", "dropped", "exploded",
             "import_method", "mech_entities", "str_entities_imported",
             "str_entities_total", "by_type_str", "warnings", "qa_grid",
-            "style", "source_layers")
+            "style", "source_layers", "units")
     return {k: payload[k] for k in keep if k in payload}
 
 
@@ -941,11 +1000,18 @@ def _mismatch_section(payload: dict | None) -> dict:
     return {
         "enabled": bool(payload.get("enabled", policy.get("enabled", True))),
         "status": payload.get("status", "unknown"),
+        "reason": str(payload.get("reason") or ""),
         "policy_hash": payload.get("policy_hash"),
         "units": payload.get("units") or {},
         "source_docs": payload.get("source_docs"),
         "features": payload.get("features") or {},
         "coverage": payload.get("coverage") or {},
+        "family_coverage": payload.get("family_coverage") or {},
+        # the offset rules: what each found, and the clusters
+        "offset_rules": payload.get("offset_rules") or {},
+        "offset_clusters": payload.get("offset_clusters") or [],
+        # what each drawing contained, and what became geometry
+        "inventory": payload.get("inventory") or {},
         "summary": summary,
         "systematic": systematic,
         "fit_context": payload.get("fit_context") or {},
@@ -1013,6 +1079,8 @@ def _build_report(job_id: str, dxf_path: Path, *, root: Path | None = None,
         }
         report["fit"] = _fit_section(transform)
 
+    report["units"] = _units_section(job_id, transform, d)
+
     overlay_report = _load_json(d / "stages" / overlay.REPORT_NAME)
     if overlay_report is not None:
         report["overlay"] = _overlay_section(overlay_report)
@@ -1023,6 +1091,39 @@ def _build_report(job_id: str, dxf_path: Path, *, root: Path | None = None,
 
     report["roles"] = _manifest_section(job_id)
     report["counts"] = counts if counts is not None else _empty_counts()
+
+    # ── the two statuses, side by side ────────────────────────────────
+    # The *overlay's* status (did the superimposition happen?) and the
+    # *mismatch check's* status (what did the comparison conclude?) are
+    # different things and are kept apart — a drawing can be perfectly
+    # superimposed while the check compared nothing.
+    overlay_section = report.get("overlay") or {}
+    dropped = int(overlay_section.get("dropped") or 0)
+    if not overlay_section:
+        overlay_status = "failed"          # the overlay stage produced nothing
+    elif dropped:
+        overlay_status = "degraded"        # it wrote the drawing, but dropped
+    else:
+        overlay_status = "ok"
+    mismatch_section = report.get("mismatch") or {}
+    # The intra-drawing findings live in the *findings* payload — the
+    # mismatch stage only knows about the cross-drawing check.
+    findings_payload = _load_json(d / "out" / "findings.json") or {}
+    other_warnings = int(findings_payload.get("other_warnings_count") or 0)
+    parts = []
+    if overlay_status != "ok":
+        parts.append(f"the overlay was {overlay_status}")
+    if mismatch_section.get("reason"):
+        parts.append(str(mismatch_section["reason"]))
+    report["status"] = {
+        "overlay": overlay_status,
+        # the CROSS-DRAWING check's status, and nothing else's
+        "mismatch": mismatch_section.get("status", "unknown"),
+        # the intra-drawing findings — a separate count, never part of the
+        # headline above
+        "other_warnings": other_warnings,
+        "reason": " — ".join(parts),
+    }
 
     preview = preview or {}
     report["extents"] = preview.get("extents", {})

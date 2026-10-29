@@ -38,6 +38,33 @@ def fx_isolated_jobs(monkeypatch, tmp_path):
     return tmp_path
 
 
+@pytest.fixture
+def fx_no_worker(monkeypatch):
+    """Stop every pipeline worker from outliving the test.
+
+    An upload spawns a background thread that runs the pipeline.  A test
+    that does not wait for it leaves that thread running, and by the time
+    the *next* test starts ``jobs.JOBS_DIR`` points at that test's tmp
+    directory — so the leaked worker creates a job directory in it and
+    breaks the next test's "a rejected request creates nothing"
+    assertion.  It is intermittent, and it gets worse the slower the
+    pipeline is (the real TP-104 drawings).
+
+    Every entry point a worker can reach is patched, not just the first
+    one: the 2-file upload runs ``pipelines.run_pipeline``, the N-file
+    upload also runs the pair pipeline, and confirming the axes runs
+    ``pipelines.resume_after_axes``.
+    """
+    import pipelines
+    import routers.api as api_mod
+
+    monkeypatch.setattr(pipelines, "run_pipeline", lambda *a, **k: None)
+    monkeypatch.setattr(pipelines, "resume_after_axes", lambda *a, **k: None)
+    monkeypatch.setattr(api_mod, "_maybe_run_pairs_after_cleaning",
+                        lambda *a, **k: None)
+    return True
+
+
 ISGEC = Path(os.environ.get(
     "ISGEC_DIR",
     str(ROOT.parent / "ISGEC"),
@@ -120,9 +147,9 @@ def fx_job_with_cleaned_dxfs(fx_isolated_jobs, fx_tp104_dxfs, tmp_path):
     # The real TP-104 MECH drawing declares $INSUNITS=1 (inch) but is drawn
     # in millimetres, so the fit's unit prior computes an expected scale of
     # 0.0394 against a true scale of 1.0.  The grid says the two drawings
-    # share an origin, so the header — not the fit — is wrong: allow the weak
-    # fit, which is what a user does with this drawing.
-    job.options = {**(job.options or {}), "allow_weak_fit": True}
+    # share an origin, so the header — not the fit — is wrong: say so
+    # explicitly, which is what a user does with this drawing.
+    job.unit_overrides = {"drawing_a": "mm", "drawing_b": "mm"}
     save_job(job)
     return job.job_id
 

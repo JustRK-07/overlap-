@@ -63,6 +63,7 @@ from pathlib import Path
 import numpy as np
 
 from . import grid
+from . import units as units_mod
 from .dxfio import read_internal as _read_internal
 from .transform2d import (Affine2D, FitError, TransformError, fit_affine,
                           loo_residuals, ransac_similarity, rms)
@@ -272,6 +273,75 @@ def expected_scale(str_units: int, mech_units: int) -> float | None:
     return f if math.isfinite(f) and f > 0.0 else None
 
 
+def grid_scale(mech_grid_result, str_grid_result) -> float | None:
+    """The scale the two grids imply, in MECH units per STR unit.
+
+    Two drawings of one building have the same physical grid spacing, so
+    the ratio of the two median spacings — each measured in its **own**
+    drawing units — is the scale between them.  This reading needs no
+    ``$INSUNITS`` header and is therefore immune to a wrong one.
+    """
+    return units_mod.grid_scale(median_spacing(mech_grid_result),
+                                median_spacing(str_grid_result))
+
+
+def write_grid_spacings(root: Path, mech_spacing, str_spacing) -> Path:
+    """Remember the two grid spacings next to the fit's outputs.
+
+    The spacings are a property of the *drawings*, not of the answer: they
+    are measured once and reused, so the units can be re-checked without
+    reading a 15 MB drawing again.
+    """
+    path = Path(root) / "axes" / "units.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "mech_spacing": mech_spacing,
+        "str_spacing": str_spacing,
+    }, indent=2))
+    return path
+
+
+def units_decision(job_id: str, *, mech_grid=None, str_grid=None,
+                   mech_spacing=None, str_spacing=None,
+                   pair_dir=None) -> "units_mod.Decision":
+    """The grid reading vs the header reading, and what to do about it.
+
+    Called at the axes step: when the two readings disagree the job pauses
+    and asks the user which units each drawing really uses.
+
+    The caller may pass the grids it has already detected, or just the two
+    median spacings — the axes step measures them once and the confirm
+    step re-uses them, so the drawings are not read twice.
+    """
+    from .roles import resolve_pair, units_for_pair
+
+    if mech_spacing is None or str_spacing is None:
+        if mech_grid is None or str_grid is None:
+            mech_path, str_path = resolve_pair(job_id, pair_dir)
+            convention_path = (Path(pair_dir).parent if pair_dir is not None
+                               else job_dir(job_id)) / "axes" / "convention.json"
+            if not convention_path.exists():
+                raise RuntimeError(
+                    "axes/convention.json missing — the grid convention must "
+                    "be confirmed before the units can be checked")
+            convention = json.loads(convention_path.read_text())
+            prefix = convention["prefix"]
+            axes = list(convention["axes"])
+            mech_grid = grid.detect_grid(_read_internal(str(mech_path)),
+                                         prefix, axes)
+            str_grid = grid.detect_grid(_read_internal(str(str_path)),
+                                        prefix, axes)
+        mech_spacing = median_spacing(mech_grid)
+        str_spacing = median_spacing(str_grid)
+
+    mech_u, str_u = units_for_pair(job_id)
+    return units_mod.decide(
+        mech_u, str_u,
+        mech_spacing=mech_spacing,
+        str_spacing=str_spacing,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The solver — pure geometry + gates, no DXFs
 # ─────────────────────────────────────────────────────────────────────────────
@@ -287,6 +357,8 @@ class FitInputs:
     extent: float = 0.0          # MECH drawing extent (tau's absolute floor)
     str_units: int = 0           # $INSUNITS of the STR drawing
     mech_units: int = 0          # $INSUNITS of the MECH drawing
+    str_unit_name: str = ""      # the units as chosen ("mm", "in", …)
+    mech_unit_name: str = ""
 
 
 def solve(inp: FitInputs, options: FitOptions | None = None) -> dict:
@@ -392,22 +464,28 @@ def solve(inp: FitInputs, options: FitOptions | None = None) -> dict:
     else:
         loo_max = None
 
-    # ── gate 5: $INSUNITS scale prior ──────────────────────────────────────
+    # ── gate 5: the units scale prior ──────────────────────────────────────
+    # The units here are the *chosen* ones — the user's override when there
+    # is one, the drawing's own $INSUNITS header otherwise.  The prior is
+    # only ever a cross-check of the grid against those units.
     expected = expected_scale(inp.str_units, inp.mech_units)
     scale, rotation_deg, mirrored, skew_deg = affine.decompose()
     if expected is None:
         warnings.append(
-            f"$INSUNITS prior unavailable (MECH={inp.mech_units}, "
+            f"units prior unavailable (MECH={inp.mech_units}, "
             f"STR={inp.str_units}) — the scale was not checked against the "
-            "unit headers")
+            "$INSUNITS headers")
     else:
         rel = abs(scale / expected - 1.0)
+        mech_name = inp.mech_unit_name or str(inp.mech_units)
+        str_name = inp.str_unit_name or str(inp.str_units)
         gate(rel <= opts.scale_prior_tol,
-             f"$INSUNITS mismatch: $INSUNITS says {inp.str_units} (STR) → "
-             f"{inp.mech_units} (MECH), i.e. a scale of {expected:.6g}, but the "
+             f"units mismatch: the units in force say {str_name} (STR) → "
+             f"{mech_name} (MECH), i.e. a scale of {expected:.6g}, but the "
              f"grid intersections give {scale:.6g} ({rel:.1%} off, tolerance "
-             f"{opts.scale_prior_tol:.1%}). Either the unit headers are wrong "
-             "or the two drawings do not share a grid origin.")
+             f"{opts.scale_prior_tol:.1%}). Either the $INSUNITS headers (or "
+             "the units you chose) are wrong, or the two drawings do not "
+             "share a grid origin.")
 
     inlier_res = [res[i] for i in inlier_idx]
     correspondences = []
@@ -474,6 +552,12 @@ def run(job_id: str, *, pair_dir=None) -> None:
     axes = list(convention["axes"])
     opts = options_for_job(job_id)
 
+    # The units of each drawing: the user's override when there is one,
+    # the drawing's own $INSUNITS header otherwise.  Read here rather
+    # than from the documents so an override is honoured everywhere.
+    from .roles import units_for_pair
+    mech_u, str_u = units_for_pair(job_id)
+
     # World-coordinate grid detection (core/grid.py); MECH = drawing A, STR = B.
     mech_doc = _read_internal(str(mech_path))
     str_doc = _read_internal(str(str_path))
@@ -490,6 +574,10 @@ def run(job_id: str, *, pair_dir=None) -> None:
     str_ix = grid.intersections(str_grid)
     keys = sorted(set(mech_ix) & set(str_ix))
     labels = [f"{a}-{b}" for a, b in keys]
+
+    # The two grid spacings, measured once: they are what says what scale
+    # the drawings really share, whatever their $INSUNITS headers claim.
+    write_grid_spacings(root, median_spacing(mech_grid), median_spacing(str_grid))
 
     skipped = [
         {"label": lbl,
@@ -519,8 +607,10 @@ def run(job_id: str, *, pair_dir=None) -> None:
             if keys else np.zeros((0, 2)),
             spacing=median_spacing(mech_grid),
             extent=float(mech_grid.extent) or 0.0,
-            str_units=_insunits(str_doc),
-            mech_units=_insunits(mech_doc),
+            str_units=str_u.code if str_u.known else 0,
+            mech_units=mech_u.code if mech_u.known else 0,
+            str_unit_name=str_u.name,
+            mech_unit_name=mech_u.name,
         ),
         opts,
     )
@@ -583,9 +673,29 @@ def run(job_id: str, *, pair_dir=None) -> None:
         "convention": {"prefix": prefix, "axes": list(axes)},
         "skipped_axes": skipped,
         "warnings": list(warnings),
+        # The units, in full: what the headers said, what was chosen, and
+        # why.  `units.mech` / `units.str` stay the $INSUNITS *codes* of
+        # the chosen units, so every existing reader keeps working.
+        "units": {
+            "mech": mech_u.code,
+            "str": str_u.code,
+            "expected_scale": sol.get("units", {}).get("expected_scale"),
+            "mech_units": mech_u.name,
+            "str_units": str_u.name,
+            "mech_header": mech_u.header_code,
+            "str_header": str_u.header_code,
+            "mech_header_units": mech_u.header_name,
+            "str_header_units": str_u.header_name,
+            "mech_source": mech_u.source,
+            "str_source": str_u.source,
+            "mech_reason": mech_u.reason,
+            "str_reason": str_u.reason,
+            "mm_per_unit": mech_u.mm_per_unit,
+        },
     }
     (root / "transform.json").write_text(json.dumps(transform, indent=2))
 
 
 __all__ = ["run", "solve", "FitInputs", "FitOptions", "FitError", "Affine2D",
-           "median_spacing", "expected_scale", "grid_to_json", "options_for_job"]
+           "median_spacing", "expected_scale", "grid_to_json", "options_for_job",
+           "grid_scale", "units_decision"]

@@ -108,6 +108,7 @@ class JobState:
     detected_axes: dict | None = None                    # filled at stage 5
     enabled_checks: list[str] = field(default_factory=list)  # spot-check toggles
     options: dict = field(default_factory=dict)          # stage tunables; core.fit reads its own keys
+    unit_overrides: dict = field(default_factory=dict)   # file_id -> "mm"|"cm"|"m"|"in"|"ft"
 
     outputs: dict = field(default_factory=dict)           # {dxf_path, preview_png, zip, report} (legacy)
     error: str | None = None
@@ -256,6 +257,10 @@ def load_job(job_id: str) -> JobState | None:
         else:
             coerced[fid] = val
     filtered["files"] = coerced
+    # Unit overrides are hand-editable, so they are cleaned on load: only
+    # the units we accept survive, and only under a non-empty file id.
+    filtered["unit_overrides"] = normalize_unit_overrides(
+        filtered.get("unit_overrides"))
     return JobState(**filtered)
 
 
@@ -314,14 +319,17 @@ def _clean_options(options: dict | None) -> dict:
 
 
 # The stage tunables (PLAN.md step 9) and their defaults. Readers:
-#   core.fit.FitOptions.from_job  — fit_model / allow_weak_fit (aliases
-#                                  model / force)
+#   core.fit.FitOptions.from_job  — fit_model / force (alias model)
 #   core.overlay.OverlayStyle     — color_mode / str_lineweight / qa_grid
 #                                  (flat keys, or the `overlay` sub-dict)
+#
+# `allow_weak_fit` is gone: the units question is now answered explicitly
+# (a per-file unit override), so there is no need for a blanket "accept a
+# bad fit" escape hatch at upload time.  The `force` knob survives on
+# `POST /{job_id}/axes/confirm` for the *other* gates.
 DEFAULT_OPTIONS: dict = {
     "color_mode": "original",
     "fit_model": "similarity",
-    "allow_weak_fit": False,
     "str_lineweight": None,
     "qa_grid": True,
 }
@@ -341,13 +349,33 @@ def normalize_options(options: dict | None) -> dict:
     flat = {k: v for k, v in (options or {}).items() if k not in _DERIVED_OPTIONS}
     resolved = {**DEFAULT_OPTIONS, **flat}
     resolved["fit"] = {"model": resolved["fit_model"],
-                       "force": resolved["allow_weak_fit"]}
+                       "force": bool(resolved.get(
+                           "force", resolved.get("allow_weak_fit", False)))}
     resolved["overlay"] = {
         "color_mode": resolved["color_mode"],
         "str_lineweight": resolved["str_lineweight"],
         "qa_grid": resolved["qa_grid"],
     }
     return resolved
+
+
+def normalize_unit_overrides(overrides: dict | None) -> dict:
+    """Clean a ``{file_id: unit}`` mapping.
+
+    Only the units we accept survive, and only under a non-empty key.
+    Anything else is dropped — a job.json written by hand must never be
+    able to put the pipeline into a state it cannot interpret.
+    """
+    from core.units import normalise_unit
+
+    out: dict[str, str] = {}
+    for key, value in (overrides or {}).items():
+        if not isinstance(key, str) or not key:
+            continue
+        unit = normalise_unit(value)
+        if unit:
+            out[key] = unit
+    return out
 
 
 def _ensure_dirs(d: Path) -> None:

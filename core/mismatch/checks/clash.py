@@ -62,7 +62,7 @@ def run(env: Env) -> list[Finding]:
         if env.policy.clash_with_members:
             others += list(env.str_by_family.get("str_member", ()))
         if not items or not others:
-            env.track("clash", len(items), 0)
+            env.track_pair("clash", mech_fam, str_fam, len(items), len(others))
             continue
         # `footprint_bbox` (not `Feature.bbox`) — a band's bbox is its
         # centreline, which excludes the half-width the band actually covers.
@@ -74,7 +74,8 @@ def run(env: Env) -> list[Finding]:
             got, matched = _item(env, item, others, index, mech_fam, str_fam)
             n_matched += 1 if matched else 0
             findings += got
-        env.track("clash", len(items), n_matched)
+        env.track_pair("clash", mech_fam, str_fam, len(items), len(others),
+                       matched_mech=n_matched)
     return findings
 
 
